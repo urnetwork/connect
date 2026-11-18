@@ -106,8 +106,8 @@ func v11KTable(lag *studyResult, drift *studyResult) string {
 		}
 		if drift != nil {
 			for run := 0; run < drift.runs(); run++ {
-				ks := drift.empiricalKs(func(s *visitorSummary) bool { return s.continent == continent }, 0, run)
-				row = append(row, ks[1])
+				ks := drift.empiricalKs(func(s *visitorSummary) bool { return s.continent == continent }, 0, run, []int{1})
+				row = append(row, ks[0])
 			}
 		}
 		t.add(row...)
@@ -147,7 +147,7 @@ func v11VerdictTable(drift *studyResult) string {
 func writeV11(b *strings.Builder, results map[string]*studyResult) {
 	if table, ok := results["V11 table"]; ok {
 		fmt.Fprintf(b, "### V11's fixed table on drift verdicts\n\n")
-		fmt.Fprintf(b, "The hybrid choice, 3 runs, each visitor judged at V11's 99%% k for the address's continent (NA 3.25, SA 3.50, AF 3.95, OC 7.88, AS 3.35, EU 3.035, AN and unknown 3.49), k_early KEarly(k). Per continent of the address, after 1, 2 and 3 runs: the region's misses for tiny-country visitors with their Wilson interval, false rejects, and power. Where the misses run over 1%%, the k they'd need: their 99%% quantile, rounded up to 0.05.\n\n")
+		fmt.Fprintf(b, "The contract's choice and stops, 3 runs, each visitor judged at V11's 99%% k for the address's continent (%s), k_early KEarly(k). Per continent of the address, after 1, 2 and 3 runs: the region's misses for tiny-country visitors with their Wilson interval, false rejects, and power. Where the misses run over 1%%, the k they'd need: their 99%% quantile, rounded up to 0.05.\n\n", v11KList(lagdrift.DefaultConfidence))
 		b.WriteString(v11TableCheck(table) + "\n")
 	}
 	lag, okLag := results["V11: lag.dev tracks"]

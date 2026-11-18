@@ -172,16 +172,19 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 			continue
 		}
 		v10 := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
+		judged := result.judgedAt()
+		nominal := []string{}
+		for _, c := range result.shownConfidences() {
+			nominal = append(nominal, alphaName(c))
+		}
 		section("Coverage and calibration: " + named.name)
-		paragraph("The fleet around each region's visitors, and the single-run fits of the tiny-country visitors: their σ_major and how often a run's b is held at its bound of 0. Policy k_early %s.", formatK(lagdrift.EarlyK))
+		paragraph("The fleet around each region's visitors, and the single-run fits of the tiny-country visitors: their σ_major and how often a run's b is held at its bound of 0. V10, %s.", judged)
 		b.WriteString(coverageTable(worldOf("main"), result, v10) + "\n")
-		paragraph("How often the region at each confidence misses the truth, for tiny-country visitors (V6's coverage, the false-reject rate's ceiling for any country). Nominal: 5%%, 1%% and 0.1%%.")
+		paragraph("How often the region at each confidence, %s, misses the truth, for tiny-country visitors (V6's coverage, the false-reject rate's ceiling for any country). Nominal: %s.", judged, strings.Join(nominal, " and "))
 		b.WriteString(calibrationTable(result, v10) + "\n")
 
-		section("Recalibrated k: " + named.name)
-		paragraph("False rejects and power under each k option, after 1 and 3 runs, at k_early %s: (a) k as now; (b) the empirical k, the tiny country's quantile of the truth's Mahalanobis distance at 99%% and 99.9%% (95%% stays 2.448, where the region is conservative); (c) no 99.9%%, and 3.28 at 99%%.", formatK(lagdrift.EarlyK))
-		b.WriteString(recalibrationTable(result, v10) + "\n")
-		paragraph("The empirical k per region, from honest visitors' single runs:")
+		section("The k the region needs: " + named.name)
+		paragraph("The empirical k per region, from honest visitors' single runs: the quantile of the truth's Mahalanobis distance from the fit at each confidence, where the textbook k is 2.448, 3.035 and 3.717. V11's table rests on these quantiles per continent (its own section).")
 		b.WriteString(regionKTable(result, v10) + "\n")
 		if tracks := calibrationFromTracksTable(result, v10); tracks != "" {
 			paragraph("V4 estimating k from tracks (honest single runs): measured from the truth, from a city point off it by about 30 km (a normal error of %d km per axis), and from the city point with its variance added to the fit's covariance, which takes the city's error back out. Then how far the quantiles of a sample of tracks spread, over 300 samples.", cityErrorKm)
@@ -189,7 +192,7 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 		}
 
 		section("False rejects: " + named.name)
-		paragraph("Honest visitors rejected (disagree), after 1, 2 and 3 pooled runs, at k_early %s. Bold exceeds 1 − confidence.", formatK(lagdrift.EarlyK))
+		paragraph("Honest visitors rejected (disagree), after 1, 2 and 3 pooled runs, V10 %s. Bold exceeds 1 − confidence.", judged)
 		b.WriteString(falseRejectTable(result, v10) + "\n")
 		paragraph("The tiny country per region:")
 		b.WriteString(falseRejectRegionTable(result, v10, scenarioTiny) + "\n")
@@ -199,13 +202,17 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 		}
 
 		section("k_early: " + named.name)
-		paragraph("Per policy and confidence: the false-reject rate of the worst honest scenario and number of runs (bold above 1 − confidence), and the false rejects the clear stop adds over no clear stop at all (k_early ∞), per 10,000 honest verdicts. The cap-only policy never stops early.")
+		scaled := ""
+		if result.config.kByContinent != nil {
+			scaled = " Each policy's k_early is its value at the textbook 99% k, scaled with the run's k as KEarly scales EarlyK (V11): EarlyK's row is V11's KEarly(k), and a run at 95% stops at the value itself."
+		}
+		paragraph("Per policy and confidence: the false-reject rate of the worst honest scenario and number of runs (bold above 1 − confidence), and the false rejects the clear stop adds over no clear stop at all (k_early ∞), per 10,000 honest verdicts. The cap-only policy never stops early.%s", scaled)
 		b.WriteString(earlyKTable(result) + "\n")
 
 		section("Power: " + named.name)
 		synthetic := []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000}
 		real := []*scenario{scenarioRealClaim300, scenarioRealClaim1000, scenarioRealClaim3000}
-		paragraph("Claims rejected (disagree) at 99%%, after 1, 2 and 3 pooled runs, at k_early %s. Synthetic claims: the claimed country's nearest point is exactly the distance away.", formatK(lagdrift.EarlyK))
+		paragraph("Claims rejected (disagree) at 99%%, after 1, 2 and 3 pooled runs, V10 %s. Synthetic claims: the claimed country's nearest point is exactly the distance away.", judged)
 		b.WriteString(powerTable(result, v10, 1, synthetic) + "\n")
 		if 0 < result.count(ofScenario(scenarioRealClaim1000)) {
 			paragraph("Real countries, their nearest point 0.8 to 1.25 times the distance away:")
@@ -216,14 +223,21 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 
 		section("Stop times: " + named.name)
 		for run := 0; run < visitorRuns; run++ {
-			paragraph("Run %d, k_early %s: seconds from the sessions opening.", run+1, formatK(lagdrift.EarlyK))
+			paragraph("Run %d, V10 at 99%% %s: seconds from the sessions opening.", run+1, judged)
 			b.WriteString(stopTable(result, v10, run) + "\n")
 		}
 	}
 
+	if staggered, ok := results["staggered sessions"]; ok && main != nil {
+		section("Session openings")
+		paragraph("The main part's visitors under V10 (%s), with far sessions opening %s late, as on the real stack (e2e), and with each session opening after its own round trips alone, as the study had them before. Stop times over every visitor, seconds from the sessions opening; false rejects, misses and power at 99%% unless named.",
+			main.judgedAt(), lateSessionText())
+		b.WriteString(sessionOpeningTable(main, staggered) + "\n")
+	}
+
 	if result, ok := results["no early stop"]; ok {
 		section("What stopping early does")
-		paragraph("One run per visitor under V10, under V10 without the clear stop (k_early ∞), and with no early stop at all, so every run lasts to the 12 s cap. At 99%%.")
+		paragraph("One run per visitor under V10, under V10 without the clear stop (k_early ∞), and with no early stop at all, so every run lasts to the %d s cap. At 99%% %s.", lagdrift.StopCapMs/1000, result.judgedAt())
 		t := &table{header: comparisonHeader}
 		for p, policy := range result.config.policies {
 			t.add(comparisonRow(policy.name, result, p)...)
@@ -234,7 +248,7 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 	if refits, ok := results["cadence: refits"]; ok {
 		if full, ok := results["cadence: full fits"]; ok {
 			section("V10's cadence")
-			paragraph("The same visitors, 3 runs each: the frame's fit by V10's cadence (a warm refit at each ping round, the full multi-start when the extenders change, every 2 s and before any stop) and by the full multi-start at every ping round. Under the cadence, %d stops were withdrawn because the full fit before them landed in another basin.", refits.withdrawnStops)
+			paragraph("The same visitors, 3 runs each, %s: the frame's fit by V10's cadence (a warm refit at each ping round, the full multi-start when the extenders change, every 2 s and before any stop) and by the full multi-start at every ping round. Under the cadence, %d stops were withdrawn because the full fit before them landed in another basin.", refits.judgedAt(), refits.withdrawnStops)
 			b.WriteString(cadenceTable(refits, full) + "\n")
 		}
 	}
@@ -243,7 +257,7 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 
 	if usable := usableStopTable(parts, results); strings.Count(usable, "\n") > 2 {
 		section("Stops on the verdict's evidence")
-		paragraph("V10 (e2e): far sessions open late on the real stack, so here they open 3 s × min(1, d / 7,500 km) later than their round trips take. The frame decides its stops on its fit over every extender with 4 round trips, as before, or over the usable extenders only, as V10 now says, at 12 and at 8 usable round trips (8 also the server's usable minimum, E5). The hybrid choice, V11's table, 3 runs; seconds from the sessions opening.")
+		paragraph("V10 (e2e): with far sessions opening late, as in every part, the frame decides its stops on its fit over every extender with 4 round trips, as before, or over the usable extenders only, as V10 says, at %d usable round trips (lagdrift's StopRoundTrips, also the server's usable minimum, E5) and at %d beside it. The contract otherwise, 3 runs; seconds from the sessions opening.", lagdrift.StopRoundTrips, besideRoundTrips())
 		b.WriteString(usable + "\n")
 	}
 
@@ -260,8 +274,15 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 	}
 
 	if variants := vpnVariantTable(parts, results); strings.Count(variants, "\n") > 2 {
+		judged := ""
+		for _, part := range parts {
+			if result, ok := results[part.name]; ok && strings.HasPrefix(part.name, "VPN ") {
+				judged = result.judgedAt()
+				break
+			}
+		}
 		section("A visitor far from the address's place (VPN)")
-		paragraph("Visitors whose address claims a country they are not in, as a VPN's virtual location does, with the extenders chosen around the address's place (E2) or by a variant (choice.go): the mid and far bands spread together with the near band (joint spread), an extender at each VPN hub nearest the address's place (VPN hubs), or greedily by the region they are expected to give for the address's place and the VPN hubs (information) or a ring of places 800 and 2,000 km around it (information ring), or E2's near and far bands with the 4 others by the ring (ring mid band), or E2 with only its mid band chosen by the ring and a short mid band's slots passing to the far band (hybrid). Each on the study's dense fleet and on a sparse one of one extender in each of 35 cities. Power is the share rejected at 99%%, k_early %s.", formatK(lagdrift.EarlyK))
+		paragraph("Visitors whose address claims a country they are not in, as a VPN's virtual location does, with the extenders chosen around the address's place by E2's earlier bands, each spread by bearing (E2), or by a variant (choice.go): the mid and far bands spread together with the near band (joint spread), an extender at each VPN hub nearest the address's place (VPN hubs), or greedily by the region they are expected to give for the address's place and the VPN hubs (information) or a ring of places 800 and 2,000 km around it (information ring), or E2's near and far bands with the 4 others by the ring (ring mid band), or E2's bands with only the mid band chosen by the ring and a short mid band's slots passing to the far band (hybrid, E2 as it now stands and every other part's choice). Each on the study's dense fleet and on a sparse one of one extender in each of 35 cities. Power is the share rejected at 99%%, %s; the k_early by the rule is its value at the textbook 99%% k.", judged)
 		b.WriteString(variants + "\n")
 		for _, pool := range []string{"dense", "sparse"} {
 			if pairs := vpnPowerTable(parts, results, pool, true); pairs != "" {
@@ -275,27 +296,29 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 
 	if interrupted := interruptedTable(parts, results); strings.Count(interrupted, "\n") > 2 {
 		section("The interrupted stop")
-		paragraph("The review's rule (V10): an interrupted run counts only if converged or clear held, by the server's check, when the silence began. Against an honest client and one that goes silent at its first look whose region touches the claimed country at 99%% once the run would count (6 extenders with 12 round trips), or when clear would stop it outside (review F-02). One run, 99%%.")
+		paragraph("The review's rule (V10): an interrupted run counts only if converged or clear held, by the server's check, when the silence began. Against an honest client and one that goes silent at its first look whose region touches the claimed country at 99%% once the run would count (%d extenders with %d round trips), or when clear would stop it outside (review F-02). One run, 99%%.", countingExtenders, lagdrift.StopRoundTrips)
 		b.WriteString(interrupted + "\n")
 	}
 
 	kappaRows := &table{header: comparisonHeader}
+	kappaJudged := ""
 	for _, part := range parts {
 		result, ok := results[part.name]
 		if !ok || !strings.HasPrefix(part.name, "κ ") {
 			continue
 		}
+		kappaJudged = result.judgedAt()
 		kappaRows.add(comparisonRow(part.about, result, result.policyIndex(v10Policy(lagdrift.EarlyK).name))...)
 	}
 	if 0 < len(kappaRows.rows) {
 		section("κ")
-		paragraph("After 1 run at 99%%, k_early %s.", formatK(lagdrift.EarlyK))
+		paragraph("After 1 run at 99%%, %s.", kappaJudged)
 		b.WriteString(kappaRows.String() + "\n")
 	}
 
 	if result, ok := results["stop rule"]; ok {
 		section("V10's constants")
-		paragraph("One constant changed at a time from V10 (k_early %s); round trips also set the server's usable extender (E5). After 1 run at 99%%.", formatK(lagdrift.EarlyK))
+		paragraph("One constant changed at a time from V10; round trips also set the server's usable extender (E5). After 1 run at 99%%, %s.", result.judgedAt())
 		t := &table{header: comparisonHeader}
 		for p, policy := range result.config.policies {
 			t.add(comparisonRow(policy.name, result, p)...)
@@ -304,26 +327,30 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 	}
 
 	stress := &table{header: comparisonHeader}
+	stressJudged := ""
 	for _, name := range []string{"main", "misplaced", "normal stretch"} {
 		result, ok := results[name]
 		if !ok {
 			continue
 		}
+		stressJudged = result.judgedAt()
 		stress.add(comparisonRow(name, result, result.policyIndex(v10Policy(lagdrift.EarlyK).name))...)
 	}
 	if 1 < len(stress.rows) {
 		section("Other worlds")
-		paragraph("After 1 run at 99%%, k_early %s.", formatK(lagdrift.EarlyK))
+		paragraph("After 1 run at 99%%, %s.", stressJudged)
 		b.WriteString(stress.String() + "\n")
 	}
 
 	oceania := &table{header: oceaniaHeader}
 	var oceaniaBase *studyResult
+	oceaniaJudged := ""
 	for _, part := range parts {
 		result, ok := results[part.name]
 		if !ok || !strings.HasPrefix(part.name, "Oceania: ") {
 			continue
 		}
+		oceaniaJudged = result.judgedAt()
 		if part.name == "Oceania: base" {
 			oceaniaBase = result
 		}
@@ -331,7 +358,7 @@ func writeParts(b *strings.Builder, parts []*studyPart, results map[string]*stud
 	}
 	if 0 < len(oceania.rows) {
 		section("Oceania")
-		paragraph("Oceania's visitors, one run each at k_early %s: in worlds that each take one source of error away, and under models that each try one remedy. The region's misses are the tiny country's; a false reject needs the whole region to leave the country (V6).", formatK(lagdrift.EarlyK))
+		paragraph("Oceania's visitors, one run each, %s, where V11 now judges Oceania at %s: in worlds that each take one source of error away, and under models that each try one remedy. The region's misses are the tiny country's; a false reject needs the whole region to leave the country (V6).", oceaniaJudged, formatK3(lagdrift.DefaultK(lagdrift.DefaultConfidence, "OC")))
 		b.WriteString(oceania.String() + "\n")
 		if oceaniaBase != nil {
 			paragraph("The base world per city:")

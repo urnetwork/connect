@@ -96,6 +96,9 @@ type visitorSummary struct {
 	access    string
 	borderKm  float64
 	claimName string
+	// the k each confidence judged the visitor at: V11's for the address's
+	// continent, else the textbook k
+	ks [3]float64
 	// per policy, per run
 	runs [][visitorRuns]runSummary
 }
@@ -107,10 +110,9 @@ type runSummary struct {
 	counted bool
 	// the verdict after the run: the counting runs it pools, and per
 	// confidence
-	counting  int
-	verdicts  [3]lagdrift.Verdict
-	reasons   [3]lagdrift.Reason
-	kVerdicts [2]lagdrift.Verdict
+	counting int
+	verdicts [3]lagdrift.Verdict
+	reasons  [3]lagdrift.Reason
 	// at the visitor's V11 k
 	v11Verdict lagdrift.Verdict
 	v11K       float64
@@ -288,6 +290,7 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 		cityName:  spec.city.name,
 		borderKm:  spec.borderKm,
 		claimName: spec.claimName,
+		ks:        outcome.ks,
 	}
 	for _, runs := range outcome.outcomes {
 		var row [visitorRuns]runSummary
@@ -299,9 +302,8 @@ func summarize(outcome *visitorOutcome) *visitorSummary {
 				usable:         o.usable,
 				counted:        o.counted,
 				counting:       v.counting,
-				verdicts:       v.verdicts,
-				reasons:        v.reasons,
-				kVerdicts:      v.kVerdicts,
+				verdicts:       o.verdicts,
+				reasons:        o.reasons,
 				v11Verdict:     v.v11Verdict,
 				v11K:           v.v11K,
 				cityM:          v.cityM,
@@ -341,7 +343,35 @@ func (self *studyResult) String() string {
 		len(self.summaries), self.stopChecks, len(self.stopMismatches), self.decideChecks, len(self.decideMismatches))
 }
 
-// The study's k for a confidence index.
-func kAt(i int) float64 {
-	return lagdrift.KForConfidence(confidences[i])
+// The confidence indexes a result judges at: V11 refuses 99.9%.
+func (self *studyResult) shownConfidences() []int {
+	if self.config.kByContinent != nil {
+		return []int{0, 1}
+	}
+	return []int{0, 1, 2}
+}
+
+// The confidence a result shows beside 99%: 99.9%, or 95% where V11 refuses
+// 99.9%.
+func (self *studyResult) otherConfidence() int {
+	if self.config.kByContinent != nil {
+		return 0
+	}
+	return 2
+}
+
+// The k a result's verdicts are judged at, for a caption.
+func (self *studyResult) kName() string {
+	if self.config.kByContinent != nil {
+		return "V11's k for the address's continent"
+	}
+	return "the textbook k"
+}
+
+// How a result's verdicts are judged under V10, for a caption.
+func (self *studyResult) judgedAt() string {
+	if self.config.kByContinent != nil {
+		return "at " + self.kName() + ", k_early KEarly(k)"
+	}
+	return fmt.Sprintf("at %s, k_early %s", self.kName(), formatK(lagdrift.EarlyK))
 }

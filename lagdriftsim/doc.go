@@ -9,9 +9,12 @@
 // the address's place (E2) is pinged 4 times a second along paths built from
 // V2's model: a route stretch drawn once per path, the extender's place
 // error, the visitor's last mile, queueing on a Wi-Fi-like link with spikes,
-// and lost pings. The frame's fit is evaluated every 250 ms with
-// lagdrift.EvaluateStop (V10), the server's verdict pools the runs (V7) and is
-// judged with lagdrift.Decide at 95%, 99% and 99.9% (V6).
+// and lost pings, with far sessions opening late, as on the real stack. The
+// frame's fit over its usable extenders is evaluated every 250 ms by V10's
+// rules, as lagdrift.EvaluateStop decides them, and the server's verdict pools
+// the runs (V7) and is judged as lagdrift.Decide judges it (V6), at V11's k
+// for the run's confidence, 95% or 99%, and the address's continent. The
+// parts that diagnose the textbook region judge at its k, at 99.9% too.
 //
 // Every draw comes from a generator keyed by the study's seed and by what it
 // draws for, so a study reproduces exactly whatever order its workers run in.

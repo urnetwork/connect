@@ -1,6 +1,7 @@
 package lagdriftsim
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -457,31 +458,49 @@ func TestHybridChoice(t *testing.T) {
 	}
 }
 
-// The k options: (a) as now, (b) 3.28 and 7.15 at 99% and 99.9%, (c) no
-// 99.9%.
-func TestKOptions(t *testing.T) {
-	r := runSummary{
-		verdicts:  [3]lagdrift.Verdict{lagdrift.VerdictDisagree, lagdrift.VerdictDisagree, lagdrift.VerdictAgree},
-		kVerdicts: [2]lagdrift.Verdict{lagdrift.VerdictAgree, lagdrift.VerdictInconclusive},
-	}
-	for _, c := range []struct {
-		option     int
-		confidence int
-		expect     lagdrift.Verdict
-		ok         bool
-	}{
-		{0, 1, lagdrift.VerdictDisagree, true},
-		{1, 0, lagdrift.VerdictDisagree, true},
-		{1, 1, lagdrift.VerdictAgree, true},
-		{1, 2, lagdrift.VerdictInconclusive, true},
-		{2, 2, "", false},
-	} {
-		if v, ok := optionVerdict(c.option, r, c.confidence); v != c.expect || ok != c.ok {
-			t.Errorf("option %d at %d: %q %v", c.option, c.confidence, v, ok)
+// V11: a run judges at its confidence's k for the address's continent and
+// stops clear at KEarly of it, so outside Europe a 99% run's k_early is above
+// a 95% run's 4.0, and the 95% verdict comes from the 95% run's own stop. At
+// the textbook k, every confidence shares the policy's k_early.
+func TestV11Confidences(t *testing.T) {
+	w := newWorld(worldConfig{seed: 13}, nil)
+	specs, _ := buildVisitors(w, 13, []scenarioCount{{scenario: scenarioClaim1000, perRegion: 6, regions: []string{regionNorthAmerica, regionOceania}}}, 0)
+	config := baseConfig(13, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+	config.runs = 1
+	policy := config.policies[0]
+	earlier := 0
+	for _, spec := range specs {
+		sim := newVisitorSim(w, &config, spec)
+		for i, confidence := range []float64{0.95, 0.99} {
+			if k := lagdrift.DefaultK(confidence, spec.continent); sim.ks[i] != k {
+				t.Fatalf("%q at %g: k %g, V11's %g", spec.continent, confidence, sim.ks[i], k)
+			}
+		}
+		at95, at99 := sim.atConfidence(policy, 0), sim.atConfidence(policy, 1)
+		if at95.earlyK != lagdrift.EarlyK || at99.earlyK != lagdrift.KEarly(sim.ks[1]) {
+			t.Fatalf("%q: k_early %g at 95%% and %g at 99%%", spec.continent, at95.earlyK, at99.earlyK)
+		}
+		outcomes := sim.runPolicy(policy)
+		runs95 := sim.runsAt(at95, false)
+		if outcomes[0].verdicts[0] != runs95[0].verdict.verdicts[0] || outcomes[0].verdicts[1] != outcomes[0].verdict.verdicts[1] {
+			t.Errorf("visitor %d: verdicts %v, the 95%% run's %v", spec.index, outcomes[0].verdicts, runs95[0].verdict.verdicts)
+		}
+		if runs95[0].stopMs < outcomes[0].stopMs {
+			earlier += 1
 		}
 	}
-	if optionK(1, 2) != 7.15 || optionK(2, 1) != 3.28 || optionK(0, 1) != lagdrift.KForConfidence(0.99) {
-		t.Errorf("the options' k")
+	if earlier == 0 {
+		t.Errorf("no 95%% run stopped before its 99%% run")
+	}
+	plain := textbook(config)
+	sim := newVisitorSim(w, &plain, specs[0])
+	for i, confidence := range confidences {
+		if sim.ks[i] != lagdrift.KForConfidence(confidence) {
+			t.Errorf("textbook k at %g: %g", confidence, sim.ks[i])
+		}
+	}
+	if sim.atConfidence(policy, 1).earlyK != lagdrift.EarlyK {
+		t.Errorf("textbook k_early %g", sim.atConfidence(policy, 1).earlyK)
 	}
 }
 
@@ -567,23 +586,15 @@ func TestStopsOnUsable(t *testing.T) {
 	config.stopOnUsable = true
 	config.lateFarSessions = true
 	config.runs = 1
-	sim := &visitorSim{world: w, config: &config, spec: specs[0], fleet: w.fleets[specs[0].fleet], model: lagdrift.DefaultModel(),
-		stretches: map[int]float64{}, traces: map[string]*runTrace{}, verdicts: map[string]*verdictRecord{}, runs: 1}
-	sim.outcome = &visitorOutcome{spec: specs[0]}
-	r := newRand(9, drawVisitor, uint64(specs[0].index))
-	sim.access = drawAccessLink(r)
-	sim.serving = make([]bool, len(w.pool))
-	for i := range sim.serving {
-		sim.serving[i] = r.Float64() < servingShare
-	}
-	sim.openSessions()
-	trace := sim.trace(0, "|12", nil, 12)
+	sim := newVisitorSim(w, &config, specs[0])
+	roundTrips := lagdrift.StopRoundTrips
+	trace := sim.trace(0, fmt.Sprintf("|%d", roundTrips), nil, roundTrips)
 	fits := 0
 	for j := 1; j <= capTicks; j++ {
 		state := trace.tick(j)
 		usable := 0
 		for _, n := range state.roundTrips {
-			if 12 <= n {
+			if roundTrips <= n {
 				usable += 1
 			}
 		}

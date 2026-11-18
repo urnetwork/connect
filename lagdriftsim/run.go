@@ -169,6 +169,10 @@ type runOutcome struct {
 	usable  int
 	counted bool
 	verdict *verdictRecord
+	// per confidence, from the runs at that confidence (V11), else the
+	// verdict's
+	verdicts [3]lagdrift.Verdict
+	reasons  [3]lagdrift.Reason
 }
 
 // The verdict after a run, over the counting runs so far.
@@ -176,8 +180,6 @@ type verdictRecord struct {
 	counting int
 	verdicts [3]lagdrift.Verdict
 	reasons  [3]lagdrift.Reason
-	// at the recalibrated k values, recalibratedKs
-	kVerdicts [2]lagdrift.Verdict
 	// at the visitor's V11 k, and that k
 	v11Verdict lagdrift.Verdict
 	v11K       float64
@@ -206,6 +208,8 @@ type verdictRecord struct {
 type visitorOutcome struct {
 	spec     *visitorSpec
 	outcomes [][]runOutcome
+	// the k each confidence judged the visitor at
+	ks [3]float64
 	// the study's checks that it decides as lagdrift does
 	stopChecks       int
 	stopMismatches   []string
@@ -269,13 +273,26 @@ type visitorSim struct {
 	outcome   *visitorOutcome
 	// the runs each visitor makes, at most visitorRuns
 	runs int
-	// V11's k for the visitor, 0 without V11
+	// V11's k for the visitor at 99%, 0 without V11
 	k11 float64
+	// the k per confidence: V11's for the address's continent at 95% and
+	// 99%, else the textbook k; V11 refuses 99.9%, judged at the textbook k
+	ks [3]float64
 	// the fits made so far, for sampling
 	fitCalls int
 }
 
 func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorOutcome {
+	sim := newVisitorSim(w, config, spec)
+	for _, policy := range config.policies {
+		sim.outcome.outcomes = append(sim.outcome.outcomes, sim.runPolicy(policy))
+	}
+	return sim.outcome
+}
+
+// A visitor with its access link, its k and its runs' sessions, before any
+// policy runs them.
+func newVisitorSim(w *world, config *studyConfig, spec *visitorSpec) *visitorSim {
 	sim := &visitorSim{
 		world:     w,
 		config:    config,
@@ -291,13 +308,18 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 	if 0 < config.runs && config.runs < visitorRuns {
 		sim.runs = config.runs
 	}
+	for i, confidence := range confidences {
+		sim.ks[i] = lagdrift.KForConfidence(confidence)
+	}
 	if config.kByContinent != nil {
 		sim.k11 = config.kByContinent[spec.continent]
 		if !(0 < sim.k11) {
 			sim.k11 = lagdrift.DefaultK(lagdrift.DefaultConfidence, spec.continent)
 		}
+		sim.ks[0] = lagdrift.DefaultK(confidences[0], spec.continent)
+		sim.ks[1] = sim.k11
 	}
-	sim.outcome = &visitorOutcome{spec: spec}
+	sim.outcome = &visitorOutcome{spec: spec, ks: sim.ks}
 	r := newRand(config.seed, drawVisitor, uint64(spec.index))
 	sim.access = drawAccessLink(r)
 	if config.idealPings {
@@ -308,11 +330,7 @@ func simulateVisitor(w *world, config *studyConfig, spec *visitorSpec) *visitorO
 		sim.serving[i] = r.Float64() < servingShare
 	}
 	sim.openSessions()
-
-	for _, policy := range config.policies {
-		sim.outcome.outcomes = append(sim.outcome.outcomes, sim.runPolicy(policy))
-	}
-	return sim.outcome
+	return sim
 }
 
 // How this visitor's runs choose their extenders.
@@ -539,12 +557,46 @@ func (self *visitorSim) openSessions() {
 	}
 }
 
-// The runs of one policy.
+// The runs of a policy. Under V11 a run's k is its confidence's for the
+// address's continent, and its k_early the policy's scaled with that k as
+// KEarly scales EarlyK, so each confidence's runs stop on their own: the
+// default confidence's give the stops, the fits and the checks, and 95%'s
+// their own verdicts at 95%. V11 refuses 99.9%, judged on the default
+// confidence's runs.
 func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
+	checked := policy.isLagdrift()
+	at99 := self.atConfidence(policy, 1)
+	outcomes := self.runsAt(at99, checked)
 	if 0 < self.k11 {
-		// V11: clear stops at the visitor's k_early
-		policy.earlyK = lagdrift.KEarly(self.k11)
+		at95 := self.atConfidence(policy, 0)
+		if !sameK(at95.earlyK, at99.earlyK) {
+			for run, o := range self.runsAt(at95, false) {
+				outcomes[run].verdicts[0] = o.verdicts[0]
+				outcomes[run].reasons[0] = o.reasons[0]
+			}
+		}
 	}
+	return outcomes
+}
+
+// The policy as a run at confidence index c stops: under V11, its k_early
+// scaled with the run's k as KEarly scales EarlyK (V11), so EarlyK becomes
+// KEarly(k), and the sweep's other values scale alike.
+func (self *visitorSim) atConfidence(policy stopPolicy, c int) stopPolicy {
+	if 0 < self.k11 && !math.IsInf(policy.earlyK, 1) {
+		policy.earlyK *= lagdrift.KEarly(self.ks[c]) / lagdrift.EarlyK
+	}
+	return policy
+}
+
+// Two k values the same but for rounding.
+func sameK(a float64, b float64) bool {
+	return a == b || math.Abs(a-b) <= 1e-9*math.Abs(b)
+}
+
+// The runs of a policy at its k_early, checked against lagdrift's stop rule
+// when checked.
+func (self *visitorSim) runsAt(policy stopPolicy, checked bool) []runOutcome {
 	outcomes := []runOutcome{}
 	// the counting runs: their keys and usable observations
 	countingKeys := []string{}
@@ -566,7 +618,7 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 		} else {
 			stopTrace, tick, reason = trace.stopFor(policy)
 		}
-		if self.checks && policy.isLagdrift() && !trace.cadence && !self.config.lagTracks {
+		if self.checks && checked && !trace.cadence && !self.config.lagTracks {
 			trace.checkStops(tick, policy.earlyK)
 		}
 		obs := trace.serverObservations(tick, policy.roundTrips)
@@ -591,6 +643,8 @@ func (self *visitorSim) runPolicy(policy stopPolicy) []runOutcome {
 		windowKeys = lastN(countingKeys, windowRuns)
 		windowObs = lastN(countingObs, windowRuns)
 		outcome.verdict = self.verdict(strings.Join(windowKeys, ";")+fmt.Sprintf("|%d", policy.roundTrips), windowObs)
+		outcome.verdicts = outcome.verdict.verdicts
+		outcome.reasons = outcome.verdict.reasons
 		outcomes = append(outcomes, outcome)
 	}
 	return outcomes
@@ -756,8 +810,8 @@ func (self *runTrace) stopFor(policy stopPolicy) (*runTrace, int, lagdrift.StopR
 	trace := self
 	first := int(lagdrift.StopEarliestMs / tickMs)
 	for j := first; j <= capTicks; j++ {
-		// the attacker waits until the run would count, 6 extenders with 12
-		// round trips (E5), then goes silent at a look that touches
+		// the attacker waits until the run would count, 6 extenders with the
+		// usable round trips (E5), then goes silent at a look that touches
 		if state := trace.tick(j); policy.attack && state.fit != nil && enoughRoundTrips(state.roundTrips, countingExtenders, policy.roundTrips) && trace.touches(j) {
 			return trace, j, lagdrift.StopInterrupted
 		}
@@ -782,10 +836,10 @@ func (self *runTrace) stopFor(policy stopPolicy) (*runTrace, int, lagdrift.StopR
 }
 
 // The region at 99% touches the IP country at ping round j: the fit is in it
-// or D is within k.
+// or D is within the run's k.
 func (self *runTrace) touches(j int) bool {
 	d := self.d(j)
-	return self.tick(j).inside || d <= lagdrift.KForConfidence(lagdrift.DefaultConfidence)
+	return self.tick(j).inside || d <= self.sim.ks[1]
 }
 
 // converged or clear held at ping round j by the server's check, with its
@@ -979,9 +1033,6 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			v.verdicts[i] = lagdrift.VerdictInconclusive
 			v.reasons[i] = reasonTooFewExtenders
 		}
-		for i := range recalibratedKs {
-			v.kVerdicts[i] = lagdrift.VerdictInconclusive
-		}
 		v.v11Verdict = lagdrift.VerdictInconclusive
 		v.v11K = self.k11
 		return v
@@ -999,9 +1050,6 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		for i := range confidences {
 			v.verdicts[i] = lagdrift.VerdictInconclusive
 			v.reasons[i] = lagdrift.ReasonLowPrecision
-		}
-		for i := range recalibratedKs {
-			v.kVerdicts[i] = lagdrift.VerdictInconclusive
 		}
 		v.v11Verdict = lagdrift.VerdictInconclusive
 		v.v11K = self.k11
@@ -1036,11 +1084,8 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			return lagdrift.VerdictDisagree, lagdrift.ReasonRegionOutside
 		}
 	}
-	for i, confidence := range confidences {
-		v.verdicts[i], v.reasons[i] = decide(lagdrift.KForConfidence(confidence))
-	}
-	for i, k := range recalibratedKs {
-		v.kVerdicts[i], _ = decide(k)
+	for i, k := range self.ks {
+		v.verdicts[i], v.reasons[i] = decide(k)
 	}
 	if 0 < self.k11 {
 		v.v11Verdict, _ = decide(self.k11)
@@ -1053,7 +1098,7 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 		v.cityImpossible = !lagdrift.PhysicallyPossible(obs, diskCountry("zz", self.spec.city.at, 1, 12))
 	}
 	if self.checks {
-		verdict, reason, _ := lagdrift.Decide(fit, c, obs, lagdrift.KForConfidence(lagdrift.DefaultConfidence), lagdrift.DefaultMaxSigmaKm)
+		verdict, reason, _ := lagdrift.Decide(fit, c, obs, self.ks[1], lagdrift.DefaultMaxSigmaKm)
 		self.outcome.decideChecks += 1
 		if verdict != v.verdicts[1] || reason != v.reasons[1] {
 			self.outcome.decideMismatches = append(self.outcome.decideMismatches,
@@ -1344,11 +1389,6 @@ func atBound(fit *lagdrift.Fit) bool {
 
 // P4's reason for a window with no counting run.
 const reasonTooFewExtenders lagdrift.Reason = "too_few_extenders"
-
-// k values the study also judges at, for the choice of a recalibrated k:
-// the k at 99% and at 99.9% whose region missed the truth at the nominal
-// rate in the study's tiny country (empiricalKs).
-var recalibratedKs = []float64{3.28, 7.15}
 
 func (self *verdictRecord) recordFit(fit *lagdrift.Fit, truth lagdrift.Point, d float64) {
 	self.d = d

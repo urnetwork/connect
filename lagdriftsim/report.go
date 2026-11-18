@@ -144,12 +144,23 @@ func verdictIs(confidence int, verdict lagdrift.Verdict) func(runSummary) bool {
 	return func(r runSummary) bool { return r.verdicts[confidence] == verdict }
 }
 
-// The truth is outside the region at a confidence, among fitted verdicts.
+// The truth is outside the region at a confidence, at the k each visitor
+// was judged at, among fitted verdicts.
 func (self *studyResult) missRate(filter visitorFilter, policy int, run int, confidence int) rate {
-	k := kAt(confidence)
-	return self.rateOf(func(s *visitorSummary) bool {
-		return filter(s) && s.runs[policy][run].fitted
-	}, policy, run, func(r runSummary) bool { return k < r.truthM })
+	r := rate{}
+	if policy < 0 {
+		return r
+	}
+	for _, s := range self.summaries {
+		if !filter(s) || !s.runs[policy][run].fitted {
+			continue
+		}
+		r.n += 1
+		if s.ks[confidence] < s.runs[policy][run].truthM {
+			r.k += 1
+		}
+	}
+	return r
 }
 
 // The stop times of run (0 to 2) under a policy, ms, sorted.
@@ -195,6 +206,39 @@ func (self *studyResult) present(scenarios []*scenario) []*scenario {
 
 func confidenceName(i int) string {
 	return strings.TrimSuffix(strings.TrimSuffix(fmt.Sprintf("%.1f", 100*confidences[i]), ".0"), "") + "%"
+}
+
+// 1 − confidence at index c, as a rate: "5%", "1%", "0.1%".
+func alphaName(c int) string {
+	return formatK(100*(1-confidences[c])) + "%"
+}
+
+// Confidences as a list: "95% and 99%".
+func confidenceList(cs []int) string {
+	names := []string{}
+	for _, c := range cs {
+		names = append(names, confidenceName(c))
+	}
+	if len(names) < 2 {
+		return strings.Join(names, "")
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+// Column names per run and shown confidence: "1 run: 95%", "99%", …,
+// "3 runs: 95%", ….
+func runConfidenceHeader(result *studyResult, runs []int) []string {
+	header := []string{}
+	for _, run := range runs {
+		for i, c := range result.shownConfidences() {
+			name := confidenceName(c)
+			if i == 0 {
+				name = fmt.Sprintf("%d run%s: %s", run+1, plural(run+1), name)
+			}
+			header = append(header, name)
+		}
+	}
+	return header
 }
 
 // The scenarios: how many visitors each has and how many it couldn't place.
@@ -299,11 +343,12 @@ func median(xs []float64) float64 {
 
 // How often the region misses the truth, per region, after 1 and 3 runs.
 func calibrationTable(result *studyResult, policy int) string {
-	t := &table{header: []string{"Region", "1 run: 95%", "99%", "99.9%", "3 runs: 95%", "99%", "99.9%"}}
+	cs := result.shownConfidences()
+	t := &table{header: append([]string{"Region"}, runConfidenceHeader(result, []int{0, 2})...)}
 	for _, region := range regions {
 		row := []string{region}
 		for _, run := range []int{0, 2} {
-			for c := range confidences {
+			for _, c := range cs {
 				row = append(row, result.missRate(ofScenarioRegion(scenarioTiny, region), policy, run, c).short())
 			}
 		}
@@ -311,14 +356,18 @@ func calibrationTable(result *studyResult, policy int) string {
 	}
 	row := []string{"All"}
 	for _, run := range []int{0, 2} {
-		for c := range confidences {
+		for _, c := range cs {
 			row = append(row, result.missRate(ofScenario(scenarioTiny), policy, run, c).String())
 		}
 	}
 	t.add(row...)
-	row = []string{"k that would hold it (nominal 2.448, 3.035, 3.717)"}
+	label := "k that would hold it (nominal 2.448, 3.035, 3.717)"
+	if result.config.kByContinent != nil {
+		label = "k that would hold it, every region (V11's is per continent)"
+	}
+	row = []string{label}
 	for _, run := range []int{0, 2} {
-		row = append(row, result.empiricalKs(ofScenario(scenarioTiny), policy, run)...)
+		row = append(row, result.empiricalKs(ofScenario(scenarioTiny), policy, run, cs)...)
 	}
 	t.add(row...)
 	return t.String()
@@ -326,11 +375,15 @@ func calibrationTable(result *studyResult, policy int) string {
 
 // False rejects per honest scenario and runs, at each confidence.
 func falseRejectTable(result *studyResult, policy int) string {
-	t := &table{header: []string{"Scenario", "Runs", "95% (limit 5%)", "99% (limit 1%)", "99.9% (limit 0.1%)", "Inconclusive at 99%"}}
+	header := []string{"Scenario", "Runs"}
+	for _, c := range result.shownConfidences() {
+		header = append(header, fmt.Sprintf("%s (limit %s)", confidenceName(c), alphaName(c)))
+	}
+	t := &table{header: append(header, "Inconclusive at 99%")}
 	for _, sc := range result.present(honestScenarios) {
 		for run := 0; run < result.runs(); run++ {
 			row := []string{sc.name, fmt.Sprint(run + 1)}
-			for c := range confidences {
+			for _, c := range result.shownConfidences() {
 				r := result.rateOf(ofScenario(sc), policy, run, verdictIs(c, lagdrift.VerdictDisagree))
 				cell := r.String()
 				if 0 < r.n && float64(r.k)/float64(r.n) > 1-confidences[c] {
@@ -347,11 +400,11 @@ func falseRejectTable(result *studyResult, policy int) string {
 
 // False rejects of one scenario per region, after 1 and 3 runs, at 99%.
 func falseRejectRegionTable(result *studyResult, policy int, sc *scenario) string {
-	t := &table{header: []string{"Region", "1 run: 95%", "99%", "99.9%", "3 runs: 95%", "99%", "99.9%"}}
+	t := &table{header: append([]string{"Region"}, runConfidenceHeader(result, []int{0, 2})...)}
 	for _, region := range regions {
 		row := []string{region}
 		for _, run := range []int{0, 2} {
-			for c := range confidences {
+			for _, c := range result.shownConfidences() {
 				r := result.rateOf(ofScenarioRegion(sc, region), policy, run, verdictIs(c, lagdrift.VerdictDisagree))
 				cell := r.short()
 				if 0 < r.n && float64(r.k)/float64(r.n) > 1-confidences[c] {
@@ -370,7 +423,7 @@ func falseRejectRegionTable(result *studyResult, policy int, sc *scenario) strin
 // stop adds over no clear stop at all, per 10,000 honest verdicts.
 func earlyKTable(result *studyResult) string {
 	header := []string{"Policy"}
-	for c := range confidences {
+	for _, c := range result.shownConfidences() {
 		header = append(header, confidenceName(c)+": worst cell", "added per 10,000")
 	}
 	header = append(header, "Honest: median stop, s", "stopped clear", "Claims: median stop, s", "stopped clear")
@@ -379,7 +432,7 @@ func earlyKTable(result *studyResult) string {
 	scenarios := result.present(honestScenarios)
 	for p, policy := range result.config.policies {
 		row := []string{policy.name}
-		for c := range confidences {
+		for _, c := range result.shownConfidences() {
 			worst := rate{}
 			worstName := ""
 			for _, sc := range scenarios {
@@ -473,14 +526,18 @@ func powerTable(result *studyResult, policy int, confidence int, scenarios []*sc
 
 // Power at every confidence, all regions, per claim distance and runs.
 func powerConfidenceTable(result *studyResult, policy int, scenarios []*scenario) string {
-	t := &table{header: []string{"Claim", "Runs", "95%", "99%", "99.9%"}}
+	header := []string{"Claim", "Runs"}
+	for _, c := range result.shownConfidences() {
+		header = append(header, confidenceName(c))
+	}
+	t := &table{header: header}
 	for _, sc := range scenarios {
 		if result.count(ofScenario(sc)) == 0 {
 			continue
 		}
 		for run := 0; run < result.runs(); run++ {
 			row := []string{fmt.Sprintf("%s km", formatThousands(sc.claimKm)), fmt.Sprint(run + 1)}
-			for c := range confidences {
+			for _, c := range result.shownConfidences() {
 				row = append(row, result.rateOf(ofScenario(sc), policy, run, verdictIs(c, lagdrift.VerdictDisagree)).short())
 			}
 			t.add(row...)
@@ -507,6 +564,44 @@ func stopTable(result *studyResult, policy int, run int) string {
 				row = append(row, result.rateOf(filter, policy, run, func(r runSummary) bool { return r.reason == reason }).short())
 			}
 			row = append(row, result.rateOf(filter, policy, run, func(r runSummary) bool { return r.counted }).short())
+			t.add(row...)
+		}
+	}
+	return t.String()
+}
+
+// Session openings: the main part's late far sessions against the same
+// visitors' sessions staggered by their round trips alone, under V10, after
+// runs 1 and 3: how runs stop, and at 99% unless named the false rejects, the
+// region's misses, power, and the claims that came out low_precision.
+func sessionOpeningTable(late *studyResult, staggered *studyResult) string {
+	t := &table{header: []string{"Sessions", "Run", "Stop p50, s", "p90, s", "p99, s", "converged", "clear", "cap", "Runs counted", "False rejects, tiny: 95%", "99%", "real countries", "Region misses (tiny)", "Power: 300 km", "1,000 km", "3,000 km", "low_precision: claims"}}
+	for _, named := range []struct {
+		name   string
+		result *studyResult
+	}{{"far ones late (main)", late}, {"staggered by round trips", staggered}} {
+		result := named.result
+		p := result.policyIndex(v10Policy(lagdrift.EarlyK).name)
+		if p < 0 {
+			continue
+		}
+		all := func(*visitorSummary) bool { return true }
+		for _, run := range []int{0, result.runs() - 1} {
+			times := result.stopTimes(all, p, run)
+			stopped := func(reason lagdrift.StopReason) string {
+				return result.rateOf(all, p, run, func(r runSummary) bool { return r.reason == reason }).short()
+			}
+			row := []string{named.name, fmt.Sprint(run + 1), quantile(times, 0.5), quantile(times, 0.9), quantile(times, 0.99),
+				stopped(lagdrift.StopConverged), stopped(lagdrift.StopClear), stopped(lagdrift.StopCap),
+				result.rateOf(all, p, run, func(r runSummary) bool { return r.counted }).short(),
+				result.rateOf(ofScenario(scenarioTiny), p, run, verdictIs(0, lagdrift.VerdictDisagree)).short(),
+				result.rateOf(ofScenario(scenarioTiny), p, run, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+				result.rateOf(ofScenario(scenarioRealHonest), p, run, verdictIs(1, lagdrift.VerdictDisagree)).short(),
+				result.missRate(ofScenario(scenarioTiny), p, run, 1).short()}
+			for _, sc := range []*scenario{scenarioClaim300, scenarioClaim1000, scenarioClaim3000} {
+				row = append(row, result.rateOf(ofScenario(sc), p, run, verdictIs(1, lagdrift.VerdictDisagree)).short())
+			}
+			row = append(row, result.rateOf(ofKind(kindClaim), p, run, func(r runSummary) bool { return r.reasons[1] == lagdrift.ReasonLowPrecision }).short())
 			t.add(row...)
 		}
 	}
@@ -620,10 +715,12 @@ func durationMs(d time.Duration) string {
 }
 
 // The cadence against the full fit at every ping round, per k_early: the
-// rule's outcome, the worst false-reject cell at 99% and 99.9%, the median
-// stop, and how many runs stopped elsewhere or ended in another verdict.
+// rule's outcome, the worst false-reject cell at 99% and at 99.9% (95% under
+// V11), the median stop, and how many runs stopped elsewhere or ended in
+// another verdict.
 func cadenceTable(refits *studyResult, full *studyResult) string {
-	t := &table{header: []string{"k_early", "Rule: cadence", "full fits", "Worst cell at 99%: cadence", "full fits", "at 99.9%: cadence", "full fits", "Median stop, s: cadence", "full fits", "Runs that stop elsewhere", "Verdicts at 99% that differ"}}
+	other := refits.otherConfidence()
+	t := &table{header: []string{"k_early", "Rule: cadence", "full fits", "Worst cell at 99%: cadence", "full fits", "at " + confidenceName(other) + ": cadence", "full fits", "Median stop, s: cadence", "full fits", "Runs that stop elsewhere", "Verdicts at 99% that differ"}}
 	refitChecks, _ := recommendEarlyK(refits)
 	fullChecks, _ := recommendEarlyK(full)
 	ruleOf := func(checks []earlyKCheck, k float64) string {
@@ -680,7 +777,7 @@ func cadenceTable(refits *studyResult, full *studyResult) string {
 			return ts
 		}
 		t.add(formatK(policy.earlyK), ruleOf(refitChecks, policy.earlyK), ruleOf(fullChecks, policy.earlyK),
-			worst(refits, p, 1), worst(full, q, 1), worst(refits, p, 2), worst(full, q, 2),
+			worst(refits, p, 1), worst(full, q, 1), worst(refits, p, other), worst(full, q, other),
 			quantile(times(refits, p), 0.5), quantile(times(full, q), 0.5),
 			rate{k: moved, n: n}.short(), rate{k: differ, n: n}.short())
 	}
@@ -751,7 +848,14 @@ func vpnPowerTable(parts []*studyPart, results map[string]*studyResult, pool str
 
 // Each VPN part's k_early, false rejects and power side by side.
 func vpnVariantTable(parts []*studyPart, results map[string]*studyResult) string {
-	t := &table{header: []string{"Fleet, choice", "k_early by the rule", "False rejects, 99%, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Worst cell at 99.9%", "Region misses, 99%", "VPN pairs: 1 run", "3 runs", "Median stop, s"}}
+	other := 2
+	for _, part := range parts {
+		if result, ok := results[part.name]; ok && strings.HasPrefix(part.name, "VPN ") {
+			other = result.otherConfidence()
+			break
+		}
+	}
+	t := &table{header: []string{"Fleet, choice", "k_early by the rule", "False rejects, 99%, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Worst cell at " + confidenceName(other), "Region misses, 99%", "VPN pairs: 1 run", "3 runs", "Median stop, s"}}
 	for _, part := range parts {
 		result, ok := results[part.name]
 		if !ok || !strings.HasPrefix(part.name, "VPN ") {
@@ -766,7 +870,7 @@ func vpnVariantTable(parts []*studyPart, results map[string]*studyResult) string
 		worst := rate{}
 		for _, sc := range result.present(honestScenarios) {
 			for run := 0; run < result.runs(); run++ {
-				r := result.rateOf(ofScenario(sc), policy, run, verdictIs(2, lagdrift.VerdictDisagree))
+				r := result.rateOf(ofScenario(sc), policy, run, verdictIs(other, lagdrift.VerdictDisagree))
 				if worst.n == 0 || worst.value() < r.value() {
 					worst = r
 				}
@@ -858,7 +962,7 @@ func calibrationWorldTable(parts []*studyPart, results map[string]*studyResult) 
 		row = append(row, result.rateOf(ofScenario(scenarioTiny), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
 			result.rateOf(ofScenario(scenarioLargeEdge), 0, 0, verdictIs(1, lagdrift.VerdictDisagree)).short(),
 			result.rateOf(ofScenario(scenarioTiny), 0, 0, verdictIs(2, lagdrift.VerdictDisagree)).short())
-		for _, k := range result.empiricalKs(ofScenario(scenarioTiny), 0, 0) {
+		for _, k := range result.empiricalKs(ofScenario(scenarioTiny), 0, 0, []int{0, 1, 2}) {
 			row = append(row, k)
 		}
 		t.add(row...)
@@ -883,69 +987,18 @@ func (self *studyResult) empiricalK(filter visitorFilter, policy int, run int, c
 	return ms[min(len(ms)-1, max(0, int(math.Ceil(confidence*float64(len(ms))))-1))]
 }
 
-// empiricalK at each of the study's confidences, formatted. Nominal: 2.448,
-// 3.035 and 3.717.
-func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int) []string {
+// empiricalK at confidence indexes, formatted. Textbook: 2.448, 3.035 and
+// 3.717.
+func (self *studyResult) empiricalKs(filter visitorFilter, policy int, run int, cs []int) []string {
 	out := []string{}
-	for _, c := range confidences {
-		if k := self.empiricalK(filter, policy, run, c); math.IsNaN(k) {
+	for _, c := range cs {
+		if k := self.empiricalK(filter, policy, run, confidences[c]); math.IsNaN(k) {
 			out = append(out, "–")
 		} else {
 			out = append(out, fmt.Sprintf("%.2f", k))
 		}
 	}
 	return out
-}
-
-// The k options for the user's choice: as now (2.448, 3.035, 3.717), the
-// empirical k (2.448, 3.28, 7.15), and no 99.9% with 3.28 at 99%.
-var kOptionNames = []string{"(a) k as now", "(b) empirical k", "(c) no 99.9%, 3.28 at 99%"}
-
-// The verdict at confidence index c under a k option, false where the option
-// has no such confidence.
-func optionVerdict(option int, r runSummary, c int) (lagdrift.Verdict, bool) {
-	switch {
-	case option == 0:
-		return r.verdicts[c], true
-	case c == 0:
-		return r.verdicts[0], true
-	case c == 1:
-		return r.kVerdicts[0], true
-	case option == 1:
-		return r.kVerdicts[1], true
-	default:
-		return "", false
-	}
-}
-
-func optionK(option int, c int) float64 {
-	if option == 0 || c == 0 {
-		return kAt(c)
-	}
-	return recalibratedKs[c-1]
-}
-
-// False rejects and power under each k option, after 1 and 3 runs.
-func recalibrationTable(result *studyResult, policy int) string {
-	t := &table{header: []string{"k", "Confidence", "False rejects, tiny: 1 run", "3 runs", "real countries: 1 run", "3 runs", "Power: 300 km, 1 run", "3 runs", "1,000 km: 1 run", "3 runs", "3,000 km: 1 run", "3 runs", "real 1,000 km: 1 run", "3 runs"}}
-	last := result.runs() - 1
-	for option := range kOptionNames {
-		for c := range confidences {
-			if _, ok := optionVerdict(option, runSummary{}, c); !ok {
-				continue
-			}
-			disagree := func(r runSummary) bool {
-				v, _ := optionVerdict(option, r, c)
-				return v == lagdrift.VerdictDisagree
-			}
-			row := []string{fmt.Sprintf("%s: %.3f", kOptionNames[option], optionK(option, c)), confidenceName(c)}
-			for _, sc := range []*scenario{scenarioTiny, scenarioRealHonest, scenarioClaim300, scenarioClaim1000, scenarioClaim3000, scenarioRealClaim1000} {
-				row = append(row, result.rateOf(ofScenario(sc), policy, 0, disagree).short(), result.rateOf(ofScenario(sc), policy, last, disagree).short())
-			}
-			t.add(row...)
-		}
-	}
-	return t.String()
 }
 
 // The Mahalanobis distance of p from a fit at at with covariance cov.
@@ -1031,7 +1084,7 @@ func regionKTable(result *studyResult, policy int) string {
 				n += 1
 			}
 		}
-		t.add(append([]string{region, formatThousands(float64(n))}, result.empiricalKs(filter, policy, 0)...)...)
+		t.add(append([]string{region, formatThousands(float64(n))}, result.empiricalKs(filter, policy, 0, []int{0, 1, 2})...)...)
 	}
 	return t.String()
 }

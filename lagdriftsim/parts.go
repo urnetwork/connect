@@ -67,7 +67,7 @@ func capPolicy() stopPolicy {
 func variantPolicies(earlyK float64) []stopPolicy {
 	base := v10Policy(earlyK)
 	policies := []stopPolicy{base}
-	for _, roundTrips := range []int{8, 16} {
+	for _, roundTrips := range otherRoundTrips() {
 		p := base
 		p.roundTrips = roundTrips
 		p.name = "round trips " + itoa(roundTrips)
@@ -108,19 +108,66 @@ type studyPart struct {
 	prepare func(part *studyPart, results map[string]*studyResult)
 }
 
-// The study's world and model unless a part varies them: the route stretch
+// The study's world and model unless a part varies them: the contract as it
+// stands (lag.dev/DRIFTTEST.md, 2026-11-17), with E2's mid band chosen by the
+// ring (the hybrid), V10's cadence, its stops decided on the usable
+// extenders only, at lagdrift's StopRoundTrips, and its interrupted rule,
+// and V11's k for the address's continent with k_early KEarly(k); far
+// sessions opening late, as on the real stack (e2e); the route stretch
 // skewed, κ 0.25 in the world and the model, no misplaced extenders.
 func baseConfig(seed uint64, policies []stopPolicy) studyConfig {
 	return studyConfig{
-		seed:         seed,
-		truthKappa:   lagdrift.DefaultKappa,
-		stretchShape: stretchSkewed,
-		modelKappa:   lagdrift.DefaultKappa,
-		policies:     policies,
-		checkEvery:   7,
-		// V10's cadence, once lagdrift has its warm refit
-		cadence: refitPosition != nil,
+		seed:            seed,
+		truthKappa:      lagdrift.DefaultKappa,
+		stretchShape:    stretchSkewed,
+		modelKappa:      lagdrift.DefaultKappa,
+		policies:        policies,
+		checkEvery:      7,
+		choiceMode:      choiceHybrid,
+		cadence:         refitPosition != nil,
+		stopOnUsable:    true,
+		interruptedRule: true,
+		kByContinent:    v11Ks(),
+		lateFarSessions: true,
 	}
+}
+
+// V11's k at 99% per continent, lagdrift's DefaultK, "" for unknown.
+func v11Ks() map[string]float64 {
+	ks := map[string]float64{}
+	for _, continent := range []string{"AF", "AN", "AS", "EU", "NA", "OC", "SA", ""} {
+		ks[continent] = lagdrift.DefaultK(lagdrift.DefaultConfidence, continent)
+	}
+	return ks
+}
+
+// A config judged at the textbook k, 2.448, 3.035 and 3.717 at 95%, 99% and
+// 99.9%, with k_early EarlyK: the region V11 recalibrated, for the parts that
+// diagnose it.
+func textbook(config studyConfig) studyConfig {
+	config.kByContinent = nil
+	return config
+}
+
+// The usable round trips the stops' evidence compares with lagdrift's
+// StopRoundTrips: 12 beside 8, else 8.
+func besideRoundTrips() int {
+	if lagdrift.StopRoundTrips == 8 {
+		return 12
+	}
+	return 8
+}
+
+// The usable round trips V10's constants compare with lagdrift's
+// StopRoundTrips: the others of 8, 12 and 16.
+func otherRoundTrips() []int {
+	others := []int{}
+	for _, roundTrips := range []int{8, 12, 16} {
+		if roundTrips != lagdrift.StopRoundTrips {
+			others = append(others, roundTrips)
+		}
+	}
+	return others
 }
 
 func counted(scale float64, perRegion int, scenarios ...*scenario) []scenarioCount {
@@ -133,9 +180,11 @@ func counted(scale float64, perRegion int, scenarios ...*scenario) []scenarioCou
 
 // The study's parts, with each scenario's visitors per region times scale.
 func studyParts(seed uint64, scale float64) []*studyPart {
+	// the contract as it stands, under T3's k_early sweep, each value scaled
+	// with the run's k as KEarly scales EarlyK
 	main := &studyPart{
 		name:   "main",
-		about:  "lagdrift as it is: κ 0.25 in the world and the model, 3 runs, the k_early sweep",
+		about:  "the contract as it stands (V10, V11, E2's hybrid choice, far sessions opening late), κ 0.25 in the world and the model, 3 runs, the k_early sweep",
 		config: baseConfig(seed, sweepPolicies()),
 	}
 	main.counts = append(main.counts, counted(scale, 800, scenarioTiny)...)
@@ -143,6 +192,16 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 	main.counts = append(main.counts, counted(scale, 500, scenarioRealHonest)...)
 	main.counts = append(main.counts, counted(scale, 150, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
 	main.counts = append(main.counts, counted(scale, 150, scenarioRealClaim300, scenarioRealClaim1000, scenarioRealClaim3000)...)
+
+	// the same visitors with each session opening after its own round trips
+	// alone, as the study had them before the e2e found far sessions late
+	staggered := &studyPart{
+		name:   "staggered sessions",
+		about:  "the main part's visitors with each session opening after its own round trips alone, as before the e2e found far sessions 2–3 s late; V10, 3 runs",
+		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}),
+		counts: main.counts,
+	}
+	staggered.config.lateFarSessions = false
 
 	// a run that never stops early, beside V10 and V10 without clear
 	noEarly := &studyPart{
@@ -186,7 +245,7 @@ func studyParts(seed uint64, scale float64) []*studyPart {
 		[]stopPolicy{v10Policy(lagdrift.EarlyK)}, other)
 	normal.config.stretchShape = stretchNormal
 
-	parts := []*studyPart{main, noEarly}
+	parts := []*studyPart{main, staggered, noEarly}
 	if refitPosition != nil {
 		// the same visitors with V10's cadence and with the full multi-start
 		// at every ping round
@@ -253,13 +312,7 @@ func v11Parts(seed uint64, scale float64) []*studyPart {
 	honest := append(counted(scale, 800, scenarioTiny), counted(scale, 500, scenarioRealHonest)...)
 	honest = append(honest, counted(scale, 200, scenarioLargeEdge)...)
 	drift := func(name string, about string) *studyPart {
-		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}), counts: honest}
-		part.config.choiceMode = choiceHybrid
-		part.config.kByContinent = map[string]float64{}
-		for _, continent := range []string{"AF", "AN", "AS", "EU", "NA", "OC", "SA", ""} {
-			part.config.kByContinent[continent] = lagdrift.DefaultK(lagdrift.DefaultConfidence, continent)
-		}
-		return part
+		return &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}), counts: honest}
 	}
 	defaults := drift("V11 drift: default k", "the hybrid choice, 3 runs, judged at V11's default k for the address's continent, k_early KEarly(k)")
 	calibrated := drift("V11 drift: lag k", "the same visitors judged at the k calibrated from the lag.dev tracks by V11's upper-bound rule")
@@ -279,43 +332,34 @@ func v11Parts(seed uint64, scale float64) []*studyPart {
 		config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}),
 		counts: append(counted(scale, 2000, scenarioTiny), append(counted(scale, 500, scenarioRealHonest), counted(scale, 300, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)...),
 	}
-	table.config.choiceMode = choiceHybrid
-	table.config.kByContinent = v11Table99
 	return []*studyPart{lag, defaults, calibrated, table}
 }
 
-// V10's stops on the verdict's evidence (e2e): far sessions opening late, as
-// on the real stack, and the frame deciding its stops on every extender with
-// 4 round trips, as before, or on the usable ones only, as V10 now says, at
-// 12 and at 8 usable round trips. The hybrid choice, V11's table, 3 runs.
+// V10's stops on the verdict's evidence (e2e): the frame deciding its stops
+// on every extender with 4 round trips, as before, or on the usable ones
+// only, as V10 says, at lagdrift's StopRoundTrips and at 8 or 12 beside it.
+// The contract otherwise, far sessions late, 3 runs.
 func usableStopParts(seed uint64, scale float64) []*studyPart {
 	counts := append(counted(scale, 800, scenarioTiny), counted(scale, 500, scenarioRealHonest)...)
 	counts = append(counts, counted(scale, 150, scenarioClaim300, scenarioClaim1000, scenarioClaim3000)...)
 	counts = append(counts, counted(scale, 40, scenarioVpnPairs)...)
-	eight := v10Policy(lagdrift.EarlyK)
-	eight.roundTrips = 8
-	eight.name = "round trips 8"
+	other := v10Policy(lagdrift.EarlyK)
+	other.roundTrips = besideRoundTrips()
+	other.name = "round trips " + itoa(other.roundTrips)
 	parts := []*studyPart{}
 	for _, usable := range []bool{false, true} {
 		name := "late sessions: stops on 4"
-		about := "far sessions 3 s × min(1, d / 7,500 km) late; the frame's stops on every extender with 4 round trips"
+		about := "far sessions " + lateSessionText() + " late; the frame's stops on every extender with 4 round trips"
 		if usable {
 			name = "late sessions: stops on usable"
-			about = "far sessions 3 s × min(1, d / 7,500 km) late; the frame's stops on the usable extenders only (V10)"
+			about = "far sessions " + lateSessionText() + " late; the frame's stops on the usable extenders only (V10)"
 		}
-		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), eight}), counts: counts}
-		part.config.choiceMode = choiceHybrid
-		part.config.kByContinent = v11Table99
-		part.config.lateFarSessions = true
+		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK), other}), counts: counts}
 		part.config.stopOnUsable = usable
 		parts = append(parts, part)
 	}
 	return parts
 }
-
-// V11's fixed 99% table (lag.dev/DRIFTTEST.md V11, the user's decision of
-// 2026-11-17), by GeoLite2 continent, "" for AN and unknown.
-var v11Table99 = map[string]float64{"NA": 3.25, "SA": 3.50, "AF": 3.95, "OC": 7.88, "AS": 3.35, "EU": 3.035, "AN": 3.49, "": 3.49}
 
 // Where the region's excess misses come from: honest visitors, one run each,
 // in worlds that each take away a source of error the model's variance
@@ -323,7 +367,7 @@ var v11Table99 = map[string]float64{"NA": 3.25, "SA": 3.50, "AF": 3.95, "OC": 7.
 func calibrationParts(seed uint64, scale float64) []*studyPart {
 	counts := append(counted(scale, 300, scenarioTiny), counted(scale, 100, scenarioLargeEdge)...)
 	part := func(name string, about string, tweak func(*studyConfig)) *studyPart {
-		config := baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+		config := textbook(baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}))
 		config.runs = 1
 		tweak(&config)
 		return &studyPart{name: "calibration: " + name, about: about, config: config, counts: counts}
@@ -355,7 +399,7 @@ func startsParts(seed uint64, scale float64) []*studyPart {
 			name = "starts: wide"
 			about = "the server's verdict from the lowest χ² of lagdrift's fit and a grid of starts around it and the address's place, one run"
 		}
-		part := &studyPart{name: name, about: about, config: baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}), counts: counts}
+		part := &studyPart{name: name, about: about, config: textbook(baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)})), counts: counts}
 		part.config.runs = 1
 		part.config.wideStarts = wide
 		parts = append(parts, part)
@@ -405,7 +449,7 @@ func oceaniaParts(seed uint64, scale float64) []*studyPart {
 		{scenario: scenarioClaim1000, perRegion: max(1, int(math.Round(scale*200))), regions: only},
 	}
 	part := func(name string, about string, tweak func(*studyConfig)) *studyPart {
-		config := baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)})
+		config := textbook(baseConfig(seed, []stopPolicy{v10Policy(lagdrift.EarlyK)}))
 		config.runs = 1
 		tweak(&config)
 		return &studyPart{name: "Oceania: " + name, about: about, config: config, counts: counts}
