@@ -59,7 +59,7 @@ func TestOrdinaryBridgePureAckBatchPreservesFeedbackCustody(t *testing.T) {
 		selected.ctx, selected.client, selected.settings = parent.ctx, f.sender, parent.settings
 		selected.args = &multiClientChannelArgs{Destination: RequireMultiHopId(f.receiver.ClientId())}
 		update.client.Store(selected)
-		t.Cleanup(func() { closeParent(); selected.closeConnectSynOwners() })
+		t.Cleanup(closeParent)
 		var received [][]byte
 		f.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 			for _, frame := range frames {
