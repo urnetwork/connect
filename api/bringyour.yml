@@ -6190,9 +6190,10 @@ paths:
         origins (`bringyourctl network drift-test`); without either list any
         `https:` origin is accepted, and so is an unknown one. For
         development, `http://localhost` and `http://127.0.0.1` on any port
-        count wherever `https:` origins do. `confidence` is 0.95, 0.99 (the
-        default) or 0.999. `reference` is at most 128 characters and is
-        returned as given.
+        count wherever `https:` origins do. `confidence` is 0.95 or 0.99, the
+        default; 0.999 is refused as `invalid`, since an honest 99.9% region
+        is too wide to reject anything near. `reference` is at most 128
+        characters and is returned as given.
 
         An Embed API: the network's root JWT or an API key, on a network the
         URnetwork team has enabled Embed for. Every refusal carries
@@ -22947,9 +22948,9 @@ components:
             type: string
             example: https://example.com
         confidence:
-          description: The verdict's confidence (V6). Default 0.99.
+          description: The verdict's confidence (V6, V11). Default 0.99.
           type: number
-          enum: [0.95, 0.99, 0.999]
+          enum: [0.95, 0.99]
         reference:
           description: Your own reference, at most 128 characters, returned as given.
           type: string
@@ -23033,7 +23034,9 @@ components:
             Once complete: `counted`, or why the run stays out of the
             verdict: `ip_family_mismatch` for a run from the other address
             family outside `client_ip`'s country, or whose sessions mostly
-            took the other family; `failed` for a run of a test that failed.
+            took the other family; `too_few_extenders` for a run with fewer
+            than 6 usable extenders, each with 8 or more round trips;
+            `failed` for a run of a test that failed.
           type: string
           enum: [counted, ip_mismatch, ip_family_mismatch, stopped_early, too_few_extenders, reports_missing, failed]
 
@@ -23171,6 +23174,12 @@ components:
           type: [integer, "null"]
         confidence:
           type: number
+        k:
+          description: |
+            The region's k the verdict was judged at (V11): the largest of its
+            runs', each from V11's table for `client_ip`'s continent at the
+            token's confidence. Absent while no run is in the verdict.
+          type: number
         geometry_version:
           description: The borders the verdict was judged against.
           type: string
@@ -23283,7 +23292,12 @@ components:
           type: boolean
 
     LagDriftIpPlace:
-      description: The place the caller's address resolves to, which the radar centers on.
+      description: |
+        The place the run's fits measure from, which the radar centers on:
+        the start address's place at its city's own point, else `client_ip`'s
+        country, with no region or city, at the middle of the box around its
+        largest outline. The frame's fits start from this point, as the
+        server's do.
       type: object
       required: []
       properties:
@@ -23354,6 +23368,15 @@ components:
         confidence:
           description: The token's confidence, at which the radar draws the region.
           type: number
+        k:
+          description: |
+            The region's k at the token's confidence for `client_ip`'s
+            continent, from V11's table, which the run is judged at; for the
+            `demo` token, for its own address's continent.
+          type: number
+        k_early:
+          description: The k a `clear` stop is judged at, never below the verdict's.
+          type: number
         ip:
           $ref: "#/components/schemas/LagDriftIpPlace"
         tickets:
@@ -23369,7 +23392,7 @@ components:
         pin:
           description: |
             The API's origin in client_ip's family, such as
-            `https://api4.bringyour.com`, for a start that arrived over the
+            `https://api-v4.bringyour.com`, for a start that arrived over the
             other family. The frame sends the same start there, and once more
             here with `unpinned` if it can't connect within 3 s.
           type: string
