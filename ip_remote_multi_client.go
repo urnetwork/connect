@@ -409,6 +409,13 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		WindowErrorBackoffMax:     15 * time.Second,
 		WindowRateLimitBackoffMin: 5 * time.Second,
 		WindowRateLimitBackoffMax: 2 * time.Minute,
+		// a busy registration bound frees a slot within one registration's
+		// hold (0.05-0.12 s on Main, 2026-11-18): a window with no usable exit
+		// asks again after 250-500 ms, five times until it has an exit and
+		// at most five times a minute, before the rate-limit backoff
+		WindowRegistrationBusyRetry:         500 * time.Millisecond,
+		WindowRegistrationBusyRetryMaxCount: 5,
+		WindowRegistrationBusyRetryPeriod:   time.Minute,
 		// an unreachable fixed destination is re-dialed after 7.5-15s, then
 		// half as often per failure down to once per 2.5-5 minutes
 		FixedDestinationRetryMin: 15 * time.Second,
@@ -1181,6 +1188,23 @@ type MultiClientSettings struct {
 	// lockstep no matter how long the delay. Any success resets it.
 	WindowRateLimitBackoffMin time.Duration
 	WindowRateLimitBackoffMax time.Duration
+	// WindowRegistrationBusyRetry is the retry delay, jittered to [d/2, d), of
+	// a mint refused because an in-process registration bound was full
+	// (ClientRegistrationBusyError) while the window has no usable exit. Such a
+	// bound frees a slot within one registration's hold, so the rate-limit
+	// backoff above only delayed the window's first exit: on Main from
+	// 2026-11-14 one, two or three refusals cost a new hosted proxy's first
+	// CONNECT about 4, 11 or 27 s (server proxy/P90SPEED.md §3.3). A window
+	// takes at most WindowRegistrationBusyRetryMaxCount of these retries until
+	// it has a usable exit again, and at most that many in any
+	// WindowRegistrationBusyRetryPeriod; past either it takes the rate-limit
+	// backoff, which these retries never advance. Every other rate limit,
+	// such as the platform API's, always takes the backoff. Nonpositive
+	// WindowRegistrationBusyRetry or WindowRegistrationBusyRetryMaxCount
+	// retries every refusal on the backoff.
+	WindowRegistrationBusyRetry         time.Duration
+	WindowRegistrationBusyRetryMaxCount int
+	WindowRegistrationBusyRetryPeriod   time.Duration
 	// WindowErrorBackoffMax bounds the same jittered doubling for every other
 	// generator failure, from WindowEnumerateErrorTimeout: a deadline, an
 	// exhausted connection pool, a 503 or an auth refusal. The flat 1s retry
@@ -12918,6 +12942,15 @@ type multiClientWindow struct {
 	rateLimitStreak atomic.Uint64
 	// Consecutive non-rate-limit generator failures, shared the same way.
 	errorStreak atomic.Uint64
+	// The short retries of busy registration refusals the window took
+	// (ip_remote_multi_client_registration_busy.go). Guarded by stateLock.
+	registrationBusyRetry registrationBusyRetryState
+	// Why the enumerator last had no candidate to offer (a mintStarve value),
+	// for an expansion pass that tried no provider.
+	mintStarve atomic.Int32
+	// The candidates the window's expansion passes have built; a pass reads
+	// it to tell whether it tried a provider.
+	expandCandidateCount atomic.Uint64
 	// Replaces the uniform jitter offset in [0, half) with a deterministic
 	// one. Production leaves it unset.
 	retryJitterForTest func(half time.Duration) time.Duration
@@ -14203,6 +14236,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
 			class := self.recordEvaluationFailure(windowFailurePlatform, err)
+			self.mintStarve.Store(mintStarveOther)
 			if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 				return
 			}
@@ -14232,6 +14266,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					suppressedSuffix(suppressed))
 			}
 			self.recordEvaluationFailure(windowFailureProvider, nil)
+		}
+		if len(destinations) == 0 {
+			self.mintStarve.Store(mintStarveOther)
 		}
 
 		// the probe found the candidate it asked for: the resize pass may now
@@ -14364,11 +14401,17 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
 						class := self.recordEvaluationFailure(windowFailurePlatform, err)
-						if !self.waitWindowRetry(self.ctx, class, networkChanged) {
+						if class == windowFailureRateLimit {
+							self.mintStarve.Store(mintStarveRefused)
+						} else {
+							self.mintStarve.Store(mintStarveOther)
+						}
+						if !self.waitMintRetry(self.ctx, class, err, networkChanged) {
 							return
 						}
 						continue
 					}
+					self.mintStarve.Store(mintStarveNone)
 					self.windowRetryReset()
 					if serviceOwner != nil && !self.serviceRefreshLive(serviceOwner) {
 						self.generator.RemoveClientArgs(clientArgs)
@@ -15389,6 +15432,7 @@ func (self *multiClientWindow) resize() {
 				self.stateLock.Unlock()
 			}
 			passProfileGeneration := self.currentProfileGeneration()
+			passCandidateCount := self.expandCandidateCount.Load()
 			addedCount = self.expand(
 				windowSize,
 				len(clients),
@@ -15407,11 +15451,12 @@ func (self *multiClientWindow) resize() {
 				})
 			}
 			// a pass a profile change ended says nothing of the providers: it
-			// neither starts the expansion backoff nor clears it
+			// neither starts the expansion backoff nor clears it, and neither
+			// does a pass whose mints were all refused
 			if !fixedDestination && self.currentProfileGeneration() == passProfileGeneration {
 				if 0 < addedCount && (refresh.owner == nil || refresh.update.receivedInbound.Load()) {
 					self.noteDiscoveryExpandAdmitted()
-				} else {
+				} else if !self.expandPassOnlyRefusedMints(passCandidateCount) {
 					self.noteDiscoveryExpandUnproductive(time.Now(), expandPass.serviceRefresh)
 				}
 			}
@@ -16275,6 +16320,8 @@ requestCandidates:
 				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				return
 			}
+			// the pass tries a provider (see expandPassOnlyRefusedMints)
+			self.expandCandidateCount.Add(1)
 			client, err := newMultiClientChannel(
 				evaluationCtx,
 				args,
