@@ -10450,8 +10450,15 @@ paths:
                 $ref: "#/components/schemas/SnPayoutArtifact"
         "400":
           description: The hash is missing or not a canonical content key.
+        "404":
+          description: |
+            No payout artifact is stored under this hash. Clients take the
+            answer as final for the hash and do not ask again. The v1 carry
+            sweep's root commits the hash of its sweep record, which is not a
+            payout artifact: the record is a ledger object, served by
+            `/sn/ledger/object`.
         "502":
-          description: The artifact is unavailable or failed its integrity recheck.
+          description: The artifact store failed to answer, or the stored bytes failed their integrity recheck.
         "503":
           description: The artifact store is unavailable.
 
