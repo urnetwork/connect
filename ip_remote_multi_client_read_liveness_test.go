@@ -99,7 +99,7 @@ func TestBlackholeReadTimeoutOnlyPeerAckRestartsClock(t *testing.T) {
 				channel := newPacketTransferTestChannel()
 				channel.settings.BlackholeTimeout = 30 * time.Second
 				path := udpTestPath(4)
-				channel.addSend(64, path) // one reliable owner remains throughout
+				_, firstBucketSerial := channel.addSend(64, path) // one reliable owner remains throughout
 				first := channel.pendingSendTime
 				time.Sleep(10 * time.Second)
 				if grouped {
@@ -107,8 +107,8 @@ func TestBlackholeReadTimeoutOnlyPeerAckRestartsClock(t *testing.T) {
 					channel.addSendGroup(group)
 					channel.observePacketGroupTransferCompletion(group, false, nil)
 				} else {
-					channel.addSend(64, path)
-					channel.observePacketTransferCompletion(64, time.Time{}, false, nil)
+					_, bucketSerial := channel.addSend(64, path)
+					channel.observePacketTransferCompletion(64, bucketSerial, time.Time{}, false, nil)
 				}
 				channel.addBusyProbeAck()
 				if !channel.pendingSendTime.Equal(first) || !channel.lastSendAckTime.IsZero() || channel.packetStats.sendNackCount != 1 {
@@ -132,7 +132,7 @@ func TestBlackholeReadTimeoutOnlyPeerAckRestartsClock(t *testing.T) {
 				if got := readLivenessReason(t, channel); got != blackholeNoSendAck {
 					t.Fatalf("historical ACK hid a later stalled run: %s", got)
 				}
-				channel.addSendAbandoned(64)
+				channel.addSendAbandoned(64, firstBucketSerial)
 				if got := readLivenessReason(t, channel); got != blackholeNone {
 					t.Fatalf("abandoned owner resurrected from old bucket: %s", got)
 				}

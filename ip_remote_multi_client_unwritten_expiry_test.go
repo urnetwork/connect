@@ -158,8 +158,8 @@ func TestReliableIpUnwrittenExpiryKeepsStructuralFailures(t *testing.T) {
 					channel.addSendGroup(group)
 					channel.observePacketGroupTransferCompletion(group, true, row.err)
 				} else {
-					channel.addSend(1000, icmpTcpTestPath(4))
-					channel.observePacketTransferCompletion(1000, time.Now(), true, row.err)
+					_, bucketSerial := channel.addSend(1000, icmpTcpTestPath(4))
+					channel.observePacketTransferCompletion(1000, bucketSerial, time.Now(), true, row.err)
 				}
 				if _, err := channel.WindowStats(); (err == nil) != row.local {
 					t.Fatalf("completion=%v, want packet-local=%t", err, row.local)

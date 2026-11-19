@@ -2,7 +2,10 @@
 // through their original stats buckets.
 package connect
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 // Matches the destination projection of the raw IPv4 and IPv6 path maps.
 type receiveAckDestination struct {
@@ -25,44 +28,127 @@ func receiveAckDestinationOf(path *IpPath) receiveAckDestination {
 
 // One distinct destination in one raw event bucket. An offer may keep this
 // scalar entry alive after expiry, but it does not keep the bucket maps alive.
-// Channel stateLock guards its lifetime and counts.
+// The first offer time is an immutable origin. The source and admission
+// publish qualified offsets atomically. Channel stateLock guards the counts.
 type receiveAckDestinationUse struct {
-	destination receiveAckDestination
-	pending     int
-	retained    bool
-	retired     bool
+	destination        receiveAckDestination
+	firstOfferTime     time.Time
+	firstSecuredOffset atomic.Uint64
+	pending            int
+	retained           bool
+	retired            bool
 }
 
 // One original offer can complete before its admission call returns. The
 // immutable destination entry is set before handoff, and stateLock orders the
-// public return and completion. The source sets dispatched.
+// public return and completion. An offset starts at one so zero needs no
+// observation. Disposition bits join source events with the public return.
 type receiveAckOffer struct {
-	use        *receiveAckDestinationUse
-	dispatched atomic.Bool
-	admitted   bool
-	finished   bool
-	unwritten  bool
+	use         *receiveAckDestinationUse
+	clockOffset uint64
+	disposition atomic.Uint32
+	admitted    bool
+	finished    bool
+	unwritten   bool
+}
+
+const (
+	receiveAckSourceDispatched uint32 = 1 << iota
+	receiveAckClockAdmitted
+	receiveAckClockSecured
+)
+
+// Only an admitted original with irreversible source evidence can start a
+// mixed bucket's receive clock. Source callbacks may precede public return.
+// The atomic minimum retains one offset per tuple and no packet or bucket.
+func (self *receiveAckOffer) observeDisposition(flags uint32) {
+	if self.clockOffset == 0 {
+		if flags&receiveAckSourceDispatched != 0 {
+			self.disposition.Store(receiveAckSourceDispatched)
+		}
+		return
+	}
+	if self.disposition.Load()&flags == flags {
+		return
+	}
+	previous := self.disposition.Or(flags)
+	const ready = receiveAckClockAdmitted | receiveAckClockSecured
+	if previous&ready == ready || (previous|flags)&ready != ready {
+		return
+	}
+	earliest := &self.use.firstSecuredOffset
+	for current := earliest.Load(); current == 0 || self.clockOffset < current; current = earliest.Load() {
+		if earliest.CompareAndSwap(current, self.clockOffset) {
+			return
+		}
+	}
+}
+
+// A selected carrier accepted the original. A later missing peer ACK cannot
+// retract that evidence or restart its clock.
+func (self *receiveAckOffer) observeCarrierWrite(TransportType) {
+	self.observeDisposition(receiveAckSourceDispatched | receiveAckClockSecured)
+}
+
+// The provider consumes an empty reset as a terminal action on either a live
+// or an absent TCP flow. Other TCP controls and payload keep their eligibility.
+func terminalReceiveAckReset(path *IpPath) bool {
+	return path.Protocol == IpProtocolTcp && path.Rst && !path.Syn && !path.Fin && path.TcpPayloadByteCount == 0
+}
+
+// A real nonempty window owns its receive clock. Bare classifier samples
+// have no buckets and retain their historical clock.
+func receiveAckOfferSince(stats *clientWindowStats) time.Time {
+	if 0 < stats.bucketCount {
+		return stats.firstReceiveAckOfferTime
+	}
+	return stats.firstSendNackTime
+}
+
+// Ordinary buckets keep the historical send clock. A bucket containing a
+// terminal reset can start receive silence only with another eligible offer.
+func (self *multiClientEventBucket) receiveAckOfferSinceWithLock() time.Time {
+	if !self.terminalResetOffered {
+		return self.sendNackTime
+	}
+	var first time.Time
+	for _, use := range self.receiveAckDestinationUses {
+		if offset := use.firstSecuredOffset.Load(); offset != 0 && (use.pending != 0 || use.retained) {
+			offered := use.firstOfferTime.Add(time.Duration(offset - 1))
+			if first.IsZero() || offered.Before(first) {
+				first = offered
+			}
+		}
+	}
+	return first
 }
 
 // Called alongside offered-path accounting. A destination with irreversible
 // evidence in this bucket needs no offer or additional admission lock.
-func (self *multiClientEventBucket) prepareReceiveAckOfferWithLock(path *IpPath, offer *receiveAckOffer) {
+func (self *multiClientEventBucket) prepareReceiveAckOfferWithLock(path *IpPath, offer *receiveAckOffer, resetOnly bool) {
+	if resetOnly {
+		self.terminalResetOffered = true
+		return
+	}
 	if offer == nil {
 		return
 	}
 	destination := receiveAckDestinationOf(path)
 	use := self.receiveAckDestinationUses[destination]
-	if use != nil && use.retained {
+	if use != nil && use.retained && use.firstSecuredOffset.Load() != 0 {
 		return
 	}
 	if use == nil {
-		use = &receiveAckDestinationUse{destination: destination}
+		use = &receiveAckDestinationUse{destination: destination, firstOfferTime: self.eventTime}
 		if self.receiveAckDestinationUses == nil {
 			self.receiveAckDestinationUses = map[receiveAckDestination]*receiveAckDestinationUse{}
 		}
 		self.receiveAckDestinationUses[destination] = use
 	}
 	offer.use = use
+	if use.firstSecuredOffset.Load() == 0 {
+		offer.clockOffset = uint64(self.eventTime.Sub(use.firstOfferTime)) + 1
+	}
 }
 
 // Public success publishes the still-live offer. An inline unwritten terminal
@@ -75,7 +161,11 @@ func (self *multiClientChannel) admitReceiveAckOffer(offer *receiveAckOffer) {
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if use.retired || use.retained || offer.unwritten {
+	if use.retired || offer.unwritten {
+		return
+	}
+	offer.observeDisposition(receiveAckClockAdmitted)
+	if use.retained {
 		return
 	}
 	if use.pending == 0 {
@@ -101,7 +191,10 @@ func (self *multiClientChannel) finishReceiveAckOffer(offer *receiveAckOffer, no
 	if use == nil {
 		return
 	}
-	unwritten := !offer.dispatched.Load() && receiveAckTransferUnwritten(err, noAck)
+	if err == nil {
+		offer.observeDisposition(receiveAckClockSecured)
+	}
+	unwritten := offer.disposition.Load()&receiveAckSourceDispatched == 0 && receiveAckTransferUnwritten(err, noAck)
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if use.retired || use.retained {
@@ -123,7 +216,7 @@ func (self *multiClientChannel) finishReceiveAckOffer(offer *receiveAckOffer, no
 // Physical carrier acceptance precedes completion, including per-chunk
 // writes. Multiplex the same existing callback to preserve attribution.
 func (self *parsedPacketGroup) observeReceiveAckNoAckRouteWrite(transportType TransportType) {
-	self.receiveAckOffer.dispatched.Store(true)
+	self.receiveAckOffer.observeCarrierWrite(transportType)
 	if attribution := self.transportAttribution; attribution != nil {
 		attribution.observe(transportType)
 	}

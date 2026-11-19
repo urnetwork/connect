@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -149,8 +150,8 @@ func TestSendStalledAbandonedSendDisarms(t *testing.T) {
 	stallTimeout := 20 * time.Millisecond
 	client := stallTestChannel()
 
-	client.addSend(1440, udpTestPath(4))
-	client.addSendAbandoned(1440)
+	_, bucketSerial := client.addSend(1440, udpTestPath(4))
+	client.addSendAbandoned(1440, bucketSerial)
 
 	// past the window: a clock left armed by the refusal would convict here
 	time.Sleep(stallTimeout + 30*time.Millisecond)
@@ -172,52 +173,52 @@ func TestSendStalledAbandonPartialKeepsClock(t *testing.T) {
 	stallTimeout := 20 * time.Millisecond
 	client := stallTestChannel()
 
-	client.addSend(1440, udpTestPath(4))
-	client.addSend(1440, udpTestPath(4))
-	client.addSendAbandoned(1440)
+	_, firstBucketSerial := client.addSend(1440, udpTestPath(4))
+	_, secondBucketSerial := client.addSend(1440, udpTestPath(4))
+	client.addSendAbandoned(1440, firstBucketSerial)
 
 	time.Sleep(stallTimeout + 30*time.Millisecond)
 	// one send is still genuinely outstanding and unacked past the window
 	AssertEqual(t, client.sendStalled(stallTimeout), true)
 
-	client.addSendAbandoned(1440)
+	client.addSendAbandoned(1440, secondBucketSerial)
 	AssertEqual(t, client.sendStalled(stallTimeout), false)
 }
 
-// the bucket a send recorded into can rotate before the transport reports the
-// refusal. the undo then lands on the newest bucket, clamped at zero -- never
-// below -- while the aggregate stays exact
+// A late retraction preserves newer sends whether the original bucket is
+// still retained or has aged out of the stats window.
 func TestSendStalledAbandonAfterBucketRotation(t *testing.T) {
-	client := stallTestChannel()
+	for _, test := range []struct {
+		delay       time.Duration
+		bucketCount int
+	}{
+		{delay: 2 * time.Second, bucketCount: 2},
+		{delay: 31 * time.Second, bucketCount: 1},
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			client := stallTestChannel()
+			_, bucketSerial := client.addSend(1440, udpTestPath(4))
+			time.Sleep(test.delay)
+			client.addSend(100, udpTestPath(4))
+			client.addSendAbandoned(1440, bucketSerial)
 
-	// the refused send records into the current bucket...
-	client.addSend(1440, udpTestPath(4))
-
-	// ...which then rotates: age it past the bucket duration so the next
-	// event opens a fresh one, exactly as the real clock would
-	client.stateLock.Lock()
-	for _, eventBucket := range client.eventBuckets {
-		eventBucket.createTime = eventBucket.createTime.Add(-2 * client.settings.StatsWindowBucketDuration)
+			client.stateLock.Lock()
+			defer client.stateLock.Unlock()
+			AssertEqual(t, client.packetStats.sendNackCount, 1)
+			AssertEqual(t, client.packetStats.sendNackByteCount, ByteCount(100))
+			AssertEqual(t, client.pendingSendTime.IsZero(), false)
+			if len(client.eventBuckets) != test.bucketCount {
+				t.Fatalf("delay %s: %d buckets, want %d", test.delay, len(client.eventBuckets), test.bucketCount)
+			}
+			newestBucket := client.eventBuckets[test.bucketCount-1]
+			AssertEqual(t, newestBucket.sendNackCount, 1)
+			AssertEqual(t, newestBucket.sendNackByteCount, ByteCount(100))
+			if test.bucketCount == 2 {
+				AssertEqual(t, client.eventBuckets[0].sendNackCount, 0)
+				AssertEqual(t, client.eventBuckets[0].sendNackByteCount, ByteCount(0))
+			}
+		})
 	}
-	client.stateLock.Unlock()
-
-	client.addSend(100, udpTestPath(4))
-	client.addSendAbandoned(1440)
-
-	client.stateLock.Lock()
-	defer client.stateLock.Unlock()
-
-	// the aggregate is exact whatever happened to the buckets: one send (the
-	// small one) is still genuinely outstanding, and its clock still runs
-	AssertEqual(t, client.packetStats.sendNackCount, 1)
-	AssertEqual(t, client.packetStats.sendNackByteCount, ByteCount(100))
-	AssertEqual(t, client.pendingSendTime.IsZero(), false)
-
-	// the newest bucket recorded less than the abandoned send, so the
-	// decrement clamps rather than going negative
-	newestBucket := client.eventBuckets[len(client.eventBuckets)-1]
-	AssertEqual(t, newestBucket.sendNackCount, 0)
-	AssertEqual(t, newestBucket.sendNackByteCount, ByteCount(0))
 }
 
 // a channel whose transport set is empty holds outstanding sends because its
@@ -261,13 +262,13 @@ func TestSendStalledTransportDownHolds(t *testing.T) {
 // missing bucket
 func TestSendStalledAbandonWithNoBuckets(t *testing.T) {
 	client := stallTestChannel()
-	client.addSend(1440, udpTestPath(4))
+	_, bucketSerial := client.addSend(1440, udpTestPath(4))
 
 	client.stateLock.Lock()
 	client.eventBuckets = nil
 	client.stateLock.Unlock()
 
-	client.addSendAbandoned(1440)
+	client.addSendAbandoned(1440, bucketSerial)
 
 	client.stateLock.Lock()
 	defer client.stateLock.Unlock()
