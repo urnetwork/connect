@@ -1072,6 +1072,16 @@ type WebRtcSettings struct {
 	// loopback-capable connect past the test deadline at STUN check pacing.
 	// Production callers leave it false.
 	UseLoopbackOnlyIceInterfaces bool
+	// When set, the client opens no p2p peer connection: its stream manager
+	// takes no StreamOpen, so its peers stay on the platform transport, and the
+	// manager refuses a peer connection to anything that asks
+	// (ErrPeerConnectionsDisabled). A peer connection gathers ice
+	// candidates from this host's own interfaces, sends them to the peer and
+	// carries the stream over this host's udp, so a client whose egress is a
+	// proxy sets it: otherwise the peer sees this host's address and the stream
+	// leaves outside the proxy (net_proxy_packet_path.go; the sdk sets it for
+	// every client of such a space). False, the default, keeps p2p.
+	DisablePeerConnections bool
 	// IceIpVersion, 4 or 6, gathers candidates of that family alone, so every
 	// ICE pair is of it. The operator's webrtc probe of an extender
 	// activation pins the family the activation was posted for, since the
@@ -2570,6 +2580,11 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 	return firstCandidateError
 }
 
+// The refusal of a p2p peer connection by a manager whose settings turn peer
+// connections off (WebRtcSettings.DisablePeerConnections). Nothing was gathered
+// or sent.
+var ErrPeerConnectionsDisabled = errors.New("this client opens no peer connection: its egress cannot carry ice")
+
 func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
 	return self.newP2pConnActiveWithTransportDelay(ctx, path, nil)
 }
@@ -2608,6 +2623,11 @@ func (self *WebRtcManager) newP2pConn(
 	active bool,
 	offerTransportDelay bool,
 ) (conn *peerConn, err error) {
+	if self.settings.DisablePeerConnections {
+		// no candidate of this host's is gathered, and no factory is built
+		err = ErrPeerConnectionsDisabled
+		return
+	}
 	if err = ctx.Err(); err != nil {
 		return
 	}

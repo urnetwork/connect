@@ -98,6 +98,27 @@ func dialControlTlsWithFamilyFallback(
 		}
 		network = narrowed
 	}
+	// A space whose egress is a proxy reaches the proxy over this host's family
+	// and the target over the proxy's, which the proxy picks: the connection's
+	// family is the first leg's, and neither its connect failure nor its
+	// handshake says anything about this host's path to the target. The ledger
+	// is process wide, so learning from such a dial would let one slow proxy
+	// steer every dial of this host away from a family that works, the dials of
+	// a miner's other slots and of its direct slot included (connect#227). It is
+	// dialed and handshaken once, in the caller's budget, and the ledger is
+	// neither written nor refuted.
+	if settings != nil && settings.ProxySettings != nil {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn, err := handshake(ctx, conn)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
 	// a move's targets stand in for the name below this layer
 	// (resident_move.go), so the dial is to fixed addresses, as a literal is:
 	// a failure there says nothing about a family the name could resolve to

@@ -1763,6 +1763,17 @@ type ClientSettings struct {
 	// anyway. The zero value publishes.
 	SkipClientKeyPublication bool
 
+	// Keep the platform's ObservedAddresses out of the process's provider-local
+	// guard (transfer_observed_addresses.go): the address the platform sees
+	// this client's transports at is not this host's, as for a client whose
+	// egress is a proxy, whose transports the platform sees at the proxy. The
+	// guard is process wide and each client's message replaces it, so taking
+	// them would let a proxied client replace this host's own public address
+	// in the guard every provider policy of the process reads, a direct
+	// provider's exit and extender forward included. The sdk sets it for every
+	// client of a space whose egress is a proxy. The zero value takes them.
+	SkipObservedAddresses bool
+
 	ProtocolVersion int
 
 	DefaultTransferOpts TransferOptions

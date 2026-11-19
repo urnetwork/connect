@@ -133,6 +133,10 @@ type IcmpBufferSettings struct {
 	// tolerates
 	OutstandingLimit int
 
+	// Set by the nat on its own copy when its tcp or udp egress is a proxy
+	// (LocalUserNat construction): an echo socket is this host's, outside the
+	// proxy, which carries no icmp, so no echo flow opens one.
+	proxiedEgress bool
 	// Tests replace the platform echo backend. Nil is a production no-op.
 	newEgressForTest func(ctx context.Context, ipVersion int, destinationIp net.IP, settings *IcmpBufferSettings) (icmpEgress, error)
 	// Tests count the arms of a flow's idle timer. Runs on the flow's send
@@ -784,6 +788,13 @@ func (self *IcmpSequence) Run() {
 	}()
 
 	self.log.V(2).Infof("[init]icmp connect\n")
+	if self.icmpBufferSettings.proxiedEgress {
+		// an exit whose egress is a proxy sends no echo from this host: the
+		// flow drops, as it does where the platform has no echo socket
+		// (net_proxy_packet_path.go)
+		self.log.V(1).Infof("[init]icmp connect refused: the exit's egress is a proxy, which carries no icmp\n")
+		return
+	}
 	newEgress := newIcmpEgress
 	if self.icmpBufferSettings.newEgressForTest != nil {
 		newEgress = self.icmpBufferSettings.newEgressForTest

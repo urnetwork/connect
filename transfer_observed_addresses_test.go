@@ -35,9 +35,19 @@ type observedAddressesSender struct {
 
 func newObservedAddressesHarness(t *testing.T, cidrs ...string) *observedAddressesHarness {
 	t.Helper()
+	return newObservedAddressesHarnessWithSettings(t, nil, cidrs...)
+}
+
+// newObservedAddressesHarness with `configure`, when set, applied to the
+// client's settings before the client is built.
+func newObservedAddressesHarnessWithSettings(t *testing.T, configure func(settings *ClientSettings), cidrs ...string) *observedAddressesHarness {
+	t.Helper()
 	networks, _ := newTestProviderLocalNetworks(t, newTestProviderLocalRead(t, cidrs...))
 	settings := closeWaitClientSettings()
 	settings.providerLocalNetworksForTest = networks
+	if configure != nil {
+		configure(settings)
+	}
 	self := &observedAddressesHarness{
 		t:         t,
 		networks:  networks,

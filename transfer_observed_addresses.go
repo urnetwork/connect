@@ -17,11 +17,18 @@ import (
 // addresses with the platform's. A ReceiveFunction: frames are borrowed, and
 // only the control source is trusted, so a peer cannot add or clear addresses
 // through an ordinary data path. Every client applies the message, provider or
-// not, so a provider started later on the same host starts with them. It never
+// not, so a provider started later on the same host starts with them, except a
+// client the platform sees at another host's address, such as a proxy's
+// (ClientSettings.SkipObservedAddresses). It never
 // blocks: the guard republishes from its last interface read, and validates
 // and bounds the addresses itself.
 func (self *Client) receiveObservedAddresses(source TransferPath, frames []*protocol.Frame, peer Peer) {
 	if !source.IsControlSource() {
+		return
+	}
+	if self.settings.SkipObservedAddresses {
+		// the addresses are those of the proxy this client's transports go
+		// through, not this host's (ClientSettings.SkipObservedAddresses)
 		return
 	}
 	for _, frame := range frames {
