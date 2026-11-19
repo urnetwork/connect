@@ -89,7 +89,9 @@ func newTestingFamilyStrategySettingsWithResolver(t *testing.T, resolver *net.Re
 type testingFamilyConnection struct {
 	remoteFamily int
 	intent       string
-	conn         *websocket.Conn
+	// the HeaderEgressProxy of the handshake (transport_egress_proxy.go)
+	egressProxy string
+	conn        *websocket.Conn
 }
 
 // testingFamilyPlatformServer is a silent websocket platform bound to one
@@ -162,6 +164,7 @@ func newTestingFamilyPlatformServerOnPort(t *testing.T, ipVersion int, port int,
 		platform.connections <- testingFamilyConnection{
 			remoteFamily: remoteFamily,
 			intent:       r.Header.Get(HeaderIpFamily),
+			egressProxy:  r.Header.Get(HeaderEgressProxy),
 			conn:         ws,
 		}
 		first := true
