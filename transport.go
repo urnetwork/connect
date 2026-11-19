@@ -61,15 +61,41 @@ const DebugCloseSend = false
 
 // The platform WebSocket/H1+ writer combines only messages already waiting on
 // its bounded route; it never waits to fill a batch, so sparse traffic is
-// written immediately and alone. ACK-sized traffic may drain thirty-two at
-// once; ordinary data stops once the batch has reached the drain bound, 4 KiB
-// below the physical write bound, so one complete ordinary <=4-KiB H1 data
-// message still fits a single write. With the 20-KiB write bound a sustained
-// download carries five three-packet Transfer messages per stream write instead
-// of four: a fifth fewer writer wake-ups, deadline arms, framer flushes and TLS
-// Write calls per byte. The bound stays modest so one flush adds little
-// head-of-line delay for the ACK and control traffic queued behind it on a slow
-// uplink. Both client writer buffers start at the historical 16 KiB and grow to
+// written immediately and alone. ACK-sized traffic may drain 384 at
+// once; ordinary data stops once the batch has reached the drain bound, 8 KiB
+// below the physical write bound, so one more complete H1 data message (a
+// six-packet Transfer message seals to 6,896 bytes, see
+// sendPackH1EstablishedGroupMaxMessageByteCount) and every message's framing still
+// fit a single write. With the 1,792-KiB write bound a sustained download
+// carries up to about 265 six-packet Transfer messages per stream write: far fewer
+// writer wake-ups, deadline arms, framer flushes and TLS Write calls per byte.
+// The message bound and the byte bound are sized together, and the route queue
+// of an unbudgeted process holds one such batch
+// (DefaultPlatformTransportSettings), so the next write is ready when the
+// current one returns. The cost is head-of-line delay: an ACK or control
+// message that becomes ready during a flush waits for that flush, at most one
+// bound of bytes (about 1.5 s on a 10 Mbit/s uplink). The bounds were 576 KiB
+// and 96 messages while an unbudgeted transfer window was 2 MiB: one bulk
+// return did not fill larger ones. Under the unbudgeted rule window
+// (unbudgetedRuleWindowByteCount) and its lead bound
+// (tcpReturnScheduleLeadByteCount) it does, and a provider write pays its path
+// latency once however much it carries, so fewer, larger writes return a bulk
+// transfer sooner.
+// The base wrote at most 20 KiB and drained at most 32 messages at a time on
+// every profile. Here the write bound and route queue depth follow the
+// process's memory policy (H1WriteBatchMaxByteCount, TransportBufferSize). A
+// process without a memory budget, or at or above the reference budget, writes
+// up to 1,792 KiB through 384-slot route queues. A process below the reference
+// budget scales its bound from 288 KiB down to 96 KiB and its queues from 96
+// slots down to 32, as before (defaultPlatformH1WriteBatchMaxByteCount,
+// defaultPlatformTransportBufferSize). A memory-targeted profile, such as
+// DeviceLocal's, writes up to 96 KiB through 32-slot queues
+// (DefaultPlatformTransportSettingsWithMemoryTarget). The drain bounds above
+// apply to every profile, and a batch drained past a connection's own write
+// bound is written in two parts. The retained byte claims that
+// TestPlatformH1RetainedProfileClaims pins for the 32-MiB and 64-MiB memory
+// targets do not change.
+// Both client writer buffers start at the historical 16 KiB and grow to
 // the bound only on a connection whose ready batch needs it (an H1+ heartbeat
 // returns idle scratch); the server drains at most 12 KiB and never grows them.
 // A larger handshake carrier may make the bounded wrapper flush its prefix
@@ -79,10 +105,49 @@ const DebugCloseSend = false
 // physical flush. If either lane is empty, the other drains without an
 // artificial flush boundary. This prevents Transfer feedback from starving
 // inner TCP ACKs or request data during a sustained download.
-const platformWebSocketWriteBatchMaxMessages = 32
-const platformH1WriteBatchMaxByteCount = 20 * 1024
-const platformWebSocketWriteBatchDrainByteCount = platformH1WriteBatchMaxByteCount - 4*1024
+const platformWebSocketWriteBatchMaxMessages = 384
+const platformH1WriteBatchMaxByteCount = 1792 * 1024
+const platformWebSocketWriteBatchDrainByteCount = platformH1WriteBatchMaxByteCount - 8*1024
 const platformWebSocketAckPriorityBurstMaxMessages = 8
+
+// A memory-targeted profile's write bound and route queue depth. Its retained
+// byte claims are computed from them.
+const platformConstrainedH1WriteBatchMaxByteCount = 96 * 1024
+const platformConstrainedTransportBufferSize = 32
+
+// A process below the reference memory budget scales its write bound from this
+// bound down to the memory-targeted one, not from
+// platformH1WriteBatchMaxByteCount.
+const platformBudgetedH1WriteBatchMaxByteCount = 288 * 1024
+
+// A process below the reference memory budget scales its route queue depth
+// from this depth down to the memory-targeted one, not from the message bound.
+const platformBudgetedTransportBufferSize = 96
+
+// The default route queue depth of this process's platform transports: one
+// write batch of messages without a memory budget or at the reference budget.
+func defaultPlatformTransportBufferSize() int {
+	if memoryScale() < 1 {
+		return MemoryScaledCount(platformBudgetedTransportBufferSize, platformConstrainedTransportBufferSize)
+	}
+	return platformWebSocketWriteBatchMaxMessages
+}
+
+// The default write bound of this process's H1 and H1+ connections.
+func defaultPlatformH1WriteBatchMaxByteCount() ByteCount {
+	if memoryScale() < 1 {
+		return MemoryScaledByteCount(platformBudgetedH1WriteBatchMaxByteCount, platformConstrainedH1WriteBatchMaxByteCount)
+	}
+	return platformH1WriteBatchMaxByteCount
+}
+
+// The write bound of this profile's H1 and H1+ connections.
+func (self *PlatformTransportSettings) h1WriteBatchMaxByteCount() ByteCount {
+	if self == nil || self.H1WriteBatchMaxByteCount <= 0 {
+		return platformH1WriteBatchMaxByteCount
+	}
+	return self.H1WriteBatchMaxByteCount
+}
 
 func platformWebSocketWriteBatchCanDrain(
 	messageCount int,
@@ -569,6 +634,9 @@ type PlatformTransportSettings struct {
 	// not block; nil retains normal production behavior.
 	AuthFrameObserver   func(authFrameBytes []byte)
 	TransportBufferSize int
+	// H1WriteBatchMaxByteCount bounds one coalesced H1/H1+ stream write of
+	// ready messages. Nonpositive uses platformH1WriteBatchMaxByteCount.
+	H1WriteBatchMaxByteCount ByteCount
 	// H1AckPriorityBufferSize enables a separate bounded writer lane used only
 	// by Transfer acknowledgements. Zero (the server/default policy) leaves the
 	// lane absent. Mobile embedders can spend a handful of channel slots so ACK
@@ -818,7 +886,8 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		PingTimeout:               5 * time.Second,
 		WriteTimeout:              10 * time.Second,
 		ReadTimeout:               30 * time.Second, // also MultiClientSettings.BlackholeTimeout's default
-		TransportBufferSize:       32,
+		TransportBufferSize:       defaultPlatformTransportBufferSize(),
+		H1WriteBatchMaxByteCount:  defaultPlatformH1WriteBatchMaxByteCount(),
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
 		ModeInitialDelay:          2 * time.Second,
@@ -882,6 +951,8 @@ func DefaultPlatformTransportSettingsWithMemoryTarget(
 	if memoryTargetByteCount <= 0 {
 		return settings
 	}
+	settings.TransportBufferSize = platformConstrainedTransportBufferSize
+	settings.H1WriteBatchMaxByteCount = platformConstrainedH1WriteBatchMaxByteCount
 	settings.PlatformTransportBudget =
 		NewPlatformTransportBudgetForMemoryTarget(memoryTargetByteCount)
 	settings.H1BudgetByteCount = MemoryTargetScaledByteCount(
@@ -2793,9 +2864,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
 			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
-				framed.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
+				framed.SetWriteBatchByteLimit(int(self.settings.h1WriteBatchMaxByteCount()))
 			} else if batch, ok := ws.UnderlyingConn().(*WebSocketWriteBatchConn); ok {
-				batch.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
+				batch.SetWriteBatchByteLimit(int(self.settings.h1WriteBatchMaxByteCount()))
 			}
 			self.setRegistered(true)
 			// a move's replacement arrived at its target once its connection

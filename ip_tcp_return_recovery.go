@@ -475,6 +475,17 @@ func (self *TcpSequence) releaseReturnChunks() {
 // bounds how much of one response queues in front of the uplink, and so how
 // long the schedule takes to hand the uplink to another burst.
 //
+// The provider profile's allowance is one platform stream write
+// (platformH1WriteBatchMaxByteCount): a younger burst may emit while the older
+// bursts' unacknowledged bytes and its own fit a single write to the
+// provider's uplink. While the older bursts have a full write or more
+// outstanding, the younger burst is held and the schedule is strictly oldest
+// first. When one burst's own pipeline (origin read, inner TCP, transfer
+// sequence) leaves part of each write empty, the next burst fills the rest
+// instead of waiting behind an uplink that is not full. A larger allowance
+// overlaps more bursts than the uplink has room for and shares it among them
+// again: first bytes arrive sooner and every transfer takes longer.
+//
 // Bulk transfers yield. A burst that has run for tcpReturnScheduleBulkTimeout
 // and has already sent tcpReturnScheduleBulkByteCount is a bulk transfer (a
 // download or a stream), not a page or an API response. While an interactive
@@ -518,9 +529,24 @@ type tcpReturnScheduler struct {
 	waitingCount int
 }
 
-// The provider profile's allowance: enough unacknowledged data to keep the
-// uplink busy while one burst hands over to the next.
-const defaultProviderTcpReturnScheduleByteCount = 128 * 1024
+// The provider profile's allowance: one platform stream write, so that a
+// younger burst may fill what the older bursts leave of a write (see
+// tcpReturnScheduler). Measured on the latency simulator with 576-KiB writes
+// and a 2-MiB transfer window, one bulk return filled about three fifths of
+// a write. Against an allowance of
+// 128 KiB, which holds a younger burst until the older one has all but
+// finished, one write cut the median request time by a quarter (50 to 37 ms)
+// and the 95th percentile by 8% (175 to 160 ms). Allowances of 768 KiB up to
+// the lead bound brought the median down further and the 95th percentile no
+// lower: it was equal on one provider population and 5% to 11% higher on a
+// second (185 to 196 ms against 176 ms), where the 95th percentile of the
+// time to first byte fell (82 to 59 ms) and that of the transfer after it
+// rose (120 to 146 ms). The allowance has since followed the write bound to
+// 1,792 KiB and was measured there only together with the unbudgeted rule
+// window and the larger lead bound. Every profile uses the unbudgeted write
+// bound here; a memory-budgeted process writes less at a time and was not
+// measured apart.
+const defaultProviderTcpReturnScheduleByteCount = platformH1WriteBatchMaxByteCount
 
 const defaultTcpReturnScheduleStallTimeout = 1 * time.Second
 const defaultTcpReturnScheduleAgeTimeout = 4 * time.Second
@@ -530,8 +556,17 @@ const defaultTcpReturnScheduleAgeByteCount = 32 * 1024
 // nearly spent allowance does not dribble out runt segments.
 const tcpReturnScheduleMinGrantByteCount = 4 * 1024
 
-// The most the oldest burst keeps unacknowledged (the lead bound).
-const tcpReturnScheduleLeadByteCount = 256 * 1024
+// The most the oldest burst keeps unacknowledged (the lead bound). The
+// platform writer takes what is ready when a write returns, and the
+// acknowledgements of one write release data for the write after the next, so
+// keeping its writes full takes more than three of them in flight
+// (platformH1WriteBatchMaxByteCount). The bound stays under the unbudgeted
+// rule window (unbudgetedRuleWindowByteCount); where the transfer window is
+// smaller, as for a budgeted process or before the first measured round trip,
+// the window binds first. The price is paid at each handover: what the
+// finishing burst still has queued ahead of the uplink, at most this bound,
+// goes out before a held burst's first byte (about 5 s of a 10 Mbit/s uplink).
+const tcpReturnScheduleLeadByteCount = 6144 * 1024
 
 // A burst that has run this long and sent this much is a bulk transfer.
 const tcpReturnScheduleBulkTimeout = 6500 * time.Millisecond

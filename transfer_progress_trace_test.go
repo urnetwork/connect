@@ -12,7 +12,8 @@ import (
 )
 
 func progressTraceTestObserver() (func(TransferProgressEvent), chan TransferProgressEvent) {
-	events := make(chan TransferProgressEvent, 128)
+	// room for the events of one whole write batch between two drains
+	events := make(chan TransferProgressEvent, 128+2*platformWebSocketWriteBatchMaxMessages)
 	return func(event TransferProgressEvent) { events <- event }, events
 }
 

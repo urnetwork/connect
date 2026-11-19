@@ -43,6 +43,7 @@ func runWindowOpeningCleanFirstFlight(t *testing.T, tinyControl bool) {
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 			s.SendBufferSettings.ApplyWindowSizing()
 			s.SendBufferSettings.ResendQueueBudget = nil
+			s.SendBufferSettings.ResendQueueMaxByteCount = mib(2) // the original opening, not the rule window
 			if s.SendBufferSettings.ResendQueueMaxByteCount != 2*1024*1024 ||
 				s.SendBufferSettings.ResendQueueMinByteCount != 256*1024 ||
 				s.ReceiveBufferSettings.AckCompressTimeout != 10*time.Millisecond {

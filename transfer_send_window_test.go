@@ -966,6 +966,8 @@ func TestALargerWindowIsFasterAtALongRoundTrip(t *testing.T) {
 			defer cancel()
 			harness := newSendWindowHarnessWithClient(t, ctx, propagation,
 				func(settings *SendBufferSettings) {
+					// every arm opens at the measured 2 MiB constant
+					settings.ResendQueueMaxByteCount = MemoryScaledByteCount(mib(2), kib(256))
 					settings.WindowSizing = WindowSizingConstant
 					if sized {
 						settings.WindowSizing = WindowSizingFromDelivery

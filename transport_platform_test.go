@@ -1543,7 +1543,8 @@ func TestPlatformTransportCloseInterruptsBlockedH3Write(t *testing.T) {
 		writer := routeManager.OpenMultiRouteWriter(DestinationId(NewId()))
 		defer routeManager.CloseMultiRouteWriter(writer)
 		blocked := false
-		for range 128 {
+		// more writes than the send route holds
+		for range 128 + settings.TransportBufferSize {
 			message := MessagePoolGet(3 * 1024)
 			if writeErr := writer.Write(ctx, message, 20*time.Millisecond); writeErr != nil {
 				MessagePoolReturn(message)

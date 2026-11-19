@@ -10,8 +10,18 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	SetMemoryBudget(0)
 	defer SetMemoryBudget(0)
 
-	AssertEqual(t, DefaultSendBufferSettings().ResendQueueMaxByteCount, mib(2))
-	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, mib(2)+kib(512))
+	// under the shipping rule an unbudgeted process holds the unbudgeted rule
+	// window, the reference host's share, and its 1.25 hold; the constant
+	// policy, a one-call rollback, keeps today's pair byte for byte
+	AssertEqual(t, DefaultSendBufferSettings().ResendQueueMaxByteCount, mib(8))
+	AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, mib(10))
+	func() {
+		defer SetWindowSizing(DefaultWindowSizing())
+		SetWindowSizing(WindowSizingConstant)
+		AssertEqual(t, DefaultSendBufferSettings().ResendQueueMaxByteCount, mib(2))
+		AssertEqual(t, DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount, mib(2)+kib(512))
+		AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Default, int(mib(1)))
+	}()
 	AssertEqual(t, DefaultWebRtcSettings().ReceiveBufferSize, kib(512))
 	AssertEqual(t, DefaultDohSettings().CacheMaxEntries, 4096)
 	clientStrategySettings := DefaultClientStrategySettings()
@@ -37,7 +47,8 @@ func TestMemoryBudgetUnsetDefaults(t *testing.T) {
 	AssertEqual(t, tunSettings.UdpReceiveBufferByteCount, int(mib(1)))
 	// 2026-08: raised so a single stream's auto-tuned window can cover the
 	// tunnel's bandwidth-delay product (see DefaultTunSettingsWithBufferSize)
-	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(mib(1)))
+	// and beside the unbudgeted rule window starts at the ceiling (tunReceiveStartByteCount)
+	AssertEqual(t, tunSettings.TcpReceiveBuffer.Default, int(mib(4)))
 	AssertEqual(t, tunSettings.TcpReceiveBuffer.Max, int(mib(4)))
 }
 

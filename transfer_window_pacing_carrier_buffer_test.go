@@ -61,12 +61,27 @@ func TestWindowPacingCarrierFasterTrainRaisesMeasuredCapacity(t *testing.T) {
 
 // The serializer and paused carrier reader have independent fixed queues.
 // Every protocol, ACK and pacing transition still runs through actual workers.
+// This is the scenario as it was derived: the 32-slot carrier FIFO that every
+// profile had then, and a memory-targeted profile still has, with a 24-message
+// train.
 func runWindowCarrierBufferWorker(t *testing.T, stall bool, priorRate, physicalRate ByteCount, releaseDelay time.Duration) windowCarrierBufferEvidence {
 	t.Helper()
+	if platformConstrainedTransportBufferSize != 32 {
+		t.Fatal("carrier queue precondition changed")
+	}
+	return runWindowCarrierBufferWorkerAt(t, stall, priorRate, physicalRate, releaseDelay, platformConstrainedTransportBufferSize, 24)
+}
+
+// The scenario at a named carrier depth, with a train no longer than that
+// depth so a stalled reader retains all of it upstream.
+func runWindowCarrierBufferWorkerAt(t *testing.T, stall bool, priorRate, physicalRate ByteCount, releaseDelay time.Duration, queueSize int, trainCount int) windowCarrierBufferEvidence {
+	t.Helper()
+	if queueSize < trainCount {
+		t.Fatal("the train does not fit the carrier queue")
+	}
 	assertMessagePoolOwnership(t)
 	var evidence windowCarrierBufferEvidence
 	synctest.Test(t, func(t *testing.T) {
-		const trainCount = 24
 		const payloadBytes = 2048
 		ctx, cancel := context.WithCancel(context.Background())
 		startSend, releaseReceive, receivePaused := make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -122,10 +137,6 @@ func runWindowCarrierBufferWorker(t *testing.T, stall bool, priorRate, physicalR
 		receiver := NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings)
 		sender.ContractManager().AddNoContractPeer(receiver.ClientId())
 		receiver.ContractManager().AddNoContractPeer(sender.ClientId())
-		queueSize := DefaultPlatformTransportSettings().TransportBufferSize
-		if queueSize != 32 {
-			t.Fatal("carrier queue precondition changed")
-		}
 		carrierBuffered := make(Route, queueSize)
 		sendOut, sendIn := make(Route, queueSize), make(Route, queueSize)
 		receiveOut, receiveIn := make(Route, queueSize), make(Route, queueSize)
@@ -346,6 +357,60 @@ func TestWindowPacingCarrierBufferedReadsAcrossSamplerBuckets(t *testing.T) {
 		evidence := runWindowCarrierBufferWorker(t, true, 12500000, 12500000, delay)
 		if evidence.serviceRate > evidence.physicalRate*101/100 || evidence.resultBurst > evidence.initialBurst*101/100 {
 			t.Errorf("release delay %s changed queued service/burst: %+v", delay, evidence)
+		}
+	}
+}
+
+// A process without a memory budget queues more on a carrier than the 32 slots
+// the scenario was derived for (DefaultPlatformTransportSettings). A stalled
+// reader there can release many more frames with compressed timestamps, so
+// the same evidence is required at that depth, for the original train and for
+// the longest train one send window of the scenario offers (a queue deeper
+// than that cannot be filled by it, and the scenario waits for its whole train
+// to queue): buffered reads must not inflate the measured service or the burst
+// at any release delay, an unqueued train keeps its capacity, and a faster
+// train is still measured. The same holds
+// from a cold start, with round-trip evidence and no service rate yet
+// (TestWindowPacingSdkColdBufferedReaderKeepsCapacityUnproved and
+// TestWindowPacingSdkColdUnqueuedReaderMeasuresCapacity at the 32-slot depth).
+func TestWindowPacingCarrierDefaultQueueDepthKeepsTheSameEvidence(t *testing.T) {
+	// the depth of a process without a memory budget, whatever ran before
+	SetMemoryBudget(0)
+	defer SetMemoryBudget(0)
+	depth := DefaultPlatformTransportSettings().TransportBufferSize
+	if depth != platformWebSocketWriteBatchMaxMessages {
+		t.Fatal("default carrier queue precondition changed")
+	}
+	// the scenario's send window offers 128 frames of this size at once and
+	// fewer than 192
+	const windowTrain = 128
+	for _, train := range []int{24, min(depth, windowTrain)} {
+		for _, delay := range []time.Duration{0, 5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond} {
+			evidence := runWindowCarrierBufferWorkerAt(t, true, 12500000, 12500000, delay, depth, train)
+			if evidence.serviceRate > evidence.physicalRate*101/100 || evidence.resultBurst > evidence.initialBurst*101/100 {
+				t.Errorf("train %d, release delay %s: buffered carrier reads inflated measured service/burst: %+v", train, delay, evidence)
+			}
+			if evidence.maxCarrierQueued != train {
+				t.Errorf("train %d, release delay %s: the stalled reader retained %d frames upstream", train, delay, evidence.maxCarrierQueued)
+			}
+		}
+		evidence := runWindowCarrierBufferWorkerAt(t, false, 12500000, 12500000, 0, depth, train)
+		if evidence.serviceRate < evidence.physicalRate*99/100 || evidence.serviceRate > evidence.physicalRate*101/100 {
+			t.Errorf("train %d: unqueued physical train changed its capacity: %+v", train, evidence)
+		}
+		evidence = runWindowCarrierBufferWorkerAt(t, false, 12500000, 125000000, 0, depth, train)
+		if evidence.serviceRate < evidence.physicalRate*90/100 || evidence.serviceRate > evidence.physicalRate*101/100 {
+			t.Errorf("train %d: genuinely faster physical train was not measured: %+v", train, evidence)
+		}
+		for _, delay := range []time.Duration{5 * time.Millisecond, 20 * time.Millisecond} {
+			evidence = runWindowCarrierBufferWorkerAt(t, true, 0, 12500000, delay, depth, train)
+			if evidence.serviceRate > evidence.physicalRate*101/100 || evidence.resultBurst > evidence.initialBurst*101/100 {
+				t.Errorf("train %d, release delay %s: cold queued reader inflated service or burst: %+v", train, delay, evidence)
+			}
+		}
+		evidence = runWindowCarrierBufferWorkerAt(t, false, 0, 12500000, 0, depth, train)
+		if evidence.serviceRate < evidence.physicalRate*99/100 || evidence.serviceRate > evidence.physicalRate*101/100 {
+			t.Errorf("train %d: cold unqueued physical train lost capacity: %+v", train, evidence)
 		}
 	}
 }

@@ -1500,6 +1500,22 @@ func (self *ContractManager) hasQueuedContract(contractKey ContractKey) bool {
 	return contractQueue != nil && contractQueue.hasContract(minEnqueueTime)
 }
 
+// Whether a contract request for this key is still in flight: sent, with its
+// result not yet handled. A result is added to the queue before its request
+// stops counting here, so a key with neither a pending request nor a queued
+// contract has no contract on its way. Read-only, like `hasQueuedContract`.
+func (self *ContractManager) hasPendingCreate(contractKey ContractKey) bool {
+	if self.settings.LegacyCreateContract {
+		contractKey = contractKey.Legacy()
+	}
+	contractQueue := func() *contractQueue {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		return self.destinationContracts[contractKey]
+	}()
+	return contractQueue != nil && contractQueue.hasPendingCreate()
+}
+
 func (self *ContractManager) hasOpenContractForKey(contractKey ContractKey) bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2120,6 +2136,12 @@ func (self *contractQueue) finishCreate(request contractCreateRequest) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 	delete(self.pendingCreates, request)
+}
+
+func (self *contractQueue) hasPendingCreate() bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return 0 < len(self.pendingCreates)
 }
 
 func newContractQueue(log Logger, trackUsedContracts bool) *contractQueue {

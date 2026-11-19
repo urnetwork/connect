@@ -913,11 +913,14 @@ func TestTwoPacketEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 // H1 may use more small frames than the compatibility coalescer. Assert the
 // maximum frame-count/byte combination, a bounded ordinary opening contract,
 // and outer sequence encryption still fit the ordinary 4-KiB data class inside
-// the minimum H1 envelope. Opening/rotating contracts retain 3 KiB; an
-// established contract can safely use three full 1,100-byte packets only while
-// no contract frame rides on that Pack.
+// the minimum H1 envelope. Opening/rotating contracts retain 3 KiB: three full
+// 1,100-byte packets with a contract already sit at that class's edge. An
+// established contract uses six full packets, inside the 8-KiB pooled class,
+// only while no contract frame rides on that Pack.
 func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T) {
 	const ordinaryH1DataEnvelopeByteCount = 4 * 1024
+	// the largest message pool class
+	const pooledH1DataEnvelopeByteCount = 8 * 1024
 
 	c := newFrameCodecTestSequenceCipher(t)
 	path := TransferPath{DestinationId: NewId(), SourceId: NewId(), StreamId: NewId()}
@@ -973,7 +976,7 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 		)
 	}
 
-	establishedFrames := make([]*protocol.Frame, 3)
+	establishedFrames := make([]*protocol.Frame, int(sendPackH1EstablishedGroupMaxMessageByteCount/DefaultMtu))
 	for frameIndex := range establishedFrames {
 		establishedFrames[frameIndex] = &protocol.Frame{
 			MessageType:  protocol.MessageType_IpIpPacketFromProvider,
@@ -999,12 +1002,25 @@ func TestH1MaximumLogicalGroupEncryptedPackFitsMinimumMessageLimit(t *testing.T)
 	defer MessagePoolReturn(establishedWrapped)
 	if limit < len(establishedWrapped) {
 		t.Fatalf(
-			"established three-MTU H1 Pack is %d bytes, exceeds minimum transport limit %d",
+			"established six-MTU H1 Pack is %d bytes, exceeds minimum transport limit %d",
 			len(establishedWrapped),
 			limit,
 		)
 	}
+	// An unpooled data message would allocate on every hop. Keep a kibibyte of
+	// the pooled class for protocol growth: a seventh packet leaves under 200
+	// bytes of it.
+	if remaining := pooledH1DataEnvelopeByteCount - len(establishedWrapped); remaining < 1024 {
+		t.Fatalf(
+			"established six-MTU H1 Pack is %d bytes, want at least 1024 bytes of headroom in the %d-byte pooled class",
+			len(establishedWrapped),
+			pooledH1DataEnvelopeByteCount,
+		)
+	}
 
+	// With a contract on the Pack, three full packets are the most the
+	// ordinary class holds.
+	m.frames = establishedFrames[:3]
 	m.contractFrame = &protocol.Frame{
 		MessageType:  protocol.MessageType_TransferContract,
 		MessageBytes: make([]byte, 512),

@@ -31,15 +31,17 @@ func newH1SpeedTestFixture(t *testing.T) (*h1LivenessFixture, int) {
 }
 
 // Probe chunks that differ from each other, so the order of their echoes is
-// visible. Each is filled with its index, so the count must stay below 256.
+// visible. Each is filled with its index in two bytes, so the count must stay
+// below 65,536.
 func h1SpeedTestProbeMessages(t *testing.T, probeCount int, testId uint32) [][]byte {
 	t.Helper()
-	if 256 <= probeCount {
-		t.Fatalf("%d probes cannot each have their own fill byte", probeCount)
+	if 1<<16 <= probeCount {
+		t.Fatalf("%d probes cannot each have their own fill pair", probeCount)
 	}
 	probeMessages := make([][]byte, probeCount)
 	for index := range probeMessages {
-		probeMessages[index] = bytes.Repeat([]byte{byte(index)}, h1SpeedTestProbeByteCount)
+		fill := bytes.Repeat([]byte{byte(index >> 8), byte(index)}, h1SpeedTestProbeByteCount/2+1)
+		probeMessages[index] = fill[:h1SpeedTestProbeByteCount]
 		SetTransportSpeedTestProbeHeader(probeMessages[index], testId)
 	}
 	return probeMessages

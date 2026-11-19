@@ -106,6 +106,20 @@ func tunBudgetShareByteCount() ByteCount {
 	return max(kib(512), budget/tunBudgetShareDivisor)
 }
 
+// tunReceiveStartByteCount is a tunnel TCP connection's starting receive
+// buffer. Beside the unbudgeted rule window (unbudgetedRuleWindowActive) it
+// is the ceiling (tunBudgetShareByteCount, 4 MiB unbudgeted), which is
+// unchanged: auto-tuning grows the buffer only as the reader drains it, so a
+// fresh connection's few-MiB response otherwise spends most of its transfer
+// below the transport's window. The buffer is a limit, not a reservation.
+// Elsewhere the start is today's budget-scaled 1 MiB.
+func tunReceiveStartByteCount() int {
+	if unbudgetedRuleWindowActive(DefaultWindowSizing()) {
+		return int(tunBudgetShareByteCount())
+	}
+	return int(MemoryScaledByteCount(mib(1), kib(128)))
+}
+
 func DefaultTunSettings() *TunSettings {
 	return DefaultTunSettingsWithBufferSize(1024)
 }
@@ -151,7 +165,7 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// reach a window that covers the tunnel's bandwidth-delay product.
 		TcpReceiveBuffer: TcpBufferRange{
 			Min:     4 * 1024,
-			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
+			Default: tunReceiveStartByteCount(),
 			Max:     int(tunBudgetShareByteCount()),
 		},
 		TcpSendBuffer: TcpBufferRange{

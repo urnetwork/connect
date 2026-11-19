@@ -16,6 +16,8 @@ func newEstimatorFixture(
 ) *SendSequence {
 	t.Helper()
 	settings := DefaultSendBufferSettings()
+	// estimator rows run at the pre-rule opening; the rule window has its own rows
+	settings.ResendQueueMaxByteCount = MemoryScaledByteCount(mib(2), kib(256))
 	settings.ApplicationPacing = true
 	if configure != nil {
 		configure(settings)

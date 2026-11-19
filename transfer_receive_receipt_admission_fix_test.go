@@ -1019,13 +1019,15 @@ func TestReceiveReceiptAdmissionOrdinaryOversizeHonorsSharedBudget(t *testing.T)
 	})
 }
 
-// The actual H1 established group limit is three complete tunnel-MTU packets.
-// All three use one existing TCP flow and its one-slot final admission queue.
+// The actual H1 established group limit in complete tunnel-MTU packets.
+const receiptAdmissionMaximumTcpGroupPacketCount = int(sendPackH1EstablishedGroupMaxMessageByteCount / DefaultMtu)
+
+// All of them use one existing TCP flow and its one-slot final admission queue.
 func (self *receiptAdmissionFixture) offerMaximumTcpGroup(messageId Id) []byte {
 	self.t.Helper()
 	payload := bytes.Repeat([]byte("m"), DefaultMtu-Ipv4HeaderSizeWithoutExtensions-TcpHeaderSizeWithoutExtensions)
 	self.offer(self.sequenceId, 0, 0, messageId, 41000, tcpFlagAck, payload, func(pack *ReceivePack) {
-		for index := 1; index < 3; index++ {
+		for index := 1; index < receiptAdmissionMaximumTcpGroupPacketCount; index++ {
 			packet := MessagePoolCopy(receiptAdmissionPacket(41000, tcpFlagAck, uint32(101+index*len(payload)), payload))
 			self.witnesses = append(self.witnesses, MessagePoolShareReadOnly(packet))
 			frame, err := ipPacketToProviderFrame(packet, DefaultProtocolVersion)
@@ -1036,7 +1038,7 @@ func (self *receiptAdmissionFixture) offerMaximumTcpGroup(messageId Id) []byte {
 			pack.Pack.Frames = append(pack.Pack.Frames, frame)
 			pack.MessageByteCount += ByteCount(len(packet))
 		}
-		if pack.MessageByteCount != sendPackH1EstablishedMaxMessageByteCount {
+		if pack.MessageByteCount != sendPackH1EstablishedGroupMaxMessageByteCount {
 			self.t.Fatal("synthetic TCP group does not reach the actual established H1 message bound")
 		}
 	})
@@ -1056,12 +1058,12 @@ func TestReceiveReceiptAdmissionMaximumTcpGroupFitsExactCap(t *testing.T) {
 			t.Fatal("maximum TCP group did not construct one real pending receipt")
 		}
 		charge := sequence.deliveryQueue.bytes
-		if charge <= sendPackH1EstablishedMaxMessageByteCount || charge > 64*1024 ||
+		if charge <= sendPackH1EstablishedGroupMaxMessageByteCount || charge > 64*1024 ||
 			charge > DefaultReceiveBufferSettings().ReceiveQueueMaxByteCount {
 			t.Fatal("actual maximum TCP group does not fit the normal/default receipt profile")
 		}
 		probe.releaseTcp(probe.firstTcp, 41000, nil)
-		for index := 0; index < 3; index++ {
+		for index := 0; index < receiptAdmissionMaximumTcpGroupPacketCount; index++ {
 			probe.releaseTcp(probe.firstTcp, 41000, payload)
 		}
 		f := newReceiptAdmissionFixture(t, 1, func(settings *ReceiveBufferSettings) {
@@ -1071,16 +1073,16 @@ func TestReceiveReceiptAdmissionMaximumTcpGroupFitsExactCap(t *testing.T) {
 		payload = f.offerMaximumTcpGroup(messageId)
 		sequence = f.sequence(f.sequenceId, 0)
 		if sequence == nil || sequence.ctx.Err() != nil || sequence.nextSequenceNumber != 1 ||
-			sequence.deliveryQueue.bytes != charge || f.delivered(41000) != 3 || len(f.acks) != 0 {
+			sequence.deliveryQueue.bytes != charge || f.delivered(41000) != receiptAdmissionMaximumTcpGroupPacketCount || len(f.acks) != 0 {
 			t.Fatal("valid maximum TCP group was refused at an exact-fit constructor boundary")
 		}
 		f.releaseTcp(f.firstTcp, 41000, nil)
-		for index := 0; index < 3; index++ {
+		for index := 0; index < receiptAdmissionMaximumTcpGroupPacketCount; index++ {
 			f.releaseTcp(f.firstTcp, 41000, payload)
 		}
 		if !f.hasAck(f.sequenceId, messageId, false) || sequence.deliveryQueue.pending() ||
 			f.receiveBudget.UsedByteCount() != 0 {
-			t.Fatal("exact-fit maximum TCP group failed to secure all three final owners")
+			t.Fatal("exact-fit maximum TCP group failed to secure every final owner")
 		}
 	})
 }

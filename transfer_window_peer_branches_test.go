@@ -28,7 +28,7 @@ func TestTheThreePeerBranchesHaveDifferentPermissionCeilings(t *testing.T) {
 			settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
 		})
 	}
-	initial := DefaultSendBufferSettings().ResendQueueMaxByteCount
+	initial := newSequence().sendBufferSettings.ResendQueueMaxByteCount
 	blindBet := min(defaultInitialWindowByteCount(), initial)
 	now := time.Unix(1700000000, 0)
 
@@ -352,8 +352,7 @@ func TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches(t *testing.T) {
 	zeroSequence.observeReceiveWindowAdvertisement(zeroed)
 	zeroEstimate := zeroSequence.sendWindowEstimate(time.Now())
 
-	settings := DefaultSendBufferSettings()
-	initial := settings.ResendQueueMaxByteCount
+	initial := newSequence().sendBufferSettings.ResendQueueMaxByteCount
 	t.Logf(
 		"absent gives window %d (this sender's constant %d), zero gives window %d",
 		absentEstimate.Window, initial, zeroEstimate.Window,

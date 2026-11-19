@@ -77,8 +77,9 @@ func (c *FramedMessageConn) UnderlyingConn() net.Conn { return c.Conn }
 // allocated here: it grows to limit only when such a batch is written, and an
 // idle heartbeat returns it to the default. A singleton never grows it, so
 // large frames keep their bounded split or frame-local temporary. A limit at or
-// below the default keeps the fixed 16-KiB scratch. Call it before the writer
-// starts or from the writer goroutine.
+// below the default keeps the fixed 16-KiB scratch. Lowering the limit takes
+// effect at the next write: scratch grown past it is released then. Call it
+// before the writer starts or from the writer goroutine.
 func (c *FramedMessageConn) SetWriteBatchByteLimit(limit int) {
 	if limit <= framedMessageWriteStorageByteCount {
 		c.storageLimit = 0
@@ -92,6 +93,10 @@ func (c *FramedMessageConn) prepareWriteStorage(messages [][]byte) {
 	if len(messages) == 1 && len(messages[0]) == 0 && framedMessageWriteStorageByteCount < len(c.storage) {
 		// A zero-length heartbeat means the writer has been idle; do not keep
 		// bulk scratch on an idle socket.
+		c.storage = nil
+	}
+	if max(c.storageLimit, framedMessageWriteStorageByteCount) < len(c.storage) {
+		// The bound was lowered after scratch grew; enforce it at this write.
 		c.storage = nil
 	}
 	if c.storage == nil {

@@ -614,6 +614,80 @@ func TestTcpReturnScheduleServesOldestBurstFirst(t *testing.T) {
 	})
 }
 
+// The provider profile's allowance is one platform stream write, under the
+// lead bound. While the oldest burst leaves part of a write unused, the next
+// burst uses the difference and a third one is held; the oldest burst is never
+// limited by them, up to the lead bound; and while the older bursts have a
+// full write or more outstanding the schedule is strictly oldest first.
+func TestTcpReturnScheduleProviderAllowanceIsOneStreamWrite(t *testing.T) {
+	if defaultProviderTcpReturnScheduleByteCount != platformH1WriteBatchMaxByteCount {
+		t.Fatalf("provider allowance=%d, want one %d-byte stream write",
+			defaultProviderTcpReturnScheduleByteCount, platformH1WriteBatchMaxByteCount)
+	}
+	if tcpReturnScheduleLeadByteCount <= 2*platformH1WriteBatchMaxByteCount {
+		t.Fatalf("lead bound=%d does not keep more than two %d-byte writes in flight",
+			tcpReturnScheduleLeadByteCount, platformH1WriteBatchMaxByteCount)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		scheduler := newTcpReturnScheduler(DefaultProviderLocalUserNatSettingsWithMemoryTarget(0).TcpBufferSettings)
+		write := ByteCount(platformH1WriteBatchMaxByteCount)
+		lead := ByteCount(tcpReturnScheduleLeadByteCount)
+		// a fast uplink: the oldest burst's own pipeline fills five eighths of
+		// a write
+		partial := write * 5 / 8
+		oldest, younger, youngest := scheduler.newFlow(), scheduler.newFlow(), scheduler.newFlow()
+		oldest.read()
+		younger.read()
+		youngest.read()
+		if grant := oldest.admit(0, int(partial)); grant != int(partial) {
+			t.Fatalf("oldest burst granted %d, want its whole window", grant)
+		}
+		if grant := younger.admit(0, int(write)); grant != int(write-partial) {
+			t.Fatalf("next burst granted %d, want what the oldest burst leaves of one write", grant)
+		}
+		if grant := youngest.admit(0, int(kib(64))); grant != 0 {
+			t.Fatalf("third burst granted %d behind a full allowance", grant)
+		}
+		if grant := oldest.admit(partial, int(lead)); grant != int(lead-partial) {
+			t.Fatalf("oldest burst limited to %d by younger bursts", grant)
+		}
+		// a slow uplink: the oldest burst waits at the lead bound
+		if grant := oldest.admit(lead, int(kib(64))); grant != 0 {
+			t.Fatalf("oldest burst granted %d beyond the lead bound", grant)
+		}
+		younger.acknowledged(0)
+		if grant := younger.admit(0, int(kib(64))); grant != 0 {
+			t.Fatalf("younger burst granted %d while the oldest burst waits at the lead bound", grant)
+		}
+		if active, waiting := tcpReturnScheduleState(scheduler); active != 3 || waiting != 3 {
+			t.Fatalf("active=%d waiting=%d", active, waiting)
+		}
+		// the oldest burst resumes first; with a full write of it outstanding
+		// the schedule is still strictly oldest first, and under one write the
+		// next burst follows within the rest
+		oldest.acknowledged(write - kib(128))
+		if grant := oldest.admit(write-kib(128), int(kib(128))); grant != int(kib(128)) {
+			t.Fatalf("oldest burst resumed with %d, want its whole window", grant)
+		}
+		if grant := younger.admit(0, int(kib(64))); grant != 0 {
+			t.Fatalf("younger burst granted %d while a full write of the oldest burst is outstanding", grant)
+		}
+		oldest.acknowledged(write - kib(64))
+		if grant := younger.admit(0, int(kib(128))); grant != int(kib(64)) {
+			t.Fatalf("younger burst granted %d, want what the oldest burst leaves of one write", grant)
+		}
+		if grant := youngest.admit(0, int(kib(64))); grant != 0 {
+			t.Fatalf("third burst granted %d behind a full allowance", grant)
+		}
+		oldest.close()
+		younger.close()
+		youngest.close()
+		if active, waiting := tcpReturnScheduleState(scheduler); active != 0 || waiting != 0 {
+			t.Fatalf("closed flows left active=%d waiting=%d", active, waiting)
+		}
+	})
+}
+
 // A client that stops acknowledging cannot hold other clients: its burst
 // stops counting once its acknowledgements have not advanced for the stall
 // timeout, and a held reader notices on its periodic re-check.
@@ -1061,7 +1135,7 @@ func TestTcpReturnScheduleBoundsLeadInFlight(t *testing.T) {
 		scheduler := newTcpReturnSchedulerForTest(kib(64))
 		oldest := scheduler.newFlow()
 		oldest.read()
-		if grant := oldest.admit(0, int(mib(1))); grant != int(tcpReturnScheduleLeadByteCount) {
+		if grant := oldest.admit(0, int(2*tcpReturnScheduleLeadByteCount)); grant != int(tcpReturnScheduleLeadByteCount) {
 			t.Fatalf("oldest burst granted %d, want the lead bound %d", grant, tcpReturnScheduleLeadByteCount)
 		}
 		if grant := oldest.admit(tcpReturnScheduleLeadByteCount, int(kib(64))); grant != 0 {

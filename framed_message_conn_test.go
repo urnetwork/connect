@@ -609,3 +609,59 @@ func TestPlatformH1ScratchMinimumChargesWriteBound(t *testing.T) {
 		t.Fatal("reservation below its own scratch minimum")
 	}
 }
+
+// Lowering a write bound after a buffer grew takes effect at the next write
+// (framed scratch) or the next batch (WebSocket coalescer), not only after an
+// idle heartbeat.
+func TestWriteBoundLoweredAfterGrowthIsEnforced(t *testing.T) {
+	const limit = 3 * framedMessageWriteStorageByteCount
+	raw := newH1UpgradeScriptConn(nil)
+	conn, err := NewFramedMessageConn(raw, H1FramerProtocol, 32*1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetWriteBatchByteLimit(limit)
+	bulk := h1WriteBoundTestMessages(limit/(3*DefaultMtu+4), 3*DefaultMtu)
+	if err := conn.WriteMessages(bulk); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != limit {
+		t.Fatalf("bulk batch scratch=%d, want %d", len(conn.storage), limit)
+	}
+	conn.SetWriteBatchByteLimit(framedMessageWriteStorageByteCount)
+	raw.output.Reset()
+	if err := conn.WriteMessages(bulk); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.storage) != framedMessageWriteStorageByteCount || cap(conn.storage) != framedMessageWriteStorageByteCount {
+		t.Fatalf("lowered bound kept grown scratch: len=%d cap=%d", len(conn.storage), cap(conn.storage))
+	}
+	h1WriteBoundTestReadFrames(t, raw.output.Bytes(), bulk)
+
+	underlying := &recordingWriteConn{}
+	ws := NewWebSocketWriteBatchConn(underlying)
+	ws.SetWriteBatchByteLimit(3 * webSocketWriteBatchMaxByteCount)
+	ws.BeginWriteBatch()
+	var want []byte
+	for label := byte(1); label < 5; label++ {
+		frame := bytes.Repeat([]byte{label}, 10*1024)
+		if _, err := ws.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, frame...)
+	}
+	if err := ws.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(ws.writeBuffer) != 3*webSocketWriteBatchMaxByteCount || len(underlying.writes) != 1 || !bytes.Equal(underlying.writes[0], want) {
+		t.Fatalf("raised bound: cap=%d writes=%d, want one ordered write", cap(ws.writeBuffer), len(underlying.writes))
+	}
+	ws.SetWriteBatchByteLimit(webSocketWriteBatchMaxByteCount)
+	ws.BeginWriteBatch()
+	if cap(ws.writeBuffer) != webSocketWriteBatchMaxByteCount {
+		t.Fatalf("lowered bound kept the grown coalescer buffer: cap=%d", cap(ws.writeBuffer))
+	}
+	if err := ws.FlushWriteBatch(); err != nil {
+		t.Fatal(err)
+	}
+}

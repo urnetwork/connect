@@ -71,6 +71,37 @@ func TestPlatformH1RetainedProfileClaims(t *testing.T) {
 	}
 }
 
+// Only a process at or above the reference memory budget, or without one,
+// writes at the full bound. Below it the bound scales from 288 KiB down to the
+// memory-targeted bound, and a memory-targeted profile writes at its own bound.
+func TestPlatformH1DefaultWriteBoundByMemoryBudget(t *testing.T) {
+	restore := MemoryBudget()
+	t.Cleanup(func() { SetMemoryBudget(restore) })
+	for _, c := range []struct {
+		budget ByteCount
+		want   ByteCount
+	}{
+		{0, platformH1WriteBatchMaxByteCount},
+		{referenceMemoryBudgetByteCount, platformH1WriteBatchMaxByteCount},
+		{2 * referenceMemoryBudgetByteCount, platformH1WriteBatchMaxByteCount},
+		{referenceMemoryBudgetByteCount / 2, platformBudgetedH1WriteBatchMaxByteCount / 2},
+		{referenceMemoryBudgetByteCount / 8, platformConstrainedH1WriteBatchMaxByteCount},
+	} {
+		SetMemoryBudget(c.budget)
+		if got := DefaultPlatformTransportSettings().h1WriteBatchMaxByteCount(); got != c.want {
+			t.Fatalf("budget %d: default write bound=%d, want %d", c.budget, got, c.want)
+		}
+	}
+	SetMemoryBudget(0)
+	if got := DefaultPlatformTransportSettingsWithMemoryTarget(mib(20)).h1WriteBatchMaxByteCount(); got != platformConstrainedH1WriteBatchMaxByteCount {
+		t.Fatalf("memory-targeted write bound=%d, want %d", got, platformConstrainedH1WriteBatchMaxByteCount)
+	}
+	if platformH1WriteBatchMaxByteCount <= platformBudgetedH1WriteBatchMaxByteCount ||
+		platformBudgetedH1WriteBatchMaxByteCount <= platformConstrainedH1WriteBatchMaxByteCount {
+		t.Fatal("write bounds are not ordered full > budgeted > constrained")
+	}
+}
+
 // Even count-zero/count-one routes can carry the maximum valid message. A
 // malformed count/maximum saturates the claim, never wraps it into cheap bytes.
 func TestPlatformH1RetainedNarrowAndOverflowProfiles(t *testing.T) {
@@ -110,7 +141,8 @@ func TestPlatformH1RetainedNarrowAndOverflowProfiles(t *testing.T) {
 	settings.H1BudgetByteCount = 1
 	settings.FramerSettings = DefaultFramerSettings(128 * 1024)
 	settings.FramerSettings.SplitMinimumLen = 256 * 1024
-	minimum := ByteCount(4*(128*1024+1)+8192+MessagePoolMetaByteCount+platformH1WriteBatchMaxByteCount) + retainedMessageCapacity(128*1024+4)
+	// the writer copy is this profile's own write bound
+	minimum := ByteCount(4*(128*1024+1)+8192+MessagePoolMetaByteCount) + settings.h1WriteBatchMaxByteCount() + retainedMessageCapacity(128*1024+4)
 	if settings.h1RetainedScratchMinimum() < minimum || settings.H1MemoryReservationByteCount() < minimum+3*retainedMessageCapacity(128*1024) {
 		t.Fatal("custom split/tiny base omitted the full framed writer copy")
 	}

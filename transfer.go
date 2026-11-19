@@ -742,6 +742,28 @@ func transferBudgetShareByteCount() ByteCount {
 	return budget / transferBudgetShareDivisor
 }
 
+// The window of a process with no memory budget while the rule is on, the
+// hosted proxy included. Without a budget there is no share, so it holds a
+// constant and never sizes itself (§37.22). That was the pre-rule 2 MiB, ~100
+// MB/s per peer at a 20 ms round trip under bulk; it is now the reference
+// host's share with today's 1.25 hold, both limits held only while bytes wait.
+// Receivers advertise their hold and the window is clamped to it; a legacy
+// receiver's overrun costs bandwidth, not correctness. The constant policy
+// keeps today's 2 MiB and 2.5 MiB.
+func unbudgetedRuleWindowByteCount() ByteCount {
+	return referenceMemoryBudgetByteCount / transferBudgetShareDivisor
+}
+
+func unbudgetedRuleHoldByteCount() ByteCount {
+	return unbudgetedRuleWindowByteCount() / 4 * 5
+}
+
+// Whether default settings built under this policy hold the unbudgeted rule
+// window: the rule is on and there is no budget to draw a share from.
+func unbudgetedRuleWindowActive(policy WindowSizingPolicyKind) bool {
+	return policy == WindowSizingFromDelivery && MemoryBudget() <= 0
+}
+
 // The initial bet: what a sender may have outstanding before it has heard
 // anything from its peer.
 //
@@ -1003,6 +1025,9 @@ func DefaultSendBufferSettingsWithBufferSize(bufferSize int) *SendBufferSettings
 	}
 	settings.WindowSizing = DefaultWindowSizing()
 	settings.ApplyWindowSizing()
+	if unbudgetedRuleWindowActive(settings.WindowSizing) && settings.ResendQueueBudget == nil {
+		settings.ResendQueueMaxByteCount = unbudgetedRuleWindowByteCount()
+	}
 	settings.ApplicationPacing = false
 	return settings
 }
@@ -1100,6 +1125,9 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 	}
 	settings.WindowSizing = DefaultWindowSizing()
 	settings.ApplyWindowSizing()
+	if unbudgetedRuleWindowActive(settings.WindowSizing) && settings.ReceiveQueueBudget == nil {
+		settings.ReceiveQueueMaxByteCount = unbudgetedRuleHoldByteCount()
+	}
 	return settings
 }
 
@@ -1342,6 +1370,22 @@ const sendPackH1GroupMaxMessageByteCount = 3 * 1024
 // rotating contracts retain the 3-KiB bound above; handshake carriers use the
 // larger transport minimum.
 const sendPackH1EstablishedMaxMessageByteCount = 3 * DefaultMtu
+
+// A logical group (one admission of ordered frames, the provider's return
+// chunk of one flow) may put six complete tunnel-MTU packets on a
+// contract-free Pack. They seal to 6,896 bytes: inside the 8-KiB message pool
+// class, the largest pooled one, and under half the transport's message
+// ceiling (ClientSettings.MinimumMessageLenLimit). A seventh packet would
+// leave under 200 bytes of that class. A provider's bulk return then travels
+// in half the messages of the three-packet chunk: half the queue slots, relay
+// handoffs, reads and acknowledgements on every hop, and a full
+// platformH1WriteBatchMaxByteCount stream write stays inside the writer's
+// message bound (platformWebSocketWriteBatchMaxMessages). A byte-accounted
+// route queue charges such a message two slots
+// (platformH1QueueSlotByteCount), so a memory-targeted profile holds the same
+// bytes as before. Independently queued Packs keep the three-packet bound
+// above when the ready drain coalesces them.
+const sendPackH1EstablishedGroupMaxMessageByteCount = 6 * DefaultMtu
 const rawSendPackPoolCapacity = 8
 
 type ReceivePack struct {
@@ -3021,6 +3065,22 @@ func (self *SendSequence) laneOldestOutstanding(route Route) *sendItem {
 	return nil
 }
 
+// laneYoungestOutstanding reports the newest item still awaiting
+// acknowledgement on this route: the lane's tail, which no later item on the
+// lane can prove dropped.
+func (self *SendSequence) laneYoungestOutstanding(route Route) *sendItem {
+	for i := len(self.sendItems) - 1; 0 <= i; i -= 1 {
+		item := self.sendItems[i]
+		if item == nil || item.selectiveAcked || item.carrierChanged {
+			continue
+		}
+		if item.carrierRoute == route {
+			return item
+		}
+	}
+	return nil
+}
+
 // promoteLaneHeads brings the new oldest unacknowledged item of each named
 // lane forward to one probe round trip from now, and tells it where its lane
 // has got to (FLIGHTGATEFIX §34.3).
@@ -3146,6 +3206,16 @@ func (self *SendSequence) shouldDeferTimeoutResend(
 		// cannot make an endpoint drop into queued bytes, even when fewer
 		// than three later selective ACKs leave recovery with this timer.
 		if self.laneAcknowledgedPast(item) || self.fifoRepairPassed(item) {
+			return false
+		}
+		// The lane's tail has no later item to prove it dropped, so deferring
+		// it waits for a proof that cannot come. When a burst's whole tail is
+		// lost, recovery's own writes then advance the cumulative ack one
+		// position per round trip and every later timeout defers again. A tail
+		// whose lane has been silent for a scaled round trip is written as a
+		// probe instead; its acknowledgement places every hole below it
+		// (laneAcknowledgedPast). A draining queue keeps acknowledging.
+		if scaledRtt < time.Since(self.lastCumulativeAckTime) && self.laneYoungestOutstanding(item.carrierRoute) == item {
 			return false
 		}
 	}
@@ -3494,7 +3564,8 @@ func (self *SendPack) pinGroupChunkLimits(policy transferFlightPolicySnapshot) {
 // h1EstablishedEnvelopeAvailable proves that every remaining chunk in one
 // logical group stays on a contract-free wire shape. Checking the entire
 // remainder matters: limits are pinned for callback accounting, so a group
-// must not rotate its contract halfway through a 3,300-byte chunk policy.
+// must not rotate its contract halfway through a chunk policy sized for a
+// contract-free Pack.
 func (self *SendSequence) h1EstablishedEnvelopeAvailable(
 	messageByteCount ByteCount,
 ) bool {
@@ -3523,7 +3594,7 @@ func (self *SendSequence) pinLogicalGroupChunkLimits(
 		MessageByteCount(sendPack.Frames[sendPack.groupFrameIndex:]),
 	) {
 		sendPack.groupChunkMaxMessageByteCount =
-			sendPackH1EstablishedMaxMessageByteCount
+			sendPackH1EstablishedGroupMaxMessageByteCount
 	}
 }
 
@@ -6711,6 +6782,11 @@ type SendSequence struct {
 	// a contract becomes current. Owned by the sequence goroutine.
 	successorContractRequested bool
 	sendContractSetTime        time.Time
+	// When to look whether the requested successor is still on its way or
+	// queued (zero: never), and how many successors of the current contract
+	// the queue has closed unused (see `forgetLostSuccessorContract`).
+	successorContractLostCheckTime time.Time
+	successorContractLostCount     int
 	// Whether the current contract's successor is requested at take and at
 	// announcement rather than once it is due (`successorContractEagerForKey`).
 	successorContractEager bool
@@ -10139,8 +10215,17 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			// Expired prefetches cannot become usable while we wait. Poll once
 			// for a live successor, then request renewal without spending the
 			// caller's admission timeout on the ordinary exhaustion retry.
+			//
+			// The same holds while no request is in flight: a successor that
+			// was requested, queued, and closed there unused after
+			// `ContractQueueExpireTimeout` (the sequence was idle meanwhile)
+			// is not coming, and waiting out the retry interval for it stalls
+			// the resumed sequence for that long before the request below is
+			// even made. A request still in flight is waited for as before,
+			// and absorbs the identical one below.
 			initialWait := min(self.sendBufferSettings.CreateContractTimeout, retryInterval)
-			if self.sendContract.expired() {
+			if self.sendContract.expired() ||
+				!self.client.ContractManager().hasPendingCreate(self.contractMetadata().key) {
 				initialWait = 0
 			}
 			if traceNextContract(initialWait) {
@@ -10290,12 +10375,23 @@ func (self *SendSequence) requestSuccessorContract(key ContractKey, messageByteC
 // Requests the current contract's successor the first time it is due (see
 // `successorContractDue`), and otherwise rearms the check that a caller's
 // no-acknowledgement write makes. A successor already in the queue counts as
-// requested. An eager sequence requests at take and at announcement instead,
-// and a contract made obsolete by a route promotion is left to the exhaustion
-// path, which retires it. Nothing here blocks.
+// requested, until the queue has closed it unused: then the contract has no
+// successor again and requests another once that is due, up to
+// `successorContractLostLimit` (see `forgetLostSuccessorContract`). An eager
+// sequence requests at take and at announcement instead, and a contract made
+// obsolete by a route promotion is left to the exhaustion path, which retires
+// it. Nothing here blocks.
 func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCount) {
 	contract := self.sendContract
-	if contract == nil || self.successorContractEager || self.successorContractRequested {
+	if contract == nil || self.successorContractEager {
+		return
+	}
+	if self.successorContractRequested &&
+		(self.aheadSendContract != nil || !self.forgetLostSuccessorContract()) {
+		return
+	}
+	if successorContractLostLimit <= self.successorContractLostCount {
+		// no further successor is requested ahead of the end of this contract
 		return
 	}
 	due, checkRemainingByteCount := self.successorContractDue(contract)
@@ -10307,6 +10403,9 @@ func (self *SendSequence) maybeRequestSuccessorContract(messageByteCount ByteCou
 		if self.client.ContractManager().hasQueuedContract(metadata.key) ||
 			self.requestSuccessorContract(metadata.key, messageByteCount) {
 			self.successorContractRequested = true
+			self.successorContractLostCheckTime = self.successorContractLostCheckAfter(
+				self.client.ContractManager().settings.ContractQueueExpireTimeout,
+			)
 			checkRemainingByteCount = 0
 		}
 	}
@@ -10593,6 +10692,7 @@ func (self *SendSequence) setContract(
 	self.sendContractSetTime = self.successorContractNow()
 	self.successorContractEager = self.successorContractEagerForKey(self.contractMetadata().key)
 	self.successorContractRequested = false
+	self.successorContractLostCount = 0
 	if !self.successorContractEager {
 		_, checkRemainingByteCount := self.successorContractDue(nextSendContract)
 		nextSendContract.successorCheckRemainingByteCount.Store(int64(checkRemainingByteCount))
@@ -12033,9 +12133,15 @@ func (self *SendSequence) estimateSendWindow(now time.Time, retainService bool, 
 		if advertised, ok := self.receivedWindowAdvertisement(); ok {
 			estimate.Window = min(estimate.Window, advertised)
 		}
+		// The unbudgeted rule window is admitted from the first measured
+		// round trip. Before it a burst keeps today's constant, so a loss
+		// that takes a whole cold window recovers as it does today.
+		if todays := MemoryScaledByteCount(mib(2), kib(256)); todays < estimate.Window && !self.rttWindow.estimate(now).Sampled() {
+			estimate.Window = todays
+		}
 		estimate.Floor = min(estimate.Floor, estimate.Window)
 		estimate.Ceiling = estimate.Window
-		estimate.Reason = "no memory budget: holding today's constant within known limits"
+		estimate.Reason = "no memory budget: holding the constant within known limits"
 		return estimate
 	}
 	// The share: what this queue's pool would lend it at full demand, read now

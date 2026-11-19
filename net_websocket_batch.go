@@ -58,7 +58,8 @@ func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
 // SetWriteBatchByteLimit raises this connection's coalescing bound. The buffer
 // still starts at 16 KiB and grows to limit only while one explicit batch
 // holds more complete frames; a limit at or below the default keeps the fixed
-// buffer.
+// buffer. Lowering the bound takes effect when the next batch begins: a buffer
+// grown past it is replaced then.
 func (self *WebSocketWriteBatchConn) SetWriteBatchByteLimit(limit int) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -92,7 +93,7 @@ func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 	if self.batching {
 		panic("websocket write batch already active")
 	}
-	if self.writeBuffer == nil {
+	if self.writeBuffer == nil || self.batchByteLimitWithLock() < cap(self.writeBuffer) {
 		self.writeBuffer = make([]byte, 0, webSocketWriteBatchMaxByteCount)
 	} else {
 		self.writeBuffer = self.writeBuffer[:0]

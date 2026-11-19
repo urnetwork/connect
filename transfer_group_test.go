@@ -790,7 +790,9 @@ func TestH1LogicalGroupWritesAckSizedBurstAsOnePack(t *testing.T) {
 	releaseTransferGroupTestWitnesses(t, frames, witnesses)
 }
 
-func TestH1EstablishedLogicalGroupWritesThreeTunnelPacketsPerPack(t *testing.T) {
+// An established H1 group puts as many complete tunnel-MTU packets on one Pack
+// as its message bound holds: six.
+func TestH1EstablishedLogicalGroupWritesSixTunnelPacketsPerPack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	destinationId := NewId()
@@ -807,7 +809,11 @@ func TestH1EstablishedLogicalGroupWritesThreeTunnelPacketsPerPack(t *testing.T) 
 		[]Route{route},
 	)
 
-	frames, witnesses := transferGroupTestFrames(t, 7, DefaultMtu)
+	packetsPerPack := int(sendPackH1EstablishedGroupMaxMessageByteCount / DefaultMtu)
+	if packetsPerPack != 6 {
+		t.Fatalf("established H1 Pack holds %d tunnel-MTU packets, want 6", packetsPerPack)
+	}
+	frames, witnesses := transferGroupTestFrames(t, 2*packetsPerPack+1, DefaultMtu)
 	result := make(chan error, 1)
 	success, err := client.sendGroupWithTimeoutDetailed(
 		frames,
@@ -841,8 +847,8 @@ func TestH1EstablishedLogicalGroupWritesThreeTunnelPacketsPerPack(t *testing.T) 
 		frameCounts = append(frameCounts, len(pack.Frames))
 		MessagePoolReturn(transferFrameBytes)
 	}
-	if !slices.Equal(frameCounts, []int{3, 3, 1}) {
-		t.Fatalf("H1 established tunnel-MTU frame counts=%v, want [3 3 1]", frameCounts)
+	if !slices.Equal(frameCounts, []int{packetsPerPack, packetsPerPack, 1}) {
+		t.Fatalf("H1 established tunnel-MTU frame counts=%v, want [6 6 1]", frameCounts)
 	}
 	releaseTransferGroupTestWitnesses(t, frames, witnesses)
 }
@@ -1013,11 +1019,11 @@ func TestH1EstablishedLogicalGroupRequiresContractForWholeRemainder(t *testing.T
 		transferFlightPolicySnapshot{h1Only: true},
 	)
 	_, availableBytes := available.groupChunkLimits()
-	if availableBytes != sendPackH1EstablishedMaxMessageByteCount {
+	if availableBytes != sendPackH1EstablishedGroupMaxMessageByteCount {
 		t.Fatalf(
 			"contract-covered H1 group byte limit=%d, want %d",
 			availableBytes,
-			sendPackH1EstablishedMaxMessageByteCount,
+			sendPackH1EstablishedGroupMaxMessageByteCount,
 		)
 	}
 }
@@ -1584,7 +1590,7 @@ func benchmarkH1Burst(b *testing.B, logicalGroup bool, frameBytes int) {
 
 	framesPerWirePack := min(
 		sendPackH1GroupMaxFrames,
-		int(sendPackH1EstablishedMaxMessageByteCount)/frameBytes,
+		int(sendPackH1EstablishedGroupMaxMessageByteCount)/frameBytes,
 	)
 	wantWirePacks := (frameCount + framesPerWirePack - 1) / framesPerWirePack
 	b.ReportAllocs()

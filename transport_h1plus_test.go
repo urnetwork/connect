@@ -33,14 +33,17 @@ func h1PlusDrainTestOwnedMessages(channel <-chan []byte) {
 
 func TestWriteH1FramedReadyBatchAckFairnessAndOwnership(t *testing.T) {
 	baseline := MessagePoolOutstandingCount()
-	priority := make(chan []byte, 40)
-	ordinary := make(chan []byte, 4)
+	// more of both lanes than one flush takes at the message bound
+	priorityCount := platformWebSocketWriteBatchMaxMessages + 8
+	ordinaryCount := platformWebSocketWriteBatchMaxMessages/9 + 2
+	priority := make(chan []byte, priorityCount)
+	ordinary := make(chan []byte, ordinaryCount)
 	defer h1PlusDrainTestOwnedMessages(priority)
 	defer h1PlusDrainTestOwnedMessages(ordinary)
-	for i := range 40 {
+	for i := range priorityCount {
 		priority <- h1PlusOwnedTestMessage(byte(i+1), 64)
 	}
-	for i := range 4 {
+	for i := range ordinaryCount {
 		ordinary <- h1PlusOwnedTestMessage(byte(0xa0+i), 64)
 	}
 	raw := newH1UpgradeScriptConn(nil)
@@ -48,6 +51,8 @@ func TestWriteH1FramedReadyBatchAckFairnessAndOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// the platform writer's bound, so a flush at the message bound is one write
+	conn.SetWriteBatchByteLimit(platformH1WriteBatchMaxByteCount)
 	sent := 0
 	open, err := writeH1FramedReadyBatch(context.Background(), conn, ordinary, priority, h1PlusOwnedTestMessage(0, 64), true, time.Second, func() { sent++ })
 	if err != nil || !open || sent != platformWebSocketWriteBatchMaxMessages || raw.writeCalls != 1 {
@@ -55,14 +60,16 @@ func TestWriteH1FramedReadyBatchAckFairnessAndOwnership(t *testing.T) {
 	}
 	// The first ACK counts toward its eight-message quantum. The complete
 	// flush is ACK[0:8],ordinary0,ACK[8:16],ordinary1,ACK[16:24],ordinary2,
-	// ACK[24:29], keeping ordinary turns inside the same physical bulk write.
+	// and so on up to the message bound, keeping ordinary turns inside the
+	// same physical bulk write.
 	var want []byte
-	ack := byte(0)
+	ack, ordinarySent := 0, 0
 	for i := range platformWebSocketWriteBatchMaxMessages {
-		if i == 8 || i == 17 || i == 26 {
-			want = append(want, byte(0xa0+i/9))
+		if i%9 == 8 {
+			want = append(want, byte(0xa0+ordinarySent))
+			ordinarySent++
 		} else {
-			want = append(want, ack)
+			want = append(want, byte(ack))
 			ack++
 		}
 	}
@@ -79,8 +86,9 @@ func TestWriteH1FramedReadyBatchAckFairnessAndOwnership(t *testing.T) {
 			t.Fatalf("bulk position %d violated ACK fairness; want label %d", i, label)
 		}
 	}
-	if reader.Len() != 0 || len(priority) != 12 || len(ordinary) != 1 {
-		t.Fatalf("collector exceeded32-message bound: unreadwire=%d priority=%d ordinary=%d", reader.Len(), len(priority), len(ordinary))
+	// the first ACK was handed to the flush directly, not taken from the lane
+	if reader.Len() != 0 || len(priority) != priorityCount-(ack-1) || len(ordinary) != ordinaryCount-ordinarySent {
+		t.Fatalf("collector exceeded the message bound: unreadwire=%d priority=%d ordinary=%d", reader.Len(), len(priority), len(ordinary))
 	}
 	h1PlusDrainTestOwnedMessages(priority)
 	h1PlusDrainTestOwnedMessages(ordinary)

@@ -162,23 +162,14 @@ func TestTheShippingWindowSizingDefaultIsTheRule(t *testing.T) {
 	}
 }
 
-// The unbudgeted process, which is the one that has to be exactly today's
-// rather than nearly: the hosted proxy and every host that never calls
-// SetMemoryBudget take this path, and a default that changes them cannot be
-// rolled back by a host that does not know it is on it.
-//
-// Exactly, on the send side, and this row states where it stops. The window a
-// sequence admits against is the constant, by the same number, because the
-// share is zero, the queue has no pool, and the estimate returns before any
-// derived term is applied — so admission calls CanAdd with the same bytes it
-// called with under the constant policy. What is not identical, named here so
-// the difference is not discovered later: the sequence allocates the delivery
-// ring the rule samples into, and the receiver advertises its hold on every
-// acknowledgement, which is a wire change on an unbudgeted process too. The
-// advertisement is the rule working as designed — the hold it advertises is
-// the same constant hold — but it is a difference, and "exactly today's"
-// applies to the window and the admission, not to the bytes on the wire.
-func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
+// The unbudgeted process: the hosted proxy and every host that never calls
+// SetMemoryBudget take this path. Under the rule it holds an unsized constant,
+// the reference share (unbudgetedRuleWindowByteCount) and its 1.25 hold, where
+// the constant policy (SetWindowSizing) keeps today's 2 MiB and 2.5 MiB. It is
+// admitted from the first measured round trip and known limits still clamp it,
+// so a peer advertising today's hold is not overrun. Not identical either way: the sequence allocates the delivery ring
+// and the receiver advertises its hold on every acknowledgement.
+func TestTheUnbudgetedProcessHoldsTheReferenceShareUnderTheRule(t *testing.T) {
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
 	SetMemoryBudget(0)
@@ -194,9 +185,11 @@ func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
 		t.Fatal("the rule reports itself active with nothing to draw on")
 	}
 
-	constant := DefaultSendBufferSettings()
-	constant.WindowSizing = WindowSizingConstant
-	constant.ApplyWindowSizing()
+	constant := func() *SendBufferSettings {
+		defer SetWindowSizing(DefaultWindowSizing())
+		SetWindowSizing(WindowSizingConstant)
+		return DefaultSendBufferSettings()
+	}()
 
 	ruledEstimate := windowEstimateForSettings(ruled)
 	constantEstimate := windowEstimateForSettings(constant)
@@ -205,24 +198,28 @@ func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
 		ruledEstimate.Window, ruledEstimate.Reason,
 		constantEstimate.Window, constantEstimate.Reason,
 	)
-	if ruledEstimate.Window != constantEstimate.Window {
+	todaysWindow := MemoryScaledByteCount(mib(2), kib(256))
+	if ruledEstimate.Window != todaysWindow || constantEstimate.Window != todaysWindow {
 		t.Errorf(
-			"the rule admits against a %d byte window where the constant admits against %d; an unbudgeted process must not change when the rule is turned on",
+			"before a measured round trip the rule admits against %d and the constant policy against %d; both should hold today's %d",
 			ruledEstimate.Window,
 			constantEstimate.Window,
+			todaysWindow,
 		)
 	}
-	if ruledEstimate.Window != ruled.ResendQueueMaxByteCount {
+	measured := newEstimatorFixture(t, func(settings *SendBufferSettings) { *settings = *ruled })
+	sampleRoundTrip(measured, 10*time.Millisecond)
+	if window := measured.sendWindowEstimate(time.Now()).Window; window != unbudgetedRuleWindowByteCount() || window != ruled.ResendQueueMaxByteCount {
 		t.Errorf(
-			"the window is %d rather than the constant %d the settings carry",
-			ruledEstimate.Window,
+			"after a measured round trip the window is %d rather than the reference share %d the settings carry",
+			window,
 			ruled.ResendQueueMaxByteCount,
 		)
 	}
 	if ruledEstimate.Sized {
 		t.Error("the rule reported a sized window with no budget to size against")
 	}
-	// the reason is the difference a reader has: same number, and it says why
+	// the reason says which constant is held and why
 	if ruledEstimate.Reason == constantEstimate.Reason {
 		t.Errorf(
 			"both policies report %q; an unbudgeted process under the rule should say it is holding the constant for want of a budget",
@@ -230,8 +227,16 @@ func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
 		)
 	}
 
-	// and the receive side, where it is not identical: the hold is the same
-	// constant and it is now advertised
+	// a peer advertising today's hold clamps the constant to it
+	todaysHold := MemoryScaledByteCount(mib(2)+kib(512), kib(320))
+	clamped := newEstimatorFixture(t, func(settings *SendBufferSettings) { *settings = *ruled })
+	sampleRoundTrip(clamped, 10*time.Millisecond)
+	clamped.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: true, receiveWindowByteCount: uint32(todaysHold)})
+	if window := clamped.sendWindowEstimate(time.Now()).Window; window != todaysHold {
+		t.Errorf("a peer advertising today's %d byte hold was given a %d byte window", todaysHold, window)
+	}
+
+	// and the receive side: the rule's hold, advertised
 	receive := DefaultReceiveBufferSettings()
 	if !receive.AdvertiseReceiveWindow {
 		t.Error("the unbudgeted receiver does not advertise, so a peer cannot size to it at all")
@@ -239,9 +244,9 @@ func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
 	if receive.ReceiveQueueBudget != nil {
 		t.Error("the unbudgeted receiver drew a pool from a budget that does not exist")
 	}
-	if want := MemoryScaledByteCount(mib(2)+kib(512), kib(320)); receive.ReceiveQueueMaxByteCount != want {
+	if want := unbudgetedRuleHoldByteCount(); receive.ReceiveQueueMaxByteCount != want {
 		t.Errorf(
-			"the unbudgeted hold is %d rather than today's constant %d",
+			"the unbudgeted hold is %d rather than the rule's %d",
 			receive.ReceiveQueueMaxByteCount,
 			want,
 		)
@@ -261,8 +266,8 @@ func TestTheUnbudgetedProcessKeepsTodaysWindowUnderTheRule(t *testing.T) {
 // The unbudgeted process is the case to read carefully, because the hosted
 // proxy and any host that never calls SetMemoryBudget take it. There the share
 // is zero — the absence of the surface, not a small share — so the rule stays
-// inert and the sequence keeps today's constant rather than falling to a
-// floor.
+// inert and the sequence holds an unsized constant, the reference share
+// (unbudgetedRuleWindowByteCount), rather than falling to a floor.
 func TestTheDerivedWindowQuantitiesAtTheShippedBudgets(t *testing.T) {
 	defer SetMemoryBudget(0)
 	budgets := []struct {
@@ -299,24 +304,25 @@ func TestTheDerivedWindowQuantitiesAtTheShippedBudgets(t *testing.T) {
 				t.Errorf("%s: the rule reports itself active with no budget to draw on", budget.name)
 			}
 			// the initial bet on this path, which is the whole window there
-			if send.ResendQueueMaxByteCount != constantWindow {
+			if send.ResendQueueMaxByteCount != unbudgetedRuleWindowByteCount() || unbudgetedRuleWindowByteCount() <= constantWindow {
 				t.Errorf(
-					"%s: the window is %d rather than today's constant %d, so an unbudgeted host changed when the rule was turned on",
+					"%s: the window is %d rather than the reference share %d, above today's constant %d",
 					budget.name,
 					send.ResendQueueMaxByteCount,
+					unbudgetedRuleWindowByteCount(),
 					constantWindow,
 				)
 			}
-			if receive.ReceiveQueueMaxByteCount != constantHold {
+			if receive.ReceiveQueueMaxByteCount != unbudgetedRuleHoldByteCount() {
 				t.Errorf(
-					"%s: the hold is %d rather than today's constant %d",
+					"%s: the hold is %d rather than the rule's %d",
 					budget.name,
 					receive.ReceiveQueueMaxByteCount,
-					constantHold,
+					unbudgetedRuleHoldByteCount(),
 				)
 			}
 			t.Logf(
-				"%s: share none, window %d (today's constant), hold %d, rule inert",
+				"%s: share none, window %d (the rule's constant), hold %d, rule inert",
 				budget.name, send.ResendQueueMaxByteCount, receive.ReceiveQueueMaxByteCount,
 			)
 			continue
@@ -563,7 +569,7 @@ func TestTheTransferShareIsADrawOnTheBudget(t *testing.T) {
 	}
 
 	// and the absence of a budget is the absence of the surface, not a small
-	// share: an unbudgeted process keeps today's constant
+	// share: an unbudgeted process never falls below today's constant
 	SetMemoryBudget(0)
 	if share := transferBudgetShareByteCount(); share != 0 {
 		t.Errorf("an unbudgeted process computed a share of %d; it has no budget to draw on", share)
@@ -577,7 +583,7 @@ func TestTheTransferShareIsADrawOnTheBudget(t *testing.T) {
 			settings.ResendQueueBudget.TotalByteCount(),
 		)
 	}
-	if settings.ResendQueueMaxByteCount != MemoryScaledByteCount(mib(2), kib(256)) {
+	if settings.ResendQueueMaxByteCount < MemoryScaledByteCount(mib(2), kib(256)) {
 		t.Errorf(
 			"an unbudgeted process's constant window is %d rather than today's %d; falling to a floor here would make every unbudgeted provider slower the moment the rule is turned on, which is the opposite of the point",
 			settings.ResendQueueMaxByteCount,
@@ -676,7 +682,7 @@ func TestTheResolvedCeilingMovesWithTheBudget(t *testing.T) {
 	if empty.WindowSizingActive() {
 		t.Error("the rule reports active with no budget to draw on")
 	}
-	if empty.ResendQueueMaxByteCount != MemoryScaledByteCount(mib(2), kib(256)) {
+	if empty.ResendQueueMaxByteCount < MemoryScaledByteCount(mib(2), kib(256)) {
 		t.Errorf("an unbudgeted process lost today's constant: %d", empty.ResendQueueMaxByteCount)
 	}
 }
@@ -834,8 +840,9 @@ func TestTheReliableAdmissionBoundReadsThePathNotTheResendFloor(t *testing.T) {
 // and never the constant.
 //
 // Prediction, recorded before the run: at 64 MiB, 256 MiB, 1 GiB and 8 GiB
-// the attached budget is exactly M/8 and the rule reports active; the 2 MiB
-// constant is what the same settings hold at a zero budget, and only there.
+// the attached budget is exactly M/8 and the rule reports active; an unsized
+// constant, the reference share, is what the same settings hold at a zero
+// budget, and only there.
 func TestABudgetedProviderDrawsItsShareRatherThanTheConstant(t *testing.T) {
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
@@ -871,7 +878,7 @@ func TestABudgetedProviderDrawsItsShareRatherThanTheConstant(t *testing.T) {
 
 	SetMemoryBudget(0)
 	settings := DefaultSendBufferSettings()
-	if settings.WindowSizingActive() || settings.ResendQueueMaxByteCount != constant {
+	if settings.WindowSizingActive() || settings.ResendQueueMaxByteCount != unbudgetedRuleWindowByteCount() {
 		t.Errorf(
 			"an unbudgeted process holds active=%v max=%d; the constant is what a zero budget means and only that",
 			settings.WindowSizingActive(), settings.ResendQueueMaxByteCount,
