@@ -912,6 +912,15 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 			icmpCopied.Log = log
 			copied.IcmpBufferSettings = &icmpCopied
 		}
+		// an exit whose egress is a proxy dials tcp through it and udp only
+		// through the owner's packet endpoint (ConnectSettings.DialContext), and
+		// sends no icmp echo, whose socket would be this host's
+		// (net_proxy_packet_path.go)
+		if copied.TcpBufferSettings.ProxySettings != nil || copied.UdpBufferSettings.ProxySettings != nil {
+			icmpCopied := *copied.IcmpBufferSettings
+			icmpCopied.proxiedEgress = true
+			copied.IcmpBufferSettings = &icmpCopied
+		}
 		settings = &copied
 	}
 	settings = boundedNatMemorySettings(settings)

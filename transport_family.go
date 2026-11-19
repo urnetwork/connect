@@ -7,9 +7,12 @@ package connect
 // A PINNED transport proves one address family to the platform. It dials its
 // family url with the network narrowed to that family regardless of the
 // control-plane policy or the demotion ledger, resolves only the matching
-// record type, uses direct dialers only, declares its intent in the auth
-// header or frame, and never counts a dial failure against the process-wide
-// backend-degraded gate. A pinned transport that cannot possibly connect is
+// record type, dials on its space's egress only -- no extender or VLESS
+// server, and the space's proxy when it has one (NewEgressClientStrategy,
+// EXTENDER.md J4) -- declares its intent in the auth header or frame, and never
+// counts a dial failure against the process-wide backend-degraded gate. Through
+// a proxy the proxy resolves the family name, so the pin proves the proxy's
+// family, which is the address the platform sees. A pinned transport that cannot possibly connect is
 // HELD rather than spun: it sleeps while the device has no path of its family
 // and idles while a Force policy contradicts it, and it wakes on a network
 // change or a policy change. An address of the family is not a path when the
@@ -23,7 +26,7 @@ package connect
 // not own them. A context value narrows the network inside
 // dialControlTlsWithFamilyFallback, which every tls dial (normal and resilient)
 // passes through, so name resolution requests only the pinned record type. A
-// DialContextSettings wrapper installed by NewDirectClientStrategy is the final
+// DialContextSettings wrapper installed by NewEgressClientStrategy is the final
 // enforcement below resolution, and the only route for a plain ws:// dial,
 // which gorilla hands to NetDialContext without any tls chain.
 //
@@ -218,55 +221,80 @@ func udpAddrFamily(udpAddr *net.UDPAddr) int {
 	return 6
 }
 
-// NewDirectClientStrategy builds the client strategy a family-pinned platform
-// transport dials with: the caller's settings without extenders, VLESS
-// servers or a proxy, so every dial is direct and the observed remote family
-// is the family the provider actually has (A4), and with the pin enforced
-// below name resolution. Each pinned transport owns one, which also gives it
-// connect pacing independent of the process-wide strategy (A5).
+// Builds the client strategy a provider's platform transports dial with
+// (EXTENDER.md J4): the caller's settings without extenders or VLESS
+// servers, so no dial crosses a third party the platform would observe
+// instead, on the space's own egress -- its proxy when it has one, else this
+// host's address -- and with a family pin enforced below name resolution.
+// Each pinned transport owns one, which also gives it connect pacing
+// independent of the process-wide strategy (IPV6.md A5).
+//
+// A space whose egress is a proxy reaches the platform through the proxy on
+// every transport (connect#227, owner 2026-11-18), so the platform observes the
+// proxy's address and places the provider there, as its exit leaves there too.
+// A pinned dial asks the proxy for the family name, which the proxy resolves on
+// its side: a family name carries records of its family alone (IPV6.md A2), so
+// the pin proves the proxy's family. Such a strategy offers no udp carrier
+// (net_proxy_packet_path.go), so its transports carry h1.
 //
 // The caller's settings are not mutated. An injected DialContextSettings
 // (headless hosts) is kept as the inner dial so a source-identity seam still
-// applies; a configured ProxySettings is dropped, because a pinned dial through
-// a proxy would prove the proxy's family, not the provider's. The extenders and
-// VLESS servers stay dropped: the strategy refuses those a later
+// applies, ahead of a proxy, as ConnectSettings.DialContext takes it. The
+// extenders and VLESS servers stay dropped: the strategy refuses those a later
 // `SetCustomExtenders` or `SetVlessConfigs` names (`DisableManualExtenders`,
 // `DisableVless`).
-func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
-	direct := *settings
-	direct.ExtenderConfigs = nil
-	direct.ExtenderDirectory = nil
-	direct.ExpandExtenderProfileCount = 0
-	direct.MaxExtenderCount = 0
-	direct.DisableManualExtenders = true
-	direct.ConnectSettings.ProxySettings = nil
-	// a VLESS server would prove its own family, as a proxy would
-	direct.VlessConfigs = nil
-	direct.DisableVless = true
+func NewEgressClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
+	egress := *settings
+	egress.ExtenderConfigs = nil
+	egress.ExtenderDirectory = nil
+	egress.ExpandExtenderProfileCount = 0
+	egress.MaxExtenderCount = 0
+	egress.DisableManualExtenders = true
+	// a VLESS server would be observed in the provider's place, as an extender
+	// would
+	egress.VlessConfigs = nil
+	egress.DisableVless = true
 
 	ipFamily = normalizeIpFamily(ipFamily)
 	// the alt carriers dial udp themselves, below any dial context, so the pin
 	// reaches them through the settings (L4)
-	direct.ipFamily = ipFamily
+	egress.ipFamily = ipFamily
 	if ipFamily != 0 {
-		base := direct.ConnectSettings
+		base := egress.ConnectSettings
 		base.DialContextSettings = nil
 		inner := func(ctx context.Context, network string, addr string) (net.Conn, error) {
 			return base.NetDialer().DialContext(ctx, network, addr)
 		}
+		if base.ProxySettings != nil {
+			// the proxy resolves the family name on its side
+			inner = func(ctx context.Context, network string, addr string) (net.Conn, error) {
+				return base.proxyDialContext(base.NetDialer())(ctx, network, addr)
+			}
+		}
 		var packetConnFactory func(context.Context) (net.PacketConn, error)
-		if injected := direct.ConnectSettings.DialContextSettings; injected != nil {
+		if injected := egress.ConnectSettings.DialContextSettings; injected != nil {
 			if injected.DialContext != nil {
 				inner = injected.DialContext
 			}
 			packetConnFactory = injected.PacketConnFactory
 		}
-		direct.ConnectSettings.DialContextSettings = &DialContextSettings{
+		egress.ConnectSettings.DialContextSettings = &DialContextSettings{
 			DialContext:       pinnedDialContext(ipFamily, inner),
 			PacketConnFactory: packetConnFactory,
 		}
 	}
-	return NewClientStrategy(ctx, &direct)
+	return NewClientStrategy(ctx, &egress)
+}
+
+// Builds the strategy NewEgressClientStrategy does with any proxy dropped, so
+// every dial leaves from this host's own address: for a dial whose point is
+// this host, such as an extender's activation, which tells the operator the
+// address the extender's carriers listen on (EXTENDER.md C2). A platform
+// transport takes NewEgressClientStrategy, which keeps the space's proxy.
+func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
+	direct := *settings
+	direct.ConnectSettings.ProxySettings = nil
+	return NewEgressClientStrategy(ctx, &direct, ipFamily)
 }
 
 // pinnedDialContext is the enforcement below name resolution: the network is
@@ -1463,7 +1491,8 @@ type FamilyPlatformTransportGroup struct {
 	ipv4Transport    *PlatformTransport
 	ipv6Transport    *PlatformTransport
 	standbyTransport *PlatformTransport
-	// owned direct-only strategies, one per pinned transport
+	// owned egress strategies, one per pinned transport
+	// (NewEgressClientStrategy)
 	ipv4Strategy *ClientStrategy
 	ipv6Strategy *ClientStrategy
 
@@ -1479,9 +1508,12 @@ type FamilyPlatformTransportGroup struct {
 // NewFamilyPlatformTransportGroup starts the group. platformUrlV4 and
 // platformUrlV6 are the family urls (empty disables that pinned transport);
 // platformUrl is the family-agnostic url the standby dials with the caller's
-// full clientStrategy. clientStrategySettings seeds the direct-only strategies
-// the pinned transports own. settings is cloned per transport: the pinned
-// clones carry their family and background budget priority.
+// full clientStrategy. clientStrategySettings seeds the egress strategies the
+// pinned transports own (NewEgressClientStrategy): no extender or VLESS server,
+// and the settings' proxy when they name one, so a provider whose space
+// egresses through a proxy proves the proxy's families (EXTENDER.md J4).
+// settings is cloned per transport: the pinned clones carry their family and
+// background budget priority.
 func NewFamilyPlatformTransportGroup(
 	ctx context.Context,
 	clientStrategySettings *ClientStrategySettings,
@@ -1542,7 +1574,7 @@ func NewFamilyPlatformTransportGroup(
 		return &copied
 	}
 	if platformUrlV4 != "" {
-		group.ipv4Strategy = NewDirectClientStrategy(cancelCtx, clientStrategySettings, 4)
+		group.ipv4Strategy = NewEgressClientStrategy(cancelCtx, clientStrategySettings, 4)
 		group.ipv4Transport = NewPlatformTransportWithTargetMode(
 			cancelCtx,
 			group.ipv4Strategy,
@@ -1554,7 +1586,7 @@ func NewFamilyPlatformTransportGroup(
 		)
 	}
 	if platformUrlV6 != "" {
-		group.ipv6Strategy = NewDirectClientStrategy(cancelCtx, clientStrategySettings, 6)
+		group.ipv6Strategy = NewEgressClientStrategy(cancelCtx, clientStrategySettings, 6)
 		group.ipv6Transport = NewPlatformTransportWithTargetMode(
 			cancelCtx,
 			group.ipv6Strategy,

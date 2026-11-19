@@ -2610,6 +2610,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					applyTransportDelayH1Offer(header)
 				}
 			}
+			// in either auth generation: the platform reads it from the
+			// handshake (transport_egress_proxy.go)
+			applyEgressProxyHeader(header, self.clientStrategy)
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
 				moveAttempt.withContext(self.dialContext(dialCtx)),

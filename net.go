@@ -119,7 +119,11 @@ type ConnectSettings struct {
 	// applied to a host-supplied DialContextSettings dial.
 	DialControl func(network string, address string, c syscall.RawConn) error
 
-	RequestTimeout   time.Duration
+	RequestTimeout time.Duration
+	// Bounds a connect: the tcp connect of the default dialer, and the whole of
+	// a dial through ProxySettings -- the connect to the proxy, its negotiation
+	// and its connect to the target -- so a proxy that stalls fails the dial as
+	// an unanswered connect does. <= 0 does not bound it.
 	ConnectTimeout   time.Duration
 	TlsTimeout       time.Duration
 	HandshakeTimeout time.Duration
@@ -245,18 +249,25 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 		moveOverride = nil
 	}
 
+	if self.ProxySettings != nil && isDatagramDialNetwork(network) {
+		// a socks proxy carries streams only, and a socket of this host's would
+		// send from this host, outside the proxy: a space whose egress is a
+		// proxy dials udp only through the owner's packet endpoint, or not at
+		// all (net_proxy_packet_path.go). This covers the exit nat's udp too.
+		return self.dialProxiedPacket(ctx, network, addr)
+	}
+
 	var dialContext DialContextFunction
 
-	if self.DialContextSettings != nil {
+	if self.DialContextSettings != nil && self.DialContextSettings.DialContext != nil {
 		dialContext = self.DialContextSettings.DialContext
 	} else {
+		// a DialContextSettings with only a packet endpoint leaves the stream
+		// dial to the proxy or this host
 		netDialer := self.NetDialer()
 		if self.ProxySettings != nil {
 			// the proxy resolves names on its side; there is nothing to race
-			dialContext = self.ProxySettings.NewDialContext(
-				ctx,
-				netDialer,
-			)
+			dialContext = self.proxyDialContext(netDialer)
 		} else {
 			dialContext = self.raceDialContext(netDialer)
 		}
@@ -328,6 +339,25 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 		Resolver:        egressAwareResolver(self.Resolver),
 		Control:         self.DialControl,
 	}))
+}
+
+// The stream dial through ProxySettings over `forward`, bounded end to end by
+// ConnectTimeout: the socks negotiation and the proxy's connect to the target
+// otherwise wait as long as the caller's context does, and a caller such as
+// the exit nat dials with a context that has no deadline, so a proxy that
+// accepts and never answers would hold the dial for the life of the flow. The
+// bound ends with the dial: the connection it returns has no deadline.
+func (self *ConnectSettings) proxyDialContext(forward proxy.Dialer) DialContextFunction {
+	connectTimeout := self.ConnectTimeout
+	proxySettings := self.ProxySettings
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if 0 < connectTimeout {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, connectTimeout)
+			defer cancel()
+		}
+		return proxySettings.NewDialContext(ctx, forward)(ctx, network, addr)
+	}
 }
 
 type ProxySettings struct {
