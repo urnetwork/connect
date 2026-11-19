@@ -51,9 +51,37 @@ type StreamManager struct {
 	// lifetime, so the first refusal is reported at default verbosity. Later
 	// refusals stay at V(1) to keep a churning peer off the hot log path.
 	rejectedStreamLogOnce sync.Once
+	// The first StreamOpen a client with peer connections off ignores is
+	// reported once at default verbosity, the rest at V(1).
+	disabledStreamLogOnce sync.Once
 
 	rejectedStreamsLock sync.Mutex
 	rejectedStreams     map[Id]*rejectedStreamOpen
+}
+
+// Whether this client opens no p2p stream: its peer connections are off
+// (WebRtcSettings.DisablePeerConnections), as for a client whose egress is a
+// proxy. Every StreamOpen is then ignored, and the peers stay on the platform
+// transport, as they do for a stream a provider's policy refuses.
+func (self *StreamManager) peerConnectionsDisabled() bool {
+	return self.webRtcManager != nil && self.webRtcManager.settings != nil &&
+		self.webRtcManager.settings.DisablePeerConnections
+}
+
+// Reports a StreamOpen ignored because peer connections are off.
+func (self *StreamManager) logDisabledStreamOpen(streamId Id) {
+	logged := false
+	self.disabledStreamLogOnce.Do(func() {
+		logged = true
+		self.client.log.Infof(
+			"[sm]%s ignore s(%s): this client opens no peer connection, its peers stay on the platform transport\n",
+			self.client.ClientTag(),
+			streamId,
+		)
+	})
+	if !logged && self.client.log.V(1).Enabled() {
+		self.client.log.Infof("[sm]%s ignore s(%s): peer connections are off\n", self.client.ClientTag(), streamId)
+	}
 }
 
 // Close retires stream admission and requests teardown without waiting.
@@ -212,7 +240,7 @@ func (self *StreamManager) forgetRejectedStreamOpen(streamId Id) {
 // when the platform sent it. A stream that is still refused stays retained,
 // because a later proof may still arrive.
 func (self *StreamManager) reconsiderRejectedStreamOpens() {
-	if !self.providerStreamPolicy {
+	if !self.providerStreamPolicy || self.peerConnectionsDisabled() {
 		return
 	}
 
@@ -362,6 +390,12 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				if err != nil {
 					return err
 				}
+				if self.peerConnectionsDisabled() {
+					// no stream, so no p2p transport and no ice of this host's;
+					// not retained, since no later proof can allow it
+					self.logDisabledStreamOpen(streamId)
+					return nil
+				}
 				return self.authorizeStreamOpen(v, func() error {
 					if !self.allowStreamOpen(sourceId, destinationId) {
 						// Retained so the first verified Network contract or peer
@@ -432,7 +466,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					if err != nil {
 						continue
 					}
-					if !self.allowStreamOpen(sourceId, destinationId) || !self.streamAuthorizationActive(streamId) {
+					if self.peerConnectionsDisabled() || !self.allowStreamOpen(sourceId, destinationId) || !self.streamAuthorizationActive(streamId) {
 						continue
 					}
 					keep[newStreamSequenceId(sourceId, destinationId, streamId)] = true

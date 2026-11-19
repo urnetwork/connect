@@ -1646,12 +1646,14 @@ extender whose provider client is already a participant is counted once,
 since the set is keyed by client id.
 
 J4. Public providers do not use extenders. A provider whose provide mode
-includes public dials the platform directly on every transport, the
-standby included, so the platform observes the provider's own address and
-location; a provider in network mode may keep using extenders, since
-network peers carry no location metadata. Destination extender parties are
-therefore expected to be empty for public providers. A change of provide
-mode that flips this rebuilds the provider transports.
+includes public dials the platform on its egress on every transport, the
+standby included: from this host, or through its proxy if it has one
+(owner, 2026-11-18; the note on a space's egress). So the platform observes
+the address the provider's exit leaves from, and places the provider there;
+a provider in network mode may keep using extenders, since network peers
+carry no location metadata. Destination extender parties are therefore
+expected to be empty for public providers. A change of provide mode that
+flips this rebuilds the provider transports.
 
 J5. The legacy extender columns of `audit_contract_event` stay unused; the
 join table is the record.
@@ -5878,7 +5880,9 @@ gossip node.
 
   A space with no host, a closed one, or one for another network runs its own stack.
   Nothing changes for apps and for every other embedder, which build no space on a
-  host.
+  host. The stack's slot also asked for the provider extender role, whichever slot it
+  was; since 2026-11-18 only a direct slot does, and a run of proxy slots runs none
+  (the note on a space's egress below).
 - **Reading a shared directory** (`ClientStrategySettings.ExtenderDirectoryReadOnly`,
   `net_extender_strategy_evidence.go`). The slots dial along different paths, each
   through its own proxy. A slot whose proxy is down would report every extender it
@@ -5989,16 +5993,101 @@ binding (R1) and DialControl.
     the system resolver (`ExtenderNetworkClient.bootstrapResolution`).
   - The extender hint already refuses a proxied strategy. The gossip node passes
     names unresolved, as above.
-- **Not changed, and left to the owner.** These parts of a proxy slot's provider still
-  leave from the host, by their designs:
-  - The provider's platform transports in a public provide mode are direct (J4,
+- **Left to the owner on 2026-11-17.** These parts of a proxy slot's provider still
+  left from the host, by their designs:
+  - The provider's platform transports in a public provide mode were direct (J4,
     sdk `standbyClientStrategy`, connect `NewDirectClientStrategy`), so the platform
-    sees the host's address, h3's udp included.
-  - The exit NAT's tcp and udp to destinations are the host's (sn passes no
+    saw the host's address, h3's udp included.
+  - The exit NAT's tcp and udp to destinations were the host's (sn passed no
     `ProviderDialContextSettings`).
-  - P2P webrtc connections gather the host's ice candidates.
-  - The extender role binds and forwards on the host (G2).
-- **Tests.**
+  - P2P webrtc connections gathered the host's ice candidates.
+  - The extender role bound and forwarded on the host (G2).
+- **Decided 2026-11-18: route through the proxy.** The owner's decision ("Route
+  through the proxy"): every egress of a proxied space leaves through its proxy, so a
+  slot appears at its proxy's address and location and exits there.
+  - **Platform transports** (J4, amended). A public provider dials the platform on its
+    egress, which is its proxy if it has one. The pins and the public standby take
+    `NewEgressClientStrategy`: the space's settings without extenders or VLESS
+    servers, the proxy kept. A pin asks the proxy for its family name, which the
+    proxy resolves on its side, so the pin proves the proxy's family. The h3 modes stay
+    off for such a strategy, endpoint or not (above), so the transports carry h1. Only
+    a dial whose point is this host's own address drops the proxy:
+    `NewDirectClientStrategy`, which an extender's activation takes (C2).
+  - **Exit.** The sdk puts the exit nat on the space's egress
+    (`applyProviderExitEgress`): tcp through the proxy, udp only through the space's
+    packet endpoint, and no icmp echo. `ConnectSettings.DialContext` refuses a
+    datagram dial through a proxy that has no endpoint of the owner's
+    (`ErrExtenderPacketCarrierUnavailable`), whatever stream dial the host supplies,
+    and connects an owner's endpoint to the destination's ip literal
+    (`dialProxiedPacket`); a socks5 udp associate would come in as such an endpoint.
+    So no exit udp leaves from this host. A refused flow is answered with an
+    unreachable at once, so the source moves on. An echo socket is this host's, so the
+    nat marks its echo settings when its tcp or udp egress names a proxy, and an echo
+    flow opens none. sn passes the slot's settings in the space it builds for the
+    slot; the exit follows the space, with no `ProviderDialContextSettings`, so no
+    embedder can leave a proxied exit on the host by leaving that unset.
+  - **P2P.** Relay-only ice through the proxy is not supported (no TURN, and no socks
+    path for ice), so a proxied space opens no p2p stream: the sdk sets
+    `WebRtcSettings.DisablePeerConnections` for every client of the space, provider
+    and windows. Its stream manager takes no StreamOpen and its manager refuses a peer
+    connection (`ErrPeerConnectionsDisabled`), so the peers stay on the platform
+    transport. A client that asked for a stream keeps offering one that is never
+    answered, as for a stream a provider's policy refuses.
+  - **Extender role.** A proxied space never takes the role: the device does not ask
+    for it (`extenderProvideProviding`), the provider refuses it
+    (`setExtenderEnabledWithLock`), and sn asks for it on its direct slot alone. A run
+    of proxy slots still hosts the extender stack in its first slot, and runs no role.
+- **What a proxied space tells this host.** Three fixes beside the decision, since
+  more of a slot's dials now cross its proxy:
+  - The provider-local guard's observed addresses are process wide, and each
+    client's ObservedAddresses replaces them. A proxied slot's transports are now
+    seen at its proxy, so its message would replace this host's public address, which
+    a direct slot's exit and extender forward are guarded against (hairpin to the
+    router). The sdk sets `ClientSettings.SkipObservedAddresses` for every client of
+    a proxied space, which keeps them out.
+  - The control family ledger (`control_family.go`) is process wide, and a proxied
+    connection's family is the leg to the proxy. A dial of a space whose egress is a
+    proxy is dialed and handshaken once, and writes nothing to the ledger nor clears
+    anything from it (`dialControlTlsWithFamilyFallback`). Before, one slow proxy
+    could demote this host's family for every dial of the process, a miner's other
+    slots and its direct slot included.
+  - `ConnectSettings.ConnectTimeout` bounds a dial through a proxy end to end: the
+    connect to the proxy, its negotiation and the proxy's connect to the target. The
+    exit dials with a context that has no deadline, so a proxy that accepted and
+    never answered held the exit flow's dial for the flow's life.
+- **What changes for a proxied slot.**
+  - Its address and location are its proxy's: the platform places a connection by
+    its address, and the egress probe sees the proxy's exit. The address's
+    classification is the proxy's too: a hosting prefix keeps the slot out of
+    Quality, and a reviewed proxy or vpn address is a risk that excludes it.
+  - With no packet endpoint it carries no udp: every h3 leg of the quality probe
+    fails, so the slot never passes it, and the probe's evidence marks it tcp only.
+    Its pins prove only the families both this host and its proxy have.
+  - It earns nothing as an extender, since it runs no role.
+- **Tests (2026-11-18).**
+  - connect: `net_proxy_full_egress_test.go`.
+  - sdk: `device_local_proxied_space_test.go`.
+  - sn: `miner/provider_extender_slot_test.go`.
+
+  Each fails on the code before the decision:
+  - the group's pins and the public standby reach a canary platform on this host,
+    and the pins offer h3;
+  - the egress strategy drops the proxy;
+  - a proxied space's udp dial is handed to the host's own stream dial, a bare proxy
+    refuses it only in the socks client, and an endpoint with no stream dial panics
+    the dial;
+  - a socks proxy that never answers holds a dial past its connect timeout;
+  - a stalled handshake through a proxy demotes a family, and a refused one undoes a
+    demotion;
+  - a proxied client replaces this host's address in the guard with its proxy's;
+  - the exit's datagram reaches a canary on this host and its tcp reaches its
+    destination directly;
+  - an echo flow of a proxied exit asks for an echo socket;
+  - a client of a proxied space starts its stream opens, and a device's client
+    settings keep p2p and the observed addresses for a proxied space;
+  - a device and a provider in a proxied space ask for and try to start the role,
+    and sn's first proxy slot asks for it.
+- **Tests (2026-11-17).**
   - connect: `net_proxy_packet_path_test.go` and
     `net_proxy_name_resolution_test.go`.
   - gossip: `node_dialer_test.go`, `node_peer_exchange_test.go`.
