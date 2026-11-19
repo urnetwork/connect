@@ -336,21 +336,23 @@ func TestProxiedDialIsBoundedByConnectTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acceptedConns := make(chan net.Conn, 16)
+	acceptedConns := []net.Conn{}
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
 			// held open and never answered
-			acceptedConns <- conn
+			acceptedConns = append(acceptedConns, conn)
 		}
 	}()
 	defer func() {
 		listener.Close()
-		close(acceptedConns)
-		for conn := range acceptedConns {
+		<-acceptDone
+		for _, conn := range acceptedConns {
 			conn.Close()
 		}
 	}()

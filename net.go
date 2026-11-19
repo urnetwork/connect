@@ -120,10 +120,10 @@ type ConnectSettings struct {
 	DialControl func(network string, address string, c syscall.RawConn) error
 
 	RequestTimeout time.Duration
-	// ConnectTimeout bounds a connect: the tcp connect of the default dialer,
-	// and the whole of a dial through ProxySettings -- the connect to the proxy,
-	// its negotiation and its connect to the target -- so a proxy that stalls
-	// fails the dial as an unanswered connect does. <= 0 does not bound it.
+	// Bounds a connect: the tcp connect of the default dialer, and the whole of
+	// a dial through ProxySettings -- the connect to the proxy, its negotiation
+	// and its connect to the target -- so a proxy that stalls fails the dial as
+	// an unanswered connect does. <= 0 does not bound it.
 	ConnectTimeout   time.Duration
 	TlsTimeout       time.Duration
 	HandshakeTimeout time.Duration

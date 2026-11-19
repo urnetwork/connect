@@ -221,13 +221,13 @@ func udpAddrFamily(udpAddr *net.UDPAddr) int {
 	return 6
 }
 
-// NewEgressClientStrategy builds the client strategy a provider's platform
-// transports dial with (EXTENDER.md J4): the caller's settings without
-// extenders or VLESS servers, so no dial crosses a third party the platform
-// would observe instead, on the space's own egress -- its proxy when it has
-// one, else this host's address -- and with a family pin enforced below name
-// resolution. Each pinned transport owns one, which also gives it connect
-// pacing independent of the process-wide strategy (IPV6.md A5).
+// Builds the client strategy a provider's platform transports dial with
+// (EXTENDER.md J4): the caller's settings without extenders or VLESS
+// servers, so no dial crosses a third party the platform would observe
+// instead, on the space's own egress -- its proxy when it has one, else this
+// host's address -- and with a family pin enforced below name resolution.
+// Each pinned transport owns one, which also gives it connect pacing
+// independent of the process-wide strategy (IPV6.md A5).
 //
 // A space whose egress is a proxy reaches the platform through the proxy on
 // every transport (connect#227, owner 2026-11-18), so the platform observes the
@@ -286,12 +286,11 @@ func NewEgressClientStrategy(ctx context.Context, settings *ClientStrategySettin
 	return NewClientStrategy(ctx, &egress)
 }
 
-// NewDirectClientStrategy builds the strategy NewEgressClientStrategy does with
-// any proxy dropped, so every dial leaves from this host's own address: for a
-// dial whose point is this host, such as an extender's activation, which tells
-// the operator the address the extender's carriers listen on (EXTENDER.md C2).
-// A platform transport takes NewEgressClientStrategy, which keeps the space's
-// proxy.
+// Builds the strategy NewEgressClientStrategy does with any proxy dropped, so
+// every dial leaves from this host's own address: for a dial whose point is
+// this host, such as an extender's activation, which tells the operator the
+// address the extender's carriers listen on (EXTENDER.md C2). A platform
+// transport takes NewEgressClientStrategy, which keeps the space's proxy.
 func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettings, ipFamily int) *ClientStrategy {
 	direct := *settings
 	direct.ConnectSettings.ProxySettings = nil
