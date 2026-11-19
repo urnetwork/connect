@@ -741,8 +741,25 @@ paths:
       summary: Auth Verify
       description: |
         Verify ownership of email or phone number.
+
+        The verification and the session it returns commit together: a
+        refused session (409 `session_limit_reached`, the network's session
+        cap) leaves the code unused and the email or phone unverified.
+
+        No authentication is required. A signed-in caller verifying an email
+        or phone of its own network (adding a sign-in method) sends its
+        network token as the bearer: the verify then renews the caller's own
+        session and `network.by_jwt` is a token of that session, so no new
+        sign-in is listed and the session cap is not reached. Without a bearer,
+        or with one that is not a live network token of the verified network
+        and user (another network's, an ended session's, a client token, an
+        API key), the verify starts a new session, as a sign-in does; such a
+        bearer is never refused here.
       operationId: authVerify
-      security: []
+      # optional auth: anonymous callers sign in, a signed-in caller's own session is renewed
+      security:
+        - {}
+        - BearerAuth: []
       requestBody:
         required: true
         content:
