@@ -270,7 +270,7 @@ func blackholeEvidenceSince(stats *clientWindowStats) time.Time {
 	evidenceSince := time.Time{}
 	for _, since := range []time.Time{
 		unacknowledgedSendSince(stats),
-		stats.firstSendNackTime,
+		receiveAckOfferSince(stats),
 		unansweredConnectSince(stats),
 	} {
 		if !since.IsZero() && (evidenceSince.IsZero() || since.Before(evidenceSince)) {

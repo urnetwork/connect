@@ -17707,6 +17707,7 @@ type multiClientEventBucket struct {
 	ip6Paths            map[Ip6Path]bool
 
 	receiveAckDestinationUses map[receiveAckDestination]*receiveAckDestinationUse
+	terminalResetOffered      bool
 }
 
 func newMultiClientEventBucket() *multiClientEventBucket {
@@ -17741,6 +17742,8 @@ type clientWindowStats struct {
 	firstSendAckTime    time.Time
 	firstSendNackTime   time.Time
 	firstSendSynTime    time.Time
+	// The no-receive-ACK clock in mature buckets with a response-eligible offer.
+	firstReceiveAckOfferTime time.Time
 	// A snapshot of the lifetime outstanding-send clock, not a rolling
 	// bucket. sendProgressKnown distinguishes an idle real channel from old
 	// synthetic stats that only carry firstSendNackTime.
@@ -17978,8 +17981,9 @@ type multiClientChannel struct {
 	// replacements or repeat generator mutations.
 	contractReliabilityOnce sync.Once
 
-	stateLock    sync.Mutex
-	eventBuckets []*multiClientEventBucket
+	stateLock         sync.Mutex
+	eventBuckets      []*multiClientEventBucket
+	eventBucketSerial uint64 // increments on append, coalescing only removes a prefix
 	// destination -> source -> count
 	ip4DestinationSourceCount          map[Ip4Path]map[Ip4Path]int
 	ip6DestinationSourceCount          map[Ip6Path]map[Ip6Path]int
@@ -20311,6 +20315,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		// It cannot later prove an unwritten local expiry.
 		self.finishConnectSynOffer(synOffer, true)
 		synAdmitted = true
+		sendPacketGroup.receiveAckOffer.observeDisposition(receiveAckClockSecured)
 		self.admitReceiveAckOffer(&sendPacketGroup.receiveAckOffer)
 		return true, nil
 	}
@@ -20422,7 +20427,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			once         sync.Once
 			receiveOffer receiveAckOffer
 		}
-		synOffer := self.addSend(packetByteCount, parsedPacket.ipPath, &completion.receiveOffer)
+		synOffer, sendBucketSerial := self.addSend(packetByteCount, parsedPacket.ipPath, &completion.receiveOffer)
 		synAdmitted := false
 		if synOffer != nil {
 			defer func() { self.resolveConnectSynAdmission(synOffer, synAdmitted) }()
@@ -20454,6 +20459,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			MessagePoolReturn(parsedPacket.packet)
 			self.finishConnectSynOffer(synOffer, true)
 			synAdmitted = true
+			completion.receiveOffer.observeDisposition(receiveAckClockSecured)
 			self.admitReceiveAckOffer(&completion.receiveOffer)
 			return true, nil
 		}
@@ -20464,11 +20470,14 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 				self.finishConnectSynOffer(synOffer, !packetTransferExpiredUnwritten(err))
 				collapseAdmission.complete(err)
 				self.finishReceiveAckOffer(&completion.receiveOffer, !ack, err)
-				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
+				self.observePacketTransferCompletion(packetByteCount, sendBucketSerial, sendTime, ack, err)
 			})
 		}
 
 		opts := []any{scheduleIpFlow(parsedPacket.ipPath)}
+		if completion.receiveOffer.clockOffset != 0 {
+			opts = append(opts, observeTransportWrite(completion.receiveOffer.observeCarrierWrite))
+		}
 		opts = multiClientProtocolTransferOpts(opts, []*protocol.Frame{frame})
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
@@ -20505,7 +20514,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		// send never takes these returns, and a refused send never reaches the
 		// ack callback.
 		if err != nil {
-			self.addSendAbandoned(packetByteCount)
+			self.addSendAbandoned(packetByteCount, sendBucketSerial)
 			if !frame.Raw {
 				MessagePoolReturn(frame.MessageBytes)
 			}
@@ -20518,7 +20527,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 				MessagePoolReturn(parsedPacket.packet)
 			}
 		} else {
-			self.addSendAbandoned(packetByteCount)
+			self.addSendAbandoned(packetByteCount, sendBucketSerial)
 			if !frame.Raw {
 				MessagePoolReturn(frame.MessageBytes)
 			}
@@ -20540,6 +20549,7 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 // no peer acknowledgement completed a round trip.
 func (self *multiClientChannel) observePacketTransferCompletion(
 	packetByteCount ByteCount,
+	sendBucketSerial uint64,
 	sendTime time.Time,
 	ack bool,
 	err error,
@@ -20552,14 +20562,14 @@ func (self *multiClientChannel) observePacketTransferCompletion(
 		return
 	}
 	if packetTransferExpiredUnwritten(err) {
-		self.addSendAbandoned(packetByteCount)
+		self.addSendAbandoned(packetByteCount, sendBucketSerial)
 		return
 	}
 	if ack || !packetLocalTransferFailure(err) {
 		self.addError(err)
 		return
 	}
-	self.addSendAbandoned(packetByteCount)
+	self.addSendAbandoned(packetByteCount, sendBucketSerial)
 }
 
 // Every joined chunk must carry the explicit pre-serialization proof. An
@@ -20989,8 +20999,8 @@ func blackholeReasonFromStats(
 			return verdict(blackholeNoSendAck, false)
 		}
 	}
-	if !windowStats.firstSendNackTime.IsZero() {
-		receiveNackAge := now.Sub(receiveClockStart(windowStats.firstSendNackTime))
+	if since := receiveAckOfferSince(windowStats); !since.IsZero() {
+		receiveNackAge := now.Sub(receiveClockStart(since))
 		if 0 < receiveTimeout && receiveTimeout <= receiveNackAge && windowStats.receiveAckCount <= 0 &&
 			// This is the ACKing-provider/no-destination-response branch.
 			// Without a true peer ACK it must not become an earlier substitute
@@ -21581,8 +21591,11 @@ func (self *multiClientChannel) detectBlackhole() {
 						// dsts is the corroborating count read by the
 						// no-receive-ACK verdict.
 						nackSince := windowStats.firstSendNackTime
-						if reason == blackholeNoSendAck {
+						switch reason {
+						case blackholeNoSendAck:
 							nackSince = unacknowledgedSendSince(windowStats)
+						case blackholeNoReceiveAck:
+							nackSince = receiveAckOfferSince(windowStats)
 						}
 						self.addError(fmt.Errorf(
 							"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s dsts=%d)",
@@ -21849,7 +21862,7 @@ func (self *multiClientChannel) ping() {
 // addSend records the per-packet send stats (nack, optional syn, and source)
 // in a single locked section, so the hot send path takes the channel lock and
 // resolves the event bucket once per packet instead of two-three times.
-func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath, receiveOffers ...*receiveAckOffer) *connectSynOffer {
+func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPath, receiveOffers ...*receiveAckOffer) (*connectSynOffer, uint64) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -21884,10 +21897,12 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 	}
 
 	self.addSourceToEventBucketWithLock(eventBucket, ipPath)
+	var receiveOffer *receiveAckOffer
 	if len(receiveOffers) != 0 {
-		eventBucket.prepareReceiveAckOfferWithLock(ipPath, receiveOffers[0])
+		receiveOffer = receiveOffers[0]
 	}
-	return synOffer
+	eventBucket.prepareReceiveAckOfferWithLock(ipPath, receiveOffer, terminalReceiveAckReset(ipPath))
+	return synOffer, self.eventBucketSerial
 }
 
 // Records one offered group in the existing channel-lock section while
@@ -21916,8 +21931,15 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	eventBucket.sendNackByteCount += sendPacketGroup.byteCount
 
 	synCount := 0
+	resetOnly := 0 < packetCount
 	for packetIndex := range sendPacketGroup.packets {
-		if sendPacketGroup.packets[packetIndex].ipPath.Syn {
+		path := sendPacketGroup.packets[packetIndex].ipPath
+		if path.Rst && terminalReceiveAckReset(path) {
+			eventBucket.terminalResetOffered = true
+		} else {
+			resetOnly = false
+		}
+		if path.Syn {
 			synCount += 1
 		}
 	}
@@ -21934,7 +21956,7 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	// Only the caller owns a descriptor reused after a public refusal.
 	sendPacketGroup.receiveAckOffer = receiveAckOffer{}
 	if packetCount != 0 {
-		eventBucket.prepareReceiveAckOfferWithLock(sendPacketGroup.ipPath, &sendPacketGroup.receiveAckOffer)
+		eventBucket.prepareReceiveAckOfferWithLock(sendPacketGroup.ipPath, &sendPacketGroup.receiveAckOffer, resetOnly)
 	}
 	return synOffer
 }
@@ -21957,22 +21979,14 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 // pendingSendTime is a lie waiting for a reader that forgets to check the
 // count first.
 //
-// The bucket undo cannot always be exact. addSend recorded into whichever
-// bucket was current at send time, and by the time the transport reports the
-// refusal that bucket may have rotated out or been coalesced away; holding a
-// reference to it across the transport call would keep dead buckets alive
-// for a case that should be rare. The choice: decrement the newest existing
-// bucket, clamped at zero. Under rotation this can under-count a younger
-// bucket's real nacks by at most the abandoned send, which errs toward "the
-// exit is fine" -- the honest direction for an undo whose purpose is to stop
-// manufacturing guilt. No new bucket is created and eventTime is not
-// advanced: a retraction is not activity, and extending the bucket's life or
-// the stats window on it would fabricate both.
+// The original bucket's serial locates it in the retained suffix without
+// keeping any bucket maps alive. If it already aged out, only the aggregate
+// needs undoing. A retraction leaves event time alone.
 //
 // Windowed SYN counters remain attempted-packet telemetry. The separate
 // offer owner retracts lifetime connect evidence exactly, without borrowing
 // another SYN's bucket or discarding an independently admitted attempt.
-func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
+func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount, sendBucketSerial uint64) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -21983,8 +21997,8 @@ func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
 		self.pendingSendGeneration++
 	}
 
-	if n := len(self.eventBuckets); 0 < n {
-		eventBucket := self.eventBuckets[n-1]
+	if offset := self.eventBucketSerial - sendBucketSerial; offset < uint64(len(self.eventBuckets)) {
+		eventBucket := self.eventBuckets[len(self.eventBuckets)-1-int(offset)]
 		if 0 < eventBucket.sendNackCount {
 			eventBucket.sendNackCount -= 1
 		}
@@ -22280,6 +22294,7 @@ func (self *multiClientChannel) eventBucket() *multiClientEventBucket {
 	if eventBucket == nil || eventBucket.createTime.Add(self.settings.StatsWindowBucketDuration).Before(now) {
 		eventBucket = newMultiClientEventBucket()
 		self.eventBuckets = append(self.eventBuckets, eventBucket)
+		self.eventBucketSerial++
 	}
 
 	eventBucket.eventTime = now
@@ -22404,10 +22419,16 @@ func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWind
 			break
 		}
 	}
-	var firstSendNackTime time.Time
+	var firstSendNackTime, firstReceiveAckOfferTime time.Time
 	for _, eventBucket := range eventBuckets {
-		if 0 < eventBucket.sendNackCount {
+		if eventBucket.sendNackCount <= 0 {
+			continue
+		}
+		if firstSendNackTime.IsZero() {
 			firstSendNackTime = eventBucket.sendNackTime
+		}
+		if since := eventBucket.receiveAckOfferSinceWithLock(); !since.IsZero() {
+			firstReceiveAckOfferTime = since
 			break
 		}
 	}
@@ -22504,6 +22525,7 @@ func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWind
 		windowDuration:             windowDuration,
 		firstSendAckTime:           firstSendAckTime,
 		firstSendNackTime:          firstSendNackTime,
+		firstReceiveAckOfferTime:   firstReceiveAckOfferTime,
 		pendingSendTime:            self.pendingSendTime,
 		sendProgressKnown:          true,
 		peerSendAckInWindow:        !self.lastSendAckTime.IsZero() && time.Since(self.lastSendAckTime) <= self.settings.StatsWindowDuration,

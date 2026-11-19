@@ -196,8 +196,8 @@ func TestPacketTransferLocalRefusalPreservesStructuralFailures(t *testing.T) {
 						channel.addSendGroup(group)
 						channel.observePacketGroupTransferCompletion(group, ack, row.err)
 					} else {
-						channel.addSend(1000, udpTestPath(4))
-						channel.observePacketTransferCompletion(1000, time.Time{}, ack, row.err)
+						_, bucketSerial := channel.addSend(1000, udpTestPath(4))
+						channel.observePacketTransferCompletion(1000, bucketSerial, time.Time{}, ack, row.err)
 					}
 					_, err := channel.WindowStats()
 					if wantFailure := ack || !row.local; (err != nil) != wantFailure {

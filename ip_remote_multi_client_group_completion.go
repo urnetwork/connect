@@ -816,7 +816,19 @@ func (self *parsedPacketGroup) publishCollapseWithLock() {
 // An unfunded first chunk disposes the raw group before its source waits.
 func (self *parsedPacketGroup) sendGroupDisposition(start, end int, materialized bool) {
 	if materialized && self.receiveAckOffer.use != nil && self.completionFlags.Load()&groupCompletionAck != 0 {
-		self.receiveAckOffer.dispatched.Store(true)
+		disposition := receiveAckSourceDispatched
+		offer := &self.receiveAckOffer
+		if offer.clockOffset != 0 && offer.disposition.Load()&receiveAckClockSecured == 0 {
+			// A retained reset-only prefix cannot supply the clock for a
+			// response-bearing suffix that the source later disposes.
+			for index := start; index < end; index++ {
+				if !terminalReceiveAckReset(self.packets[index].ipPath) {
+					disposition |= receiveAckClockSecured
+					break
+				}
+			}
+		}
+		offer.observeDisposition(disposition)
 	}
 	if offer := self.connectSynOffer; offer != nil && materialized {
 		// The group callback joins only errors. A later unwritten chunk
