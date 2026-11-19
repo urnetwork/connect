@@ -1300,7 +1300,10 @@ which decodes it over the defaults. Every other constructor keeps both on.
 The role's state is re-read after each hand-over to the provider until it
 stands, so a change racing another is never undone by the older one.
 
-G2. Lifecycle in `deviceLocalProvider`. When provide is on and the setting
+G2. Lifecycle in `deviceLocalProvider`. A device whose space's egress is a
+proxy never runs the role: it binds and forwards on this host, outside the
+proxy every other egress of the space takes (owner, 2026-11-18; the note on a
+space's egress). When provide is on and the setting
 is on: load or create the identity key, which belongs to the network space:
 local state's `.extender_key` when the space has storage, otherwise the
 seed an embedder passes through `DeviceLocalKeyMaterial`, otherwise one
