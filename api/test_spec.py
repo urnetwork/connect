@@ -222,6 +222,18 @@ class SpecTest(unittest.TestCase):
         self.assertIn("failed to answer", responses["502"]["description"])
         self.assertIn("404", self.spec["paths"]["/sn/ledger/object"]["get"]["responses"])
 
+    def test_auth_verify_takes_an_optional_bearer(self):
+        # server model.AuthVerify: a signed-in caller verifying a sign-in
+        # method of its own network renews its own session when it sends its
+        # network token, so the generated clients must send it when they
+        # have one; any other caller is served signed out
+        verify = self.spec["paths"]["/auth/verify"]["post"]
+        self.assertEqual([{}, {"BearerAuth": []}], verify["security"])
+        description = " ".join(verify["description"].split())
+        self.assertIn("renews the caller's own session", description)
+        self.assertIn("leaves the code unused", description)
+        self.assertIn("never refused here", description)
+
     def test_local_references_resolve(self):
         def visit(value):
             if isinstance(value, dict):
