@@ -2788,7 +2788,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:
@@ -3911,7 +3911,7 @@ func (self *PlatformTransport) runH3(
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:
