@@ -16,7 +16,7 @@ rejected, how often a false claim is caught, how long runs take, and where to se
   - small country, center: 2.36%, 1.86%, 1.79% at 95%; 0.71%, 0.50%, 0.71% at 99%.
   - large country, 100 km in: 0.64%, 0.64%, 0.50% at 95%; 0.21%, 0.29%, 0.14% at 99%.
   - real country: 0.46%, 0.29%, 0.29% at 95%; 0.12%, 0.086%, 0.12% at 99%.
-- **Calibration:** the 99% region at V11's k for the address's continent misses the truth in 0.75% (0.55–1.02) of single runs (nominal 1%), most in South America at 1.18%. A country's false-reject rate is at most its region's miss rate, which the tiny country reaches.
+- **Calibration:** the 99% region at V11's k for the address's continent misses the truth in 0.79% (0.59–1.06) of single runs (nominal 1%), most in Asia at 1.13%. A country's false-reject rate is at most its region's miss rate, which the tiny country reaches.
 - **Power** at 99% after 1, 2 and 3 runs, all regions: claim 300 km: 7.17%, 18.9%, 29.0%; claim 1,000 km: 57.1%, 72.8%, 78.0%; claim 3,000 km: 68.9%, 84.6%, 89.3%; real claim 300 km: 11.8%, 28.0%, 40.6%; real claim 1,000 km: 52.1%, 70.8%, 77.2%; real claim 3,000 km: 62.8%, 83.6%, 87.0%; by region in the tables.
 - **Stop times** of honest visitors' first runs at 99%: median 7.50 s, p90 8.75 s, p99 12.00 s; 1.13% at the 12 s cap.
 - **Stop times** of claims' first runs at 99%: median 5.50 s, p90 8.00 s, p99 11.00 s; 0.60% at the 12 s cap.
@@ -89,9 +89,10 @@ Singapore, Hong Kong). A visitor is within 15 km of their city's point, which is
   run with 6 such (an interrupted run only if converged or clear held when the silence began, V10), pools the last 3
   counting runs (V7), and judges at the k for the run's confidence and the address's continent (V11): at 95% AF 2.50, OC 2.79, others 2.448; at
   99% NA 3.25, SA 3.50, AF 3.95, OC 7.88, AS 3.35, AN 3.49, unknown 3.49, others 3.035; k_early KEarly(k) = max(4, 1.3180 × k). The parts that diagnose the textbook region judge at its k
-  (2.448, 3.035 and 3.717 at 95%, 99% and 99.9%, which V11 refuses) with k_early 4. Inconclusive for a σ_major
-  above 1500 km or a region that touches the country while the physical check fails, else agree when the region
-  touches the country, else disagree (V6).
+  (2.448, 3.035 and 3.717 at 95%, 99% and 99.9%, which V11 refuses) with k_early 4. Inconclusive for a region
+  that touches the country while the physical check fails, else agree when the region touches the country, however
+  wide; a region wholly outside is inconclusive (low_precision) for a σ_major above 1500 km, which bounds rejection
+  only, else disagree; no fit at all is low_precision (V6).
 
 **Parts.** Every part runs the contract as it stands unless it says otherwise: E2's choice, V10's cadence and stops on
 the usable extenders, the interrupted rule, V11's k with KEarly(k), and far sessions opening late. The main part
@@ -135,27 +136,27 @@ With no clear stop at all, every honest cell is within 1 − confidence.
 
 **κ** (one run, 99% at V11's k for the address's continent, k_early KEarly(k)):
 
-- κ 0.15 in the world, 0.15 in the model, one run: the region misses 0.78%, false rejects 0.67% (tiny) and 0.43% (large country's edge), power 19.2% at 300 km and 80.9% at 1,000 km.
-- κ 0.15 in the world, 0.25 in the model, one run: the region misses 0.50%, false rejects 0.38% (tiny) and 0.14% (large country's edge), power 5.06% at 300 km and 57.6% at 1,000 km.
-- κ 0.25 in the world, 0.15 in the model, one run: the region misses 1.99%, false rejects 1.52% (tiny) and 0.14% (large country's edge), power 14.8% at 300 km and 69.8% at 1,000 km.
-- κ 0.25 in the world, 0.25 in the model, one run: the region misses 0.91%, false rejects 0.76% (tiny) and 0% (large country's edge), power 4.40% at 300 km and 55.0% at 1,000 km.
-- κ 0.25 in the world, 0.35 in the model, one run: the region misses 0.31%, false rejects 0.29% (tiny) and 0% (large country's edge), power 1.63% at 300 km and 39.2% at 1,000 km.
-- κ 0.35 in the world, 0.25 in the model, one run: the region misses 0.51%, false rejects 0.19% (tiny) and 0.14% (large country's edge), power 6.04% at 300 km and 52.6% at 1,000 km.
-- κ 0.35 in the world, 0.35 in the model, one run: the region misses 0.21%, false rejects 0.095% (tiny) and 0% (large country's edge), power 1.79% at 300 km and 38.3% at 1,000 km.
+- κ 0.15 in the world, 0.15 in the model, one run: the region misses 0.77%, false rejects 0.67% (tiny) and 0.43% (large country's edge), power 19.2% at 300 km and 80.9% at 1,000 km.
+- κ 0.15 in the world, 0.25 in the model, one run: the region misses 0.48%, false rejects 0.38% (tiny) and 0.14% (large country's edge), power 5.06% at 300 km and 57.6% at 1,000 km.
+- κ 0.25 in the world, 0.15 in the model, one run: the region misses 1.91%, false rejects 1.52% (tiny) and 0.14% (large country's edge), power 14.8% at 300 km and 69.8% at 1,000 km.
+- κ 0.25 in the world, 0.25 in the model, one run: the region misses 0.86%, false rejects 0.76% (tiny) and 0% (large country's edge), power 4.40% at 300 km and 55.0% at 1,000 km.
+- κ 0.25 in the world, 0.35 in the model, one run: the region misses 0.29%, false rejects 0.29% (tiny) and 0% (large country's edge), power 1.63% at 300 km and 39.2% at 1,000 km.
+- κ 0.35 in the world, 0.25 in the model, one run: the region misses 0.48%, false rejects 0.19% (tiny) and 0.14% (large country's edge), power 6.04% at 300 km and 52.6% at 1,000 km.
+- κ 0.35 in the world, 0.35 in the model, one run: the region misses 0.19%, false rejects 0.095% (tiny) and 0% (large country's edge), power 1.79% at 300 km and 38.3% at 1,000 km.
 
 **Oceania** (one run, 99% at the textbook k, k_early 4; V11's 99% k for Oceania is 7.88), each line taking one source of error away or trying one remedy:
 
-- base (the study's world): the region misses 3.10% (2.12–4.50); false rejects 0.75% in real countries, 2.00% in the tiny one; power 2.29% at 300 km and 62.0% at 1,000 km.
-- normal stretch (the route stretch normal and unfloored: no long tail of detours): the region misses 3.76% (2.66–5.29); false rejects 0.75% in real countries, 2.42% in the tiny one; power 2.29% at 300 km and 65.0% at 1,000 km.
-- no long-path error (no route error on paths of 2,500 km or more): the region misses 2.88% (1.97–4.19); false rejects 0.50% in real countries, 1.67% in the tiny one; power 4.00% at 300 km and 68.0% at 1,000 km.
-- no short-path error (no route error on paths under 2,500 km): the region misses 4.02% (2.89–5.57); false rejects 1.00% in real countries, 2.58% in the tiny one; power 2.29% at 300 km and 59.0% at 1,000 km.
-- no place error (every extender exactly at its place): the region misses 3.58% (2.52–5.06); false rejects 0.75% in real countries, 2.33% in the tiny one; power 2.29% at 300 km and 66.0% at 1,000 km.
-- ideal pings (no queue, jitter, spike or loss): the region misses 3.19% (2.20–4.60); false rejects 0.75% in real countries, 2.00% in the tiny one; power 1.71% at 300 km and 65.0% at 1,000 km.
-- denser fleet (9 more extenders: Adelaide, Canberra, Hobart, Darwin, Wellington, Christchurch, Port Moresby, Suva, Nouméa): the region misses 0.35% (0.14–0.90); false rejects 0% in real countries, 0.25% in the tiny one; power 20.6% at 300 km and 96.0% at 1,000 km.
-- model κ 0.30 (the model's κ 0.30 for Oceania (a κ calibrated per continent, V4)): the region misses 1.53% (0.88–2.66); false rejects 0.75% in real countries, 0.92% in the tiny one; power 0.57% at 300 km and 46.0% at 1,000 km.
-- model κ 0.35 (the model's κ 0.35 for Oceania): the region misses 1.38% (0.75–2.52); false rejects 0.75% in real countries, 0.83% in the tiny one; power 0.57% at 300 km and 43.0% at 1,000 km.
-- model κ 0.45 (the model's κ 0.45 for Oceania): the region misses 1.48% (0.78–2.78); false rejects 0.75% in real countries, 0.67% in the tiny one; power 0% at 300 km and 29.0% at 1,000 km.
-- s_ext by distance (each extender's place error at least 5% of its distance from the address's place, within lagdrift's [10, 100] km hold): the region misses 3.11% (2.13–4.52); false rejects 0.75% in real countries, 2.00% in the tiny one; power 1.71% at 300 km and 62.0% at 1,000 km.
+- base (the study's world): the region misses 3.27% (2.40–4.44); false rejects 0.75% in real countries, 2.00% in the tiny one; power 2.29% at 300 km and 62.0% at 1,000 km.
+- normal stretch (the route stretch normal and unfloored: no long tail of detours): the region misses 3.86% (2.91–5.11); false rejects 0.75% in real countries, 2.42% in the tiny one; power 2.29% at 300 km and 65.0% at 1,000 km.
+- no long-path error (no route error on paths of 2,500 km or more): the region misses 2.60% (1.84–3.67); false rejects 0.50% in real countries, 1.67% in the tiny one; power 4.00% at 300 km and 68.0% at 1,000 km.
+- no short-path error (no route error on paths under 2,500 km): the region misses 3.69% (2.76–4.92); false rejects 1.00% in real countries, 2.58% in the tiny one; power 2.29% at 300 km and 59.0% at 1,000 km.
+- no place error (every extender exactly at its place): the region misses 3.36% (2.47–4.54); false rejects 0.75% in real countries, 2.33% in the tiny one; power 2.29% at 300 km and 66.0% at 1,000 km.
+- ideal pings (no queue, jitter, spike or loss): the region misses 3.35% (2.47–4.53); false rejects 0.75% in real countries, 2.00% in the tiny one; power 1.71% at 300 km and 65.0% at 1,000 km.
+- denser fleet (9 more extenders: Adelaide, Canberra, Hobart, Darwin, Wellington, Christchurch, Port Moresby, Suva, Nouméa): the region misses 0.33% (0.13–0.86); false rejects 0% in real countries, 0.25% in the tiny one; power 20.6% at 300 km and 96.0% at 1,000 km.
+- model κ 0.30 (the model's κ 0.30 for Oceania (a κ calibrated per continent, V4)): the region misses 1.59% (1.02–2.48); false rejects 0.75% in real countries, 0.92% in the tiny one; power 0.57% at 300 km and 46.0% at 1,000 km.
+- model κ 0.35 (the model's κ 0.35 for Oceania): the region misses 1.26% (0.76–2.07); false rejects 0.75% in real countries, 0.83% in the tiny one; power 0.57% at 300 km and 43.0% at 1,000 km.
+- model κ 0.45 (the model's κ 0.45 for Oceania): the region misses 1.17% (0.70–1.96); false rejects 0.75% in real countries, 0.67% in the tiny one; power 0% at 300 km and 29.0% at 1,000 km.
+- s_ext by distance (each extender's place error at least 5% of its distance from the address's place, within lagdrift's [10, 100] km hold): the region misses 3.27% (2.40–4.44); false rejects 0.75% in real countries, 2.00% in the tiny one; power 1.71% at 300 km and 62.0% at 1,000 km.
 
 **V10's other constants** (one run, 99% at V11's k for the address's continent, k_early KEarly(k)):
 
@@ -188,27 +189,27 @@ With no clear stop at all, every honest cell is within 1 − confidence.
 
 **The interrupted stop** (one run, 99% at V11's k for the address's continent, k_early KEarly(k)):
 
-- counted: the silent client is agreed with in 80.0% of 300 km claims and 41.7% of 1,000 km ones; an honest client's runs that don't count: 0.27%.
+- counted: the silent client is agreed with in 97.4% of 300 km claims and 58.9% of 1,000 km ones; an honest client's runs that don't count: 0.27%.
 - review's rule: the silent client is agreed with in 0.16% of 300 km claims and 0.31% of 1,000 km ones; an honest client's runs that don't count: 0.37%.
 
 **Where the region's misses come from** (tiny country, one run; nominal 5%, 1% and 0.1%, k 2.448, 3.035 and 3.717):
 
-- base (the study's world): the region misses 3.04%, 2.05% and 1.10% at 95%, 99% and 99.9%; the k that would hold each is 2.04, 4.02 and 9.41.
-- ideal pings (no queue, jitter, spike or loss): the region misses 3.04%, 1.94% and 1.10% at 95%, 99% and 99.9%; the k that would hold each is 2.05, 3.84 and 9.52.
-- no place error (every extender exactly at its place): the region misses 3.14%, 2.04% and 1.05% at 95%, 99% and 99.9%; the k that would hold each is 2.02, 3.73 and 10.76.
-- normal stretch (the route stretch normal and unfloored): the region misses 6.35%, 3.00% and 1.45% at 95%, 99% and 99.9%; the k that would hold each is 2.62, 4.26 and 10.36.
-- model's world (all three: the route stretch normal, no place error, ideal pings): the region misses 5.95%, 2.95% and 1.50% at 95%, 99% and 99.9%; the k that would hold each is 2.61, 4.08 and 10.28.
+- base (the study's world): the region misses 3.20%, 2.05% and 1.05% at 95%, 99% and 99.9%; the k that would hold each is 2.07, 4.02 and 9.41.
+- ideal pings (no queue, jitter, spike or loss): the region misses 3.20%, 1.91% and 1.05% at 95%, 99% and 99.9%; the k that would hold each is 2.10, 3.84 and 9.52.
+- no place error (every extender exactly at its place): the region misses 3.30%, 2.10% and 1.00% at 95%, 99% and 99.9%; the k that would hold each is 2.06, 3.73 and 10.76.
+- normal stretch (the route stretch normal and unfloored): the region misses 6.50%, 3.20% and 1.53% at 95%, 99% and 99.9%; the k that would hold each is 2.63, 4.35 and 8.85.
+- model's world (all three: the route stretch normal, no place error, ideal pings): the region misses 6.06%, 3.01% and 1.53% at 95%, 99% and 99.9%; the k that would hold each is 2.63, 4.14 and 10.28.
 
 **The verdict's starts** (one run): lagdrift's against the lowest χ² of a wider grid of starts:
 
 - lagdrift: false rejects 1.62% (tiny) and 0.48% (real countries) at 99%; VPN pairs rejected 26.8%.
 - wide: false rejects 1.52% (tiny) and 0.48% (real countries) at 99%; VPN pairs rejected 26.4%.
 
-**The fit** (the checks table): 0% of 114,217 warm refits of a verdict's fit moved it 1 km or more, and 163 of 17,257 grids of starts found a fixed point with a χ² lower by more than 1. Of those, 31 lie nearer the truth than the fit. One at a time, by CPU time: the frame's full fit, one run, p50 0.40 ms and p95 1.21 ms; the frame's full fit, pooled runs, p50 1.05 ms and p95 3.00 ms; the server's fit, one run, p50 0.42 ms and p95 1.08 ms; the server's fit, pooled runs, p50 1.16 ms and p95 3.00 ms; the frame's warm refit, one run, p50 0.03 ms and p95 0.14 ms; the frame's warm refit, pooled runs, p50 0.09 ms and p95 0.39 ms; against V10's budget of a warm refit at p95 ≤ 1 ms and a full fit at p95 ≤ 10 ms.
+**The fit** (the checks table): 0.003% of 122,433 warm refits of a verdict's fit moved it 1 km or more, and 173 of 19,226 grids of starts found a fixed point with a χ² lower by more than 1. Of those, 36 lie nearer the truth than the fit. One at a time, by CPU time: the frame's full fit, one run, p50 0.38 ms and p95 1.10 ms; the frame's full fit, pooled runs, p50 1.06 ms and p95 3.18 ms; the server's fit, one run, p50 0.42 ms and p95 1.06 ms; the server's fit, pooled runs, p50 1.19 ms and p95 2.95 ms; the frame's warm refit, one run, p50 0.03 ms and p95 0.14 ms; the frame's warm refit, pooled runs, p50 0.10 ms and p95 0.40 ms; against V10's budget of a warm refit at p95 ≤ 1 ms and a full fit at p95 ≤ 10 ms.
 
 ## Tables
 
-Generated 2026-11-18 in 53m3s: seed 1, scale 1, go1.27.4, borders ne-admin0-10m-v5.1.2-claims3, lagdrift's EarlyK 4.
+Generated 2026-11-20 in 1h9m58s: seed 1, scale 1, go1.27.4, borders ne-admin0-10m-v5.1.2-claims3, lagdrift's EarlyK 4.
 
 ### Parts
 
@@ -294,26 +295,26 @@ The fleet around each region's visitors, and the single-run fits of the tiny-cou
 | Region | Cities | Extenders within 1,000 km | 4th nearest extender, km | σ_major, 1 run, km | b held at 0 |
 |---|--:|--:|--:|--:|--:|
 | Europe | 43 | 52 | 251 | 149 | 0.88% |
-| North America | 29 | 10 | 352 | 208 | 4.12% |
+| North America | 29 | 10 | 352 | 209 | 4.12% |
 | Eastern Europe, Middle East | 17 | 7 | 689 | 202 | 1.50% |
 | Asia | 20 | 3 | 1149 | 375 | 5.75% |
-| South America | 15 | 1 | 1968 | 466 | 6.12% |
-| Africa | 18 | 1 | 3457 | 559 | 8.00% |
-| Oceania | 8 | 1 | 2289 | 561 | 19.9% |
+| South America | 15 | 1 | 1968 | 479 | 6.12% |
+| Africa | 18 | 1 | 3457 | 561 | 8.00% |
+| Oceania | 8 | 1 | 2289 | 832 | 19.9% |
 
 How often the region at each confidence, at V11's k for the address's continent, k_early KEarly(k), misses the truth, for tiny-country visitors (V6's coverage, the false-reject rate's ceiling for any country). Nominal: 5% and 1%.
 
 | Region | 1 run: 95% | 99% | 3 runs: 95% | 99% |
 |---|--:|--:|--:|--:|
 | Europe | 0.63% | 0.50% | 1.12% | 0.12% |
-| North America | 1.63% | 0.63% | 2.12% | 0.88% |
+| North America | 1.62% | 0.62% | 2.12% | 0.88% |
 | Eastern Europe, Middle East | 1.01% | 0.25% | 1.62% | 0.62% |
 | Asia | 1.76% | 1.01% | 2.75% | 0.50% |
-| South America | 2.23% | 0.92% | 2.77% | 0.76% |
-| Africa | 5.16% | 0.38% | 5.00% | 1.50% |
-| Oceania | 4.57% | 0.53% | 5.14% | 0.48% |
-| All | 2.34% (1.96–2.78) | 0.60% (0.43–0.85) | 2.86% (2.45–3.34) | 0.70% (0.51–0.96) |
-| k that would hold it, every region (V11's is per continent) | 1.96 | 3.27 | 2.13 | 3.54 |
+| South America | 2.13% | 0.88% | 2.75% | 0.75% |
+| Africa | 5.14% | 0.38% | 5.00% | 1.50% |
+| Oceania | 5.15% | 0.75% | 5.25% | 0.50% |
+| All | 2.49% (2.11–2.93) | 0.63% (0.45–0.87) | 2.95% (2.53–3.42) | 0.70% (0.51–0.95) |
+| k that would hold it, every region (V11's is per continent) | 2.00 | 3.42 | 2.15 | 3.53 |
 
 ### The k the region needs: lagdrift
 
@@ -322,25 +323,25 @@ The empirical k per region, from honest visitors' single runs: the quantile of t
 | Region | Fits | k at 95% | 99% | 99.9% |
 |---|--:|--:|--:|--:|
 | Europe | 2085 | 1.73 | 2.43 | 4.05 |
-| North America | 2074 | 1.80 | 2.94 | 4.01 |
-| Eastern Europe, Middle East | 2090 | 1.84 | 2.81 | 6.27 |
-| Asia | 2091 | 1.83 | 3.14 | 5.26 |
-| South America | 2013 | 2.07 | 3.23 | 5.13 |
-| Africa | 2088 | 2.50 | 3.75 | 5.53 |
-| Oceania | 1483 | 2.87 | 8.08 | 15.26 |
-| All | 13,924 | 1.99 | 3.46 | 9.39 |
+| North America | 2080 | 1.79 | 2.94 | 4.01 |
+| Eastern Europe, Middle East | 2094 | 1.84 | 2.81 | 6.27 |
+| Asia | 2093 | 1.83 | 3.14 | 5.26 |
+| South America | 2095 | 2.05 | 3.23 | 5.13 |
+| Africa | 2096 | 2.50 | 3.75 | 5.53 |
+| Oceania | 2090 | 2.87 | 7.56 | 15.26 |
+| All | 14,633 | 2.03 | 3.49 | 9.98 |
 
 V4 estimating k from tracks (honest single runs): measured from the truth, from a city point off it by about 30 km (a normal error of 24 km per axis), and from the city point with its variance added to the fit's covariance, which takes the city's error back out. Then how far the quantiles of a sample of tracks spread, over 300 samples.
 
 | Measured from | Tracks | k at 99%: estimate | 5–95% of estimates | k at 99.9%: estimate | 5–95% of estimates |
 |---|--:|--:|--:|--:|--:|
-| the truth | 13,924 | 3.46 |  | 9.39 |  |
-| the city point | 13,924 | 3.47 |  | 9.33 |  |
-| the city point, its variance added | 13,924 | 3.44 |  | 9.21 |  |
-| the city point, its variance added: a sample of | 1000 | 3.38 | 2.92–3.95 | 6.24 | 4.25–13.65 |
-| the city point, its variance added: a sample of | 3000 | 3.43 | 3.17–3.72 | 7.85 | 5.34–12.41 |
-| the city point, its variance added: a sample of | 10,000 | 3.44 | 3.24–3.55 | 8.00 | 6.30–11.30 |
-| the city point, its variance added: a sample of | 30,000 | 3.44 | 3.34–3.47 | 9.14 | 7.52–10.36 |
+| the truth | 14,633 | 3.49 |  | 9.98 |  |
+| the city point | 14,633 | 3.48 |  | 9.90 |  |
+| the city point, its variance added | 14,633 | 3.45 |  | 9.66 |  |
+| the city point, its variance added: a sample of | 1000 | 3.44 | 2.98–4.05 | 7.29 | 4.34–14.90 |
+| the city point, its variance added: a sample of | 3000 | 3.44 | 3.20–3.73 | 8.37 | 5.34–13.02 |
+| the city point, its variance added: a sample of | 10,000 | 3.45 | 3.32–3.56 | 9.21 | 7.08–11.89 |
+| the city point, its variance added: a sample of | 30,000 | 3.45 | 3.35–3.52 | 9.66 | 7.85–11.30 |
 
 ### False rejects: lagdrift
 
@@ -348,24 +349,24 @@ Honest visitors rejected (disagree), after 1, 2 and 3 pooled runs, V10 at V11's 
 
 | Scenario | Runs | 95% (limit 5%) | 99% (limit 1%) | Inconclusive at 99% |
 |---|--:|--:|--:|--:|
-| tiny country, 20 km | 1 | 2.05% (1.71–2.46) | 0.52% (0.36–0.74) | 5.20% |
-| tiny country, 20 km | 2 | 2.07% (1.73–2.48) | 0.48% (0.33–0.70) | 3.48% |
-| tiny country, 20 km | 3 | 2.32% (1.96–2.75) | 0.64% (0.46–0.89) | 3.30% |
-| small country, 5 km in | 1 | 1.57% (1.04–2.37) | 0.21% (0.073–0.63) | 5.14% |
-| small country, 5 km in | 2 | 1.00% (0.60–1.67) | 0.29% (0.11–0.73) | 3.93% |
-| small country, 5 km in | 3 | 1.36% (0.87–2.11) | 0.36% (0.15–0.83) | 3.71% |
-| large country, 5 km in | 1 | 0.71% (0.39–1.31) | 0.43% (0.20–0.93) | 4.43% |
-| large country, 5 km in | 2 | 0.93% (0.54–1.58) | 0.29% (0.11–0.73) | 3.71% |
-| large country, 5 km in | 3 | 1.00% (0.60–1.67) | 0.071% (0.013–0.40) | 3.43% |
-| small country, center | 1 | 2.07% (1.45–2.96) | 0.64% (0.34–1.22) | 4.36% |
-| small country, center | 2 | 1.64% (1.10–2.45) | 0.50% (0.24–1.03) | 3.14% |
-| small country, center | 3 | 1.43% (0.93–2.20) | 0.57% (0.29–1.12) | 2.86% |
-| large country, 100 km in | 1 | 0.64% (0.34–1.22) | 0.29% (0.11–0.73) | 5.43% |
-| large country, 100 km in | 2 | 0.64% (0.34–1.22) | 0.14% (0.039–0.52) | 3.71% |
-| large country, 100 km in | 3 | 0.43% (0.20–0.93) | 0.14% (0.039–0.52) | 3.71% |
-| real country | 1 | 0.35% (0.20–0.60) | 0.029% (0.005–0.16) | 5.36% |
-| real country | 2 | 0.26% (0.14–0.49) | 0.086% (0.029–0.25) | 3.69% |
-| real country | 3 | 0.17% (0.079–0.38) | 0.029% (0.005–0.16) | 3.40% |
+| tiny country, 20 km | 1 | 2.05% (1.71–2.46) | 0.52% (0.36–0.74) | 0.41% |
+| tiny country, 20 km | 2 | 2.07% (1.73–2.48) | 0.48% (0.33–0.70) | 0.036% |
+| tiny country, 20 km | 3 | 2.32% (1.96–2.75) | 0.64% (0.46–0.89) | 0.018% |
+| small country, 5 km in | 1 | 1.57% (1.04–2.37) | 0.21% (0.073–0.63) | 0.14% |
+| small country, 5 km in | 2 | 1.00% (0.60–1.67) | 0.29% (0.11–0.73) | 0% |
+| small country, 5 km in | 3 | 1.36% (0.87–2.11) | 0.36% (0.15–0.83) | 0% |
+| large country, 5 km in | 1 | 0.71% (0.39–1.31) | 0.43% (0.20–0.93) | 0.071% |
+| large country, 5 km in | 2 | 0.93% (0.54–1.58) | 0.29% (0.11–0.73) | 0% |
+| large country, 5 km in | 3 | 1.00% (0.60–1.67) | 0.071% (0.013–0.40) | 0% |
+| small country, center | 1 | 2.07% (1.45–2.96) | 0.64% (0.34–1.22) | 0.29% |
+| small country, center | 2 | 1.64% (1.10–2.45) | 0.50% (0.24–1.03) | 0.071% |
+| small country, center | 3 | 1.43% (0.93–2.20) | 0.57% (0.29–1.12) | 0% |
+| large country, 100 km in | 1 | 0.64% (0.34–1.22) | 0.29% (0.11–0.73) | 0.21% |
+| large country, 100 km in | 2 | 0.64% (0.34–1.22) | 0.14% (0.039–0.52) | 0% |
+| large country, 100 km in | 3 | 0.43% (0.20–0.93) | 0.14% (0.039–0.52) | 0% |
+| real country | 1 | 0.35% (0.20–0.60) | 0.029% (0.005–0.16) | 0.26% |
+| real country | 2 | 0.26% (0.14–0.49) | 0.086% (0.029–0.25) | 0% |
+| real country | 3 | 0.17% (0.079–0.38) | 0.029% (0.005–0.16) | 0% |
 
 The tiny country per region:
 
@@ -415,28 +416,28 @@ Claims rejected (disagree) at 99%, after 1, 2 and 3 pooled runs, V10 at V11's k 
 |---|--:|--:|--:|--:|--:|--:|
 | Europe | 300 km | 13.3% | 34.7% | 58.7% | 0.67% | 300 |
 | Europe | 1000 km | 80.7% | 96.7% | 98.7% | 0% | 1000 |
-| Europe | 3000 km | 64.7% | 73.3% | 88.7% | 26.7% | 3000 |
-| North America | 300 km | 6.00% | 30.7% | 52.0% | 2.67% | 300 |
-| North America | 1000 km | 62.9% | 81.4% | 88.6% | 3.57% | 1000 |
-| North America | 3000 km | 73.3% | 91.3% | 96.0% | 22.0% | 3000 |
-| Eastern Europe, Middle East | 300 km | 10.0% | 36.7% | 50.0% | 0.67% | 300 |
+| Europe | 3000 km | 64.7% | 73.3% | 88.7% | 3.33% | 3000 |
+| North America | 300 km | 6.00% | 30.7% | 52.0% | 0% | 300 |
+| North America | 1000 km | 62.9% | 81.4% | 88.6% | 0.71% | 1000 |
+| North America | 3000 km | 73.3% | 91.3% | 96.0% | 3.33% | 3000 |
+| Eastern Europe, Middle East | 300 km | 10.0% | 36.7% | 50.0% | 0% | 300 |
 | Eastern Europe, Middle East | 1000 km | 74.7% | 92.7% | 94.7% | 0% | 1000 |
-| Eastern Europe, Middle East | 3000 km | 77.3% | 91.3% | 94.0% | 15.3% | 3000 |
+| Eastern Europe, Middle East | 3000 km | 77.3% | 91.3% | 94.0% | 3.33% | 3000 |
 | Asia | 300 km | 8.89% | 14.4% | 14.4% | 0% | 300 |
 | Asia | 1000 km | 65.2% | 78.5% | 88.9% | 2.22% | 1000 |
-| Asia | 3000 km | 76.8% | 93.0% | 96.5% | 16.9% | 3000 |
-| South America | 300 km | 0% | 2.80% | 5.61% | 2.80% | 300 |
-| South America | 1000 km | 56.7% | 78.7% | 82.7% | 4.67% | 1000 |
-| South America | 3000 km | 82.3% | 96.9% | 97.7% | 16.2% | 3000 |
+| Asia | 3000 km | 76.8% | 93.0% | 96.5% | 9.86% | 3000 |
+| South America | 300 km | 0% | 2.80% | 5.61% | 0% | 300 |
+| South America | 1000 km | 56.7% | 78.7% | 82.7% | 2.00% | 1000 |
+| South America | 3000 km | 82.3% | 96.9% | 97.7% | 13.1% | 3000 |
 | Africa | 300 km | 0% | 1.41% | 0% | 0% | 300 |
-| Africa | 1000 km | 16.7% | 34.7% | 42.7% | 2.67% | 1000 |
-| Africa | 3000 km | 75.3% | 92.7% | 97.3% | 8.67% | 3000 |
-| Oceania | 300 km | 2.29% | 2.29% | 1.53% | 32.8% | 300 |
-| Oceania | 1000 km | 10.5% | 14.5% | 14.5% | 9.21% | 1000 |
-| Oceania | 3000 km | 41.1% | 49.6% | 53.5% | 39.5% | 3000 |
-| All | 300 km | 5.98% (4.62–7.70) | 18.9% (16.5–21.6) | 28.5% (25.7–31.5) | 5.65% |  |
-| All | 1000 km | 55.4% (52.2–58.5) | 72.0% (69.1–74.8) | 77.1% (74.3–79.6) | 2.73% |  |
-| All | 3000 km | 70.4% (67.5–73.2) | 84.4% (82.0–86.5) | 89.6% (87.6–91.4) | 20.5% |  |
+| Africa | 1000 km | 16.7% | 34.7% | 42.7% | 0% | 1000 |
+| Africa | 3000 km | 75.3% | 92.7% | 97.3% | 3.33% | 3000 |
+| Oceania | 300 km | 2.29% | 2.29% | 1.53% | 0% | 300 |
+| Oceania | 1000 km | 10.5% | 14.5% | 14.5% | 2.63% | 1000 |
+| Oceania | 3000 km | 41.1% | 49.6% | 53.5% | 7.75% | 3000 |
+| All | 300 km | 5.98% (4.62–7.70) | 18.9% (16.5–21.6) | 28.5% (25.7–31.5) | 0.11% |  |
+| All | 1000 km | 55.4% (52.2–58.5) | 72.0% (69.1–74.8) | 77.1% (74.3–79.6) | 0.95% |  |
+| All | 3000 km | 70.4% (67.5–73.2) | 84.4% (82.0–86.5) | 89.6% (87.6–91.4) | 6.09% |  |
 
 Real countries, their nearest point 0.8 to 1.25 times the distance away:
 
@@ -444,26 +445,26 @@ Real countries, their nearest point 0.8 to 1.25 times the distance away:
 |---|--:|--:|--:|--:|--:|--:|
 | Europe | 300 km | 15.9% | 42.5% | 72.6% | 0.88% | 309 |
 | Europe | 1000 km | 78.0% | 95.3% | 98.0% | 0% | 1051 |
-| Europe | 3000 km | 70.0% | 92.0% | 96.0% | 20.0% | 3087 |
+| Europe | 3000 km | 70.0% | 92.0% | 96.0% | 4.00% | 3087 |
 | North America | 300 km | 7.41% | 33.3% | 48.1% | 0% | 308 |
-| North America | 1000 km | 58.1% | 77.4% | 93.5% | 16.1% | 1033 |
-| North America | 3000 km | 70.0% | 84.0% | 88.0% | 26.7% | 3094 |
-| Eastern Europe, Middle East | 300 km | 20.9% | 53.9% | 68.7% | 0.87% | 312 |
-| Eastern Europe, Middle East | 1000 km | 66.0% | 86.0% | 91.3% | 0.67% | 1043 |
-| Eastern Europe, Middle East | 3000 km | 72.7% | 91.3% | 94.0% | 14.7% | 3077 |
-| Asia | 300 km | 6.56% | 14.8% | 16.4% | 1.64% | 345 |
-| Asia | 1000 km | 49.7% | 70.6% | 80.4% | 4.90% | 1044 |
-| Asia | 3000 km | 69.3% | 89.3% | 92.7% | 20.0% | 3112 |
+| North America | 1000 km | 58.1% | 77.4% | 93.5% | 3.23% | 1033 |
+| North America | 3000 km | 70.0% | 84.0% | 88.0% | 6.00% | 3094 |
+| Eastern Europe, Middle East | 300 km | 20.9% | 53.9% | 68.7% | 0% | 312 |
+| Eastern Europe, Middle East | 1000 km | 66.0% | 86.0% | 91.3% | 0% | 1043 |
+| Eastern Europe, Middle East | 3000 km | 72.7% | 91.3% | 94.0% | 5.33% | 3077 |
+| Asia | 300 km | 6.56% | 14.8% | 16.4% | 0% | 345 |
+| Asia | 1000 km | 49.7% | 70.6% | 80.4% | 2.10% | 1044 |
+| Asia | 3000 km | 69.3% | 89.3% | 92.7% | 6.00% | 3112 |
 | South America | 300 km | 0% | 0% | 0% | 1.67% | 310 |
-| South America | 1000 km | 37.7% | 57.7% | 63.1% | 3.08% | 1041 |
-| South America | 3000 km | 64.0% | 87.3% | 89.3% | 30.7% | 3249 |
+| South America | 1000 km | 37.7% | 57.7% | 63.1% | 0% | 1041 |
+| South America | 3000 km | 64.0% | 87.3% | 89.3% | 9.33% | 3249 |
 | Africa | 300 km | 4.27% | 5.13% | 8.55% | 0.85% | 294 |
-| Africa | 1000 km | 23.3% | 37.3% | 46.0% | 4.00% | 1062 |
-| Africa | 3000 km | 68.0% | 94.0% | 95.3% | 18.7% | 3131 |
-| Oceania | 3000 km | 29.3% | 52.0% | 54.0% | 47.3% | 3031 |
-| All | 300 km | 10.8% (8.31–13.8) | 27.2% (23.4–31.3) | 39.4% (35.1–43.7) | 1.01% |  |
-| All | 1000 km | 51.6% (48.0–55.1) | 70.0% (66.7–73.2) | 76.8% (73.6–79.7) | 3.05% |  |
-| All | 3000 km | 63.3% (60.4–66.2) | 84.3% (82.0–86.4) | 87.0% (84.9–88.9) | 25.4% |  |
+| Africa | 1000 km | 23.3% | 37.3% | 46.0% | 2.00% | 1062 |
+| Africa | 3000 km | 68.0% | 94.0% | 95.3% | 8.00% | 3131 |
+| Oceania | 3000 km | 29.3% | 52.0% | 54.0% | 14.0% | 3031 |
+| All | 300 km | 10.8% (8.31–13.8) | 27.2% (23.4–31.3) | 39.4% (35.1–43.7) | 0.61% |  |
+| All | 1000 km | 51.6% (48.0–55.1) | 70.0% (66.7–73.2) | 76.8% (73.6–79.7) | 0.93% |  |
+| All | 3000 km | 63.3% (60.4–66.2) | 84.3% (82.0–86.4) | 87.0% (84.9–88.9) | 7.52% |  |
 
 At each confidence, all regions:
 
@@ -559,10 +560,10 @@ The main part's visitors under V10 (at V11's k for the address's continent, k_ea
 
 | Sessions | Run | Stop p50, s | p90, s | p99, s | converged | clear | cap | Runs counted | False rejects, tiny: 95% | 99% | real countries | Region misses (tiny) | Power: 300 km | 1,000 km | 3,000 km | low_precision: claims |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| far ones late (main) | 1 | 7.50 | 8.75 | 12.00 | 88.0% | 10.6% | 1.05% | 99.7% | 2.05% | 0.52% | 0.029% | 0.60% | 5.98% | 55.4% | 70.4% | 10.5% |
-| far ones late (main) | 3 | 5.50 | 7.75 | 9.00 | 83.1% | 16.3% | 0.27% | 99.6% | 2.32% | 0.64% | 0.029% | 0.70% | 28.5% | 77.1% | 89.6% | 3.75% |
-| staggered by round trips | 1 | 4.75 | 5.50 | 10.50 | 89.5% | 9.75% | 0.70% | 99.9% | 1.77% | 0.48% | 0.029% | 0.53% | 6.09% | 54.0% | 72.2% | 9.63% |
-| staggered by round trips | 3 | 4.50 | 5.00 | 6.75 | 83.4% | 16.1% | 0.33% | 99.8% | 2.29% | 0.59% | 0.029% | 0.66% | 28.5% | 77.7% | 90.9% | 3.37% |
+| far ones late (main) | 1 | 7.50 | 8.75 | 12.00 | 88.0% | 10.6% | 1.05% | 99.7% | 2.05% | 0.52% | 0.029% | 0.63% | 5.98% | 55.4% | 70.4% | 2.34% |
+| far ones late (main) | 3 | 5.50 | 7.75 | 9.00 | 83.1% | 16.3% | 0.27% | 99.6% | 2.32% | 0.64% | 0.029% | 0.70% | 28.5% | 77.1% | 89.6% | 0.79% |
+| staggered by round trips | 1 | 4.75 | 5.50 | 10.50 | 89.5% | 9.75% | 0.70% | 99.9% | 1.77% | 0.48% | 0.029% | 0.54% | 6.09% | 54.0% | 72.2% | 1.16% |
+| staggered by round trips | 3 | 4.50 | 5.00 | 6.75 | 83.4% | 16.1% | 0.33% | 99.8% | 2.29% | 0.59% | 0.029% | 0.66% | 28.5% | 77.7% | 90.9% | 0.56% |
 
 ### What stopping early does
 
@@ -570,9 +571,9 @@ One run per visitor under V10, under V10 without the clear stop (k_early ∞), a
 
 |  | False rejects: tiny country | large country, 5 km in | Region misses the truth (tiny) | Power: 300 km | 1,000 km | 3,000 km | Median stop, s | p90 stop, s | At the cap |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| k_early 4 | 0.43% | 0% | 0.53% | 5.53% | 54.5% | – | 7.50 | 8.75 | 0.81% |
-| k_early ∞ | 0.29% | 0% | 0.38% | 5.37% | 53.2% | – | 7.50 | 9.00 | 0.87% |
-| cap only | 0.29% | 0% | 0.38% | 5.20% | 54.8% | – | 12.00 | 12.00 | 99.2% |
+| k_early 4 | 0.43% | 0% | 0.50% | 5.53% | 54.5% | – | 7.50 | 8.75 | 0.81% |
+| k_early ∞ | 0.29% | 0% | 0.36% | 5.37% | 53.2% | – | 7.50 | 9.00 | 0.87% |
+| cap only | 0.29% | 0% | 0.36% | 5.20% | 54.8% | – | 12.00 | 12.00 | 99.2% |
 
 ### V10's cadence
 
@@ -580,15 +581,15 @@ The same visitors, 3 runs each, at V11's k for the address's continent, k_early 
 
 | k_early | Rule: cadence | full fits | Worst cell at 99%: cadence | full fits | at 95%: cadence | full fits | Median stop, s: cadence | full fits | Runs that stop elsewhere | Verdicts at 99% that differ |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 3 | holds | holds | 0.90% | 0.90% | 2.95% | 2.90% | 6.00 | 6.00 | 1.29% | 0.028% |
-| 3.25 | holds | holds | 0.71% | 0.71% | 2.81% | 2.76% | 6.00 | 6.00 | 1.30% | 0.028% |
-| 3.5 | holds | holds | 0.67% | 0.62% | 2.81% | 2.76% | 6.25 | 6.00 | 1.33% | 0.021% |
-| 3.75 | holds | holds | 0.67% | 0.62% | 2.81% | 2.76% | 6.25 | 6.25 | 1.37% | 0.021% |
-| 4 | holds | holds | 0.62% | 0.57% | 2.71% | 2.67% | 6.25 | 6.25 | 1.38% | 0.028% |
-| 4.25 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.25 | 6.25 | 1.40% | 0.021% |
-| 4.5 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.25 | 6.25 | 1.40% | 0.021% |
-| 5 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.50 | 6.50 | 1.42% | 0.021% |
-| ∞ | – | – | 0.52% | 0.57% | 2.62% | 2.62% | 6.50 | 6.50 | 1.52% | 0.035% |
+| 3 | holds | holds | 0.90% | 0.90% | 2.95% | 2.90% | 6.00 | 6.00 | 1.29% | 0.021% |
+| 3.25 | holds | holds | 0.71% | 0.71% | 2.81% | 2.76% | 6.00 | 6.00 | 1.30% | 0.021% |
+| 3.5 | holds | holds | 0.67% | 0.62% | 2.81% | 2.76% | 6.25 | 6.00 | 1.33% | 0.014% |
+| 3.75 | holds | holds | 0.67% | 0.62% | 2.81% | 2.76% | 6.25 | 6.25 | 1.37% | 0.014% |
+| 4 | holds | holds | 0.62% | 0.57% | 2.71% | 2.67% | 6.25 | 6.25 | 1.38% | 0.021% |
+| 4.25 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.25 | 6.25 | 1.40% | 0.014% |
+| 4.5 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.25 | 6.25 | 1.40% | 0.014% |
+| 5 | holds | holds | 0.57% | 0.52% | 2.71% | 2.67% | 6.50 | 6.50 | 1.42% | 0.014% |
+| ∞ | – | – | 0.52% | 0.57% | 2.62% | 2.62% | 6.50 | 6.50 | 1.52% | 0.028% |
 
 ### V11's fixed table on drift verdicts
 
@@ -596,27 +597,27 @@ The contract's choice and stops, 3 runs, each visitor judged at V11's 99% k for 
 
 | Continent | k | Runs | Tiny visitors | Region misses | False rejects: tiny | real countries | Power: 300 km | 1,000 km | 3,000 km | Over 1%: k needed |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| EU | 3.035 | 1 | 3167 | 0.60% (0.38–0.94) | 0.57% | 0.13% | 12.6% | 75.3% | 54.5% |  |
-| EU | 3.035 | 2 | 3178 | 0.57% (0.36–0.89) | 0.47% | 0% | 38.4% | 94.6% | 87.5% |  |
+| EU | 3.035 | 1 | 3172 | 0.60% (0.38–0.93) | 0.57% | 0.13% | 12.6% | 75.3% | 54.5% |  |
+| EU | 3.035 | 2 | 3179 | 0.57% (0.36–0.89) | 0.47% | 0% | 38.4% | 94.6% | 87.5% |  |
 | EU | 3.035 | 3 | 3179 | 0.38% (0.22–0.66) | 0.25% | 0% | 57.7% | 98.7% | 97.7% |  |
-| NA | 3.250 | 1 | 1987 | 0.35% (0.17–0.73) | 0.30% | 0% | 8.76% | 62.0% | 68.0% |  |
+| NA | 3.250 | 1 | 1995 | 0.35% (0.17–0.72) | 0.30% | 0% | 8.76% | 62.0% | 68.0% |  |
 | NA | 3.250 | 2 | 2000 | 0.55% (0.31–0.98) | 0.45% | 0% | 34.1% | 80.4% | 90.6% |  |
 | NA | 3.250 | 3 | 2000 | 0.70% (0.42–1.17) | 0.55% | 0% | 44.4% | 89.2% | 95.3% |  |
-| AS | 3.350 | 1 | 2814 | 0.78% (0.52–1.18) | 0.78% | 0% | 6.84% | 62.6% | 72.5% |  |
-| AS | 3.350 | 2 | 2820 | 0.64% (0.40–1.01) | 0.60% | 0% | 9.89% | 80.3% | 88.1% |  |
+| AS | 3.350 | 1 | 2817 | 0.78% (0.52–1.18) | 0.78% | 0% | 6.84% | 62.6% | 72.5% |  |
+| AS | 3.350 | 2 | 2821 | 0.64% (0.40–1.01) | 0.60% | 0% | 9.89% | 80.3% | 88.1% |  |
 | AS | 3.350 | 3 | 2821 | 0.78% (0.52–1.18) | 0.64% | 0% | 11.4% | 86.4% | 94.0% |  |
-| SA | 3.500 | 1 | 1921 | 0.83% (0.51–1.35) | 0.75% | 0% | 0% | 56.0% | 91.5% |  |
-| SA | 3.500 | 2 | 1977 | 0.66% (0.38–1.12) | 0.60% | 0% | 2.70% | 76.6% | 97.0% |  |
-| SA | 3.500 | 3 | 1982 | 0.61% (0.35–1.06) | 0.55% | 0.40% | 3.24% | 80.6% | 98.8% |  |
-| AF | 3.950 | 1 | 1978 | 0.56% (0.31–0.99) | 0.50% | 0% | 1.15% | 19.5% | 72.7% |  |
-| AF | 3.950 | 2 | 1998 | 0.70% (0.42–1.17) | 0.65% | 0.20% | 2.68% | 33.0% | 90.1% |  |
+| SA | 3.500 | 1 | 1992 | 0.80% (0.50–1.30) | 0.75% | 0% | 0% | 56.0% | 91.5% |  |
+| SA | 3.500 | 2 | 1999 | 0.65% (0.38–1.11) | 0.60% | 0% | 2.70% | 76.6% | 97.0% |  |
+| SA | 3.500 | 3 | 2000 | 0.60% (0.34–1.05) | 0.55% | 0.40% | 3.24% | 80.6% | 98.8% |  |
+| AF | 3.950 | 1 | 1991 | 0.55% (0.31–0.99) | 0.50% | 0% | 1.15% | 19.5% | 72.7% |  |
+| AF | 3.950 | 2 | 2000 | 0.70% (0.42–1.17) | 0.65% | 0.20% | 2.68% | 33.0% | 90.1% |  |
 | AF | 3.950 | 3 | 2000 | 0.70% (0.42–1.17) | 0.50% | 0.20% | 3.07% | 37.1% | 94.9% |  |
-| OC | 7.880 | 1 | 1430 | 1.61% (1.07–2.40) | 1.10% | 0.60% | 0.38% | 9.27% | 41.9% | **10.50** |
-| OC | 7.880 | 2 | 1529 | 1.11% (0.70–1.77) | 0.85% | 0.60% | 0.38% | 11.9% | 56.5% | **10.15** |
-| OC | 7.880 | 3 | 1546 | 1.23% (0.79–1.91) | 0.95% | 0.80% | 0.76% | 14.6% | 58.5% | **10.35** |
-| All | per continent | 1 | 13,297 | 0.74% (0.61–0.90) | 0.66% | 0.12% | 6.46% | 55.0% | 67.8% |  |
-| All | per continent | 2 | 13,502 | 0.67% (0.55–0.83) | 0.59% | 0.12% | 19.5% | 71.9% | 85.7% |  |
-| All | per continent | 3 | 13,528 | 0.69% (0.56–0.84) | 0.55% | 0.20% | 27.4% | 77.0% | 90.7% |  |
+| OC | 7.880 | 1 | 1993 | 1.15% (0.77–1.73) | 1.10% | 0.60% | 0.38% | 9.27% | 41.9% | **8.55** |
+| OC | 7.880 | 2 | 2000 | 1.05% (0.69–1.60) | 0.85% | 0.60% | 0.38% | 11.9% | 56.5% | **8.05** |
+| OC | 7.880 | 3 | 2000 | 1.15% (0.77–1.72) | 0.95% | 0.80% | 0.76% | 14.6% | 58.5% | **9.05** |
+| All | per continent | 1 | 13,960 | 0.70% (0.58–0.85) | 0.66% | 0.12% | 6.46% | 55.0% | 67.8% |  |
+| All | per continent | 2 | 13,999 | 0.68% (0.56–0.83) | 0.59% | 0.12% | 19.5% | 71.9% | 85.7% |  |
+| All | per continent | 3 | 14,000 | 0.69% (0.57–0.84) | 0.55% | 0.20% | 27.4% | 77.0% | 90.7% |  |
 
 ### V11's k on drift verdicts
 
@@ -624,36 +625,36 @@ V11 calibrates k at 99% per continent on single-run lag.dev tracks (lag.dev's ow
 
 | Continent | Default k | Lag tracks | left out: light | lag 99% quantile | Calibrated k (upper bound) | Drift needs: 1 run | 2 runs | 3 runs |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| EU | 3.035 | 14,078 | 0 | 3.17 | 3.35 | 2.30 | 2.35 | 2.46 |
-| NA | 3.250 | 9153 | 0 | 3.12 | 3.25 | 2.82 | 2.80 | 3.08 |
-| AS | 3.350 | 11,598 | 0 | 4.62 | 5.10 | 2.84 | 2.86 | 3.07 |
-| SA | 3.500 | 8691 | 0 | 4.34 | 4.55 | 3.21 | 3.22 | 3.36 |
-| AF | 3.950 | 7385 | 0 | 6.26 | 6.65 | 3.26 | 3.61 | 4.07 |
-| OC | 7.880 | 6006 | 0 | 5.48 | 6.10 | 7.53 | 5.83 | 5.58 |
+| EU | 3.035 | 15,796 | 0 | 3.07 | 3.25 | 2.30 | 2.35 | 2.46 |
+| NA | 3.250 | 9944 | 0 | 3.14 | 3.30 | 2.82 | 2.80 | 3.08 |
+| AS | 3.350 | 14,031 | 0 | 4.46 | 4.70 | 2.84 | 2.86 | 3.07 |
+| SA | 3.500 | 9945 | 0 | 4.29 | 4.45 | 3.21 | 3.17 | 3.35 |
+| AF | 3.950 | 9942 | 0 | 6.20 | 6.50 | 3.26 | 3.61 | 4.07 |
+| OC | 7.880 | 9943 | 0 | 4.82 | 5.25 | 7.53 | 5.46 | 5.15 |
 
 Drift verdicts at V11's default k (tiny-country visitors for the region's misses; k_early is KEarly(k)):
 
 | Continent | k | Region misses: 1 run | 2 runs | 3 runs | False rejects, tiny: 1 run | 2 runs | 3 runs | real countries: 1 run | 2 runs | 3 runs |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | EU | 3.03 | 0.40% | 0.47% | 0.16% | 0.39% | 0.31% | 0.079% | 0% | 0% | 0% |
-| NA | 3.25 | 0.63% | 0.62% | 0.88% | 0.38% | 0.25% | 0.88% | 0% | 0% | 0.21% |
+| NA | 3.25 | 0.62% | 0.62% | 0.88% | 0.38% | 0.25% | 0.88% | 0% | 0% | 0.21% |
 | AS | 3.35 | 0.80% | 0.62% | 0.71% | 0.71% | 0.62% | 0.71% | 0% | 0% | 0% |
-| SA | 3.50 | 0.92% | 0.63% | 0.76% | 0.88% | 0.62% | 0.75% | 0% | 0% | 0.60% |
+| SA | 3.50 | 0.88% | 0.62% | 0.75% | 0.88% | 0.62% | 0.75% | 0% | 0% | 0.60% |
 | AF | 3.95 | 0.38% | 0.88% | 1.50% | 0.38% | 0.75% | 1.38% | 0% | 0% | 0.20% |
-| OC | 7.88 | 0.53% | 0.49% | 0.48% | 0.38% | 0.38% | 0.38% | 0.80% | 1.00% | 0.80% |
-| All | per continent | 0.60% | 0.61% | 0.70% | 0.52% | 0.48% | 0.64% | 0.12% | 0.14% | 0.26% |
+| OC | 7.88 | 0.75% | 0.62% | 0.50% | 0.38% | 0.38% | 0.38% | 0.80% | 1.00% | 0.80% |
+| All | per continent | 0.63% | 0.62% | 0.70% | 0.52% | 0.48% | 0.64% | 0.12% | 0.14% | 0.26% |
 
 Drift verdicts at the k calibrated on lag.dev tracks (tiny-country visitors for the region's misses; k_early is KEarly(k)):
 
 | Continent | k | Region misses: 1 run | 2 runs | 3 runs | False rejects, tiny: 1 run | 2 runs | 3 runs | real countries: 1 run | 2 runs | 3 runs |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| EU | 3.35 | 0.32% | 0.31% | 0.16% | 0.24% | 0.24% | 0.079% | 0% | 0% | 0% |
-| NA | 3.25 | 0.63% | 0.62% | 0.88% | 0.38% | 0.25% | 0.88% | 0% | 0% | 0.21% |
-| AS | 5.10 | 0.27% | 0.35% | 0.18% | 0.18% | 0.35% | 0.18% | 0% | 0% | 0% |
-| SA | 4.55 | 0.26% | 0.38% | 0.25% | 0.25% | 0.25% | 0.25% | 0% | 0% | 0% |
-| AF | 6.65 | 0.13% | 0.25% | 0.38% | 0.12% | 0.12% | 0.38% | 0% | 0% | 0% |
-| OC | 6.10 | 1.05% | 0.49% | 0.48% | 0.75% | 0.38% | 0.38% | 1.60% | 1.00% | 0.80% |
-| All | per continent | 0.40% | 0.39% | 0.35% | 0.30% | 0.27% | 0.32% | 0.23% | 0.14% | 0.14% |
+| EU | 3.25 | 0.32% | 0.31% | 0.16% | 0.31% | 0.31% | 0.079% | 0% | 0% | 0% |
+| NA | 3.30 | 0.50% | 0.62% | 0.88% | 0.38% | 0.25% | 0.88% | 0% | 0% | 0% |
+| AS | 4.70 | 0.36% | 0.44% | 0.35% | 0.27% | 0.44% | 0.27% | 0% | 0% | 0% |
+| SA | 4.45 | 0.38% | 0.38% | 0.38% | 0.25% | 0.38% | 0.25% | 0% | 0% | 0% |
+| AF | 6.50 | 0.13% | 0.25% | 0.38% | 0.12% | 0.25% | 0.38% | 0% | 0% | 0% |
+| OC | 5.25 | 1.51% | 0.75% | 0.62% | 1.00% | 0.50% | 0.50% | 1.80% | 1.00% | 0.80% |
+| All | per continent | 0.50% | 0.45% | 0.43% | 0.38% | 0.36% | 0.36% | 0.26% | 0.14% | 0.12% |
 
 ### Stops on the verdict's evidence
 
@@ -661,14 +662,14 @@ V10 (e2e): with far sessions opening late, as in every part, the frame decides i
 
 | Stops decided on | Usable round trips | Run | Stop p50, s | p90, s | p99, s | clear | cap | Runs counted | False rejects: tiny | real | Region misses | Power: 300 km | 1,000 km | 3,000 km | VPN pairs | low_precision: claims | honest |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 4 | 8 | 1 | 6.50 | 8.00 | 12.00 | 9.65% | 1.06% | 99.7% | 0.46% | 0.086% | 0.53% | 5.98% | 51.7% | 63.6% | 19.6% | 11.0% | 4.82% |
-| 4 | 8 | 3 | 5.25 | 7.00 | 8.25 | 15.1% | 0.25% | 99.6% | 0.59% | 0.20% | 0.66% | 27.9% | 78.5% | 87.0% | 66.8% | 3.68% | 3.26% |
-| 4 | 12 | 1 | 6.50 | 8.00 | 12.00 | 9.33% | 1.10% | 99.6% | 0.46% | 0.12% | 0.51% | 5.43% | 51.1% | 61.2% | 19.3% | 11.6% | 4.79% |
-| 4 | 12 | 3 | 5.75 | 7.00 | 8.75 | 14.9% | 0.36% | 99.5% | 0.55% | 0.17% | 0.63% | 27.6% | 77.0% | 87.7% | 65.4% | 3.59% | 3.24% |
-| usable | 8 | 1 | 7.50 | 8.75 | 12.00 | 10.3% | 1.06% | 99.7% | 0.52% | 0.12% | 0.60% | 6.20% | 55.5% | 69.9% | 23.6% | 8.92% | 4.79% |
-| usable | 8 | 3 | 5.50 | 7.75 | 9.00 | 15.5% | 0.32% | 99.6% | 0.64% | 0.26% | 0.70% | 27.5% | 78.7% | 89.9% | 67.9% | 3.33% | 3.38% |
-| usable | 12 | 1 | 8.50 | 9.75 | 12.00 | 10.1% | 1.44% | 99.6% | 0.57% | 0.12% | 0.62% | 6.20% | 55.2% | 69.6% | 23.9% | 9.04% | 4.79% |
-| usable | 12 | 3 | 6.50 | 8.75 | 9.75 | 15.5% | 0.30% | 99.5% | 0.64% | 0.20% | 0.70% | 28.2% | 78.2% | 90.0% | 66.8% | 3.30% | 3.35% |
+| 4 | 8 | 1 | 6.50 | 8.00 | 12.00 | 9.65% | 1.06% | 99.7% | 0.46% | 0.086% | 0.56% | 5.98% | 51.7% | 63.6% | 19.6% | 2.25% | 0.033% |
+| 4 | 8 | 3 | 5.25 | 7.00 | 8.25 | 15.1% | 0.25% | 99.6% | 0.59% | 0.20% | 0.66% | 27.9% | 78.5% | 87.0% | 66.8% | 0.57% | 0.011% |
+| 4 | 12 | 1 | 6.50 | 8.00 | 12.00 | 9.33% | 1.10% | 99.6% | 0.46% | 0.12% | 0.54% | 5.43% | 51.1% | 61.2% | 19.3% | 2.25% | 0.033% |
+| 4 | 12 | 3 | 5.75 | 7.00 | 8.75 | 14.9% | 0.36% | 99.5% | 0.55% | 0.17% | 0.62% | 27.6% | 77.0% | 87.7% | 65.4% | 0.54% | 0.011% |
+| usable | 8 | 1 | 7.50 | 8.75 | 12.00 | 10.3% | 1.06% | 99.7% | 0.52% | 0.12% | 0.63% | 6.20% | 55.5% | 69.9% | 23.6% | 2.44% | 0.033% |
+| usable | 8 | 3 | 5.50 | 7.75 | 9.00 | 15.5% | 0.32% | 99.6% | 0.64% | 0.26% | 0.70% | 27.5% | 78.7% | 89.9% | 67.9% | 0.44% | 0.011% |
+| usable | 12 | 1 | 8.50 | 9.75 | 12.00 | 10.1% | 1.44% | 99.6% | 0.57% | 0.12% | 0.63% | 6.20% | 55.2% | 69.6% | 23.9% | 2.44% | 0.022% |
+| usable | 12 | 3 | 6.50 | 8.75 | 9.75 | 15.5% | 0.30% | 99.5% | 0.64% | 0.20% | 0.70% | 28.2% | 78.2% | 90.0% | 66.8% | 0.44% | 0.011% |
 
 ### Where the region's misses come from
 
@@ -676,11 +677,11 @@ Tiny-country visitors, one run each, in worlds that each take away a source of e
 
 | World | Region misses: 95% | 99% | 99.9% | False rejects, 99%: tiny | large country, 5 km in | 99.9%: tiny | k that holds 95% | 99% | 99.9% |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| base: the study's world | 3.04% (2.38–3.89) | 2.05% (1.51–2.76) | 1.10% (0.73–1.66) | 1.67% | 0.43% | 1.00% | 2.04 | 4.02 | 9.41 |
-| ideal pings: no queue, jitter, spike or loss | 3.04% (2.37–3.88) | 1.94% (1.42–2.65) | 1.10% (0.73–1.65) | 1.71% | 0.43% | 0.90% | 2.05 | 3.84 | 9.52 |
-| no place error: every extender exactly at its place | 3.14% (2.46–4.00) | 2.04% (1.51–2.76) | 1.05% (0.69–1.59) | 1.57% | 0.43% | 0.95% | 2.02 | 3.73 | 10.76 |
-| normal stretch: the route stretch normal and unfloored | 6.35% (5.37–7.51) | 3.00% (2.34–3.84) | 1.45% (1.01–2.08) | 2.29% | 0.86% | 1.24% | 2.62 | 4.26 | 10.36 |
-| model's world: all three: the route stretch normal, no place error, ideal pings | 5.95% (4.99–7.07) | 2.95% (2.29–3.78) | 1.50% (1.05–2.13) | 2.43% | 1.14% | 1.38% | 2.61 | 4.08 | 10.28 |
+| base: the study's world | 3.20% (2.53–4.05) | 2.05% (1.53–2.76) | 1.05% (0.70–1.59) | 1.67% | 0.43% | 1.00% | 2.07 | 4.02 | 9.41 |
+| ideal pings: no queue, jitter, spike or loss | 3.20% (2.53–4.04) | 1.91% (1.41–2.59) | 1.05% (0.69–1.59) | 1.71% | 0.43% | 0.90% | 2.10 | 3.84 | 9.52 |
+| no place error: every extender exactly at its place | 3.30% (2.61–4.15) | 2.10% (1.57–2.81) | 1.00% (0.66–1.53) | 1.57% | 0.43% | 0.95% | 2.06 | 3.73 | 10.76 |
+| normal stretch: the route stretch normal and unfloored | 6.50% (5.52–7.64) | 3.20% (2.53–4.05) | 1.53% (1.09–2.15) | 2.29% | 0.86% | 1.24% | 2.63 | 4.35 | 8.85 |
+| model's world: all three: the route stretch normal, no place error, ideal pings | 6.06% (5.12–7.17) | 3.01% (2.36–3.83) | 1.53% (1.08–2.15) | 2.43% | 1.14% | 1.38% | 2.63 | 4.14 | 10.28 |
 
 ### The verdict's starts
 
@@ -688,8 +689,8 @@ The same visitors, one run each, with the server's verdict from lagdrift's fit, 
 
 | Verdict's starts | False rejects, 99%: tiny | real countries | 99.9%: tiny | real countries | Region misses, 99% | 99.9% | VPN pairs | 300 km | 800 km | 1,500 km | 3,000 km | 6,000 km |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| lagdrift | 1.62% | 0.48% | 0.76% | 0.24% | 1.92% | 0.81% | 26.8% | 9.92% | 41.5% | 71.9% | 71.1% | 45.0% |
-| wide | 1.52% | 0.48% | 0.67% | 0.24% | 1.82% | 0.71% | 26.4% | 9.92% | 41.5% | 70.7% | 71.1% | 43.9% |
+| lagdrift | 1.62% | 0.48% | 0.76% | 0.24% | 2.11% | 0.86% | 26.8% | 9.92% | 41.5% | 71.9% | 71.1% | 45.0% |
+| wide | 1.52% | 0.48% | 0.67% | 0.24% | 2.11% | 0.77% | 26.4% | 9.92% | 41.5% | 70.7% | 71.1% | 43.9% |
 
 ### A visitor far from the address's place (VPN)
 
@@ -697,20 +698,20 @@ Visitors whose address claims a country they are not in, as a VPN's virtual loca
 
 | Fleet, choice | k_early by the rule | False rejects, 99%, tiny: 1 run | 3 runs | real countries: 1 run | 3 runs | Worst cell at 95% | Region misses, 99% | VPN pairs: 1 run | 3 runs | Median stop, s |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| dense: E2 | 3 | 0.60% | 0.83% | 0% | 0.24% | 2.98% | 0.76% | 15.7% | 51.8% | 7.25 |
-| dense: joint spread | 3 | 0.48% | 0.48% | 0% | 0.24% | 2.62% | 0.64% | 15.7% | 44.3% | 7.00 |
-| dense: VPN hubs | 3.75 | 0.36% | 1.43% | 0% | 0% | 3.69% | 0.50% | 8.93% | 28.6% | 7.50 |
-| dense: information | 3 | 0.83% | 0.48% | 0% | 0% | 3.81% | 0.88% | 11.8% | 25.7% | 8.00 |
+| dense: E2 | 3 | 0.60% | 0.83% | 0% | 0.24% | 2.98% | 0.96% | 15.7% | 51.8% | 7.25 |
+| dense: joint spread | 3 | 0.48% | 0.48% | 0% | 0.24% | 2.62% | 0.72% | 15.7% | 44.3% | 7.00 |
+| dense: VPN hubs | 3.75 | 0.36% | 1.43% | 0% | 0% | 3.69% | 0.60% | 8.93% | 28.6% | 7.50 |
+| dense: information | 3 | 0.83% | 0.48% | 0% | 0% | 3.81% | 0.96% | 11.8% | 25.7% | 8.00 |
 | dense: information ring | 3 | 0.60% | 0.95% | 0% | 0% | 3.10% | 0.60% | 19.3% | 52.5% | 6.50 |
 | dense: ring mid band | 3 | 0.24% | 0.95% | 0% | 0% | 3.33% | 0.48% | 11.8% | 57.5% | 7.00 |
-| dense: hybrid | 3 | 0.48% | 0.83% | 0% | 0.24% | 2.74% | 0.63% | 22.9% | 66.8% | 7.25 |
-| sparse: E2 | none holds | 1.79% | 1.79% | 0.24% | 0.48% | 4.88% | 2.26% | 30.7% | 49.6% | 7.75 |
-| sparse: joint spread | none holds | 1.43% | 1.79% | 0.72% | 0.24% | 4.64% | 1.64% | 30.4% | 47.1% | 7.50 |
-| sparse: VPN hubs | none holds | 1.55% | 1.43% | 0.48% | 0.24% | 4.88% | 1.69% | 25.7% | 43.9% | 7.75 |
-| sparse: information | 3.25 | 0.83% | 1.07% | 0.72% | 0.48% | 4.52% | 0.93% | 20.4% | 57.9% | 8.00 |
-| sparse: information ring | 4.25 | 1.07% | 1.31% | 0.72% | 0% | 4.40% | 1.22% | 27.1% | 57.9% | 7.50 |
-| sparse: ring mid band | 4.25 | 1.19% | 0.95% | 0.24% | 0.48% | 3.93% | 1.45% | 31.4% | 59.3% | 7.75 |
-| sparse: hybrid | none holds | 1.79% | 1.79% | 0.24% | 0.48% | 4.88% | 2.26% | 32.5% | 50.7% | 7.75 |
+| dense: hybrid | 3 | 0.48% | 0.83% | 0% | 0.24% | 2.74% | 0.84% | 22.9% | 66.8% | 7.25 |
+| sparse: E2 | none holds | 1.79% | 1.79% | 0.24% | 0.48% | 4.88% | 2.15% | 30.7% | 49.6% | 7.75 |
+| sparse: joint spread | none holds | 1.43% | 1.79% | 0.72% | 0.24% | 4.64% | 1.67% | 30.4% | 47.1% | 7.50 |
+| sparse: VPN hubs | none holds | 1.55% | 1.43% | 0.48% | 0.24% | 4.88% | 1.68% | 25.7% | 43.9% | 7.75 |
+| sparse: information | 3.25 | 0.83% | 1.07% | 0.72% | 0.48% | 4.52% | 0.96% | 20.4% | 57.9% | 8.00 |
+| sparse: information ring | 4.25 | 1.07% | 1.31% | 0.72% | 0% | 4.40% | 1.20% | 27.1% | 57.9% | 7.50 |
+| sparse: ring mid band | 4.25 | 1.19% | 0.95% | 0.24% | 0.48% | 3.93% | 1.44% | 31.4% | 59.3% | 7.75 |
+| sparse: hybrid | none holds | 1.79% | 1.79% | 0.24% | 0.48% | 4.88% | 2.15% | 32.5% | 50.7% | 7.75 |
 
 The named pairs on the dense fleet:
 
@@ -764,10 +765,10 @@ The review's rule (V10): an interrupted run counts only if converged or clear he
 
 | Rule | Client | Claims agree: 300 km | 1,000 km | 3,000 km | Claims rejected: 300 km | 1,000 km | 3,000 km | False rejects (tiny) | Runs that don't count | interrupted |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| counted | honest (V10) | 88.1% | 42.8% | 10.3% | 5.69% | 54.6% | 69.6% | 0.43% | 0.27% | 0.37% |
-| counted | silent at a favourable look | 80.0% | 41.7% | 9.88% | 2.28% | 40.0% | 48.8% | 0.21% | 0.27% | 98.5% |
-| review's rule | honest (V10) | 88.1% | 42.8% | 10.3% | 5.53% | 54.5% | 69.6% | 0.43% | 0.37% | 0.37% |
-| review's rule | silent at a favourable look | 0.16% | 0.31% | 0.15% | 1.79% | 38.7% | 47.3% | 0.14% | 84.8% | 98.5% |
+| counted | honest (V10) | 94.0% | 44.3% | 24.9% | 5.69% | 54.6% | 69.6% | 0.43% | 0.27% | 0.37% |
+| counted | silent at a favourable look | 97.4% | 58.9% | 46.0% | 2.28% | 40.0% | 48.8% | 0.21% | 0.27% | 98.5% |
+| review's rule | honest (V10) | 94.0% | 44.3% | 24.9% | 5.53% | 54.5% | 69.6% | 0.43% | 0.37% | 0.37% |
+| review's rule | silent at a favourable look | 0.16% | 0.31% | 0.90% | 1.79% | 38.7% | 47.3% | 0.14% | 84.8% | 98.5% |
 
 ### κ
 
@@ -775,13 +776,13 @@ After 1 run at 99%, at V11's k for the address's continent, k_early KEarly(k).
 
 |  | False rejects: tiny country | large country, 5 km in | Region misses the truth (tiny) | Power: 300 km | 1,000 km | 3,000 km | Median stop, s | p90 stop, s | At the cap |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| κ 0.15 in the world, 0.15 in the model, one run | 0.67% | 0.43% | 0.78% | 19.2% | 80.9% | 86.4% | 6.75 | 8.50 | 0.71% |
-| κ 0.15 in the world, 0.25 in the model, one run | 0.38% | 0.14% | 0.50% | 5.06% | 57.6% | 72.3% | 6.50 | 8.25 | 0.98% |
-| κ 0.25 in the world, 0.15 in the model, one run | 1.52% | 0.14% | 1.99% | 14.8% | 69.8% | 80.7% | 7.50 | 8.75 | 0.71% |
-| κ 0.25 in the world, 0.25 in the model, one run | 0.76% | 0% | 0.91% | 4.40% | 55.0% | 70.3% | 7.50 | 8.50 | 0.79% |
-| κ 0.25 in the world, 0.35 in the model, one run | 0.29% | 0% | 0.31% | 1.63% | 39.2% | 56.1% | 7.00 | 8.50 | 1.15% |
-| κ 0.35 in the world, 0.25 in the model, one run | 0.19% | 0.14% | 0.51% | 6.04% | 52.6% | 64.3% | 7.50 | 9.25 | 1.17% |
-| κ 0.35 in the world, 0.35 in the model, one run | 0.095% | 0% | 0.21% | 1.79% | 38.3% | 53.2% | 7.50 | 8.75 | 0.93% |
+| κ 0.15 in the world, 0.15 in the model, one run | 0.67% | 0.43% | 0.77% | 19.2% | 80.9% | 86.4% | 6.75 | 8.50 | 0.71% |
+| κ 0.15 in the world, 0.25 in the model, one run | 0.38% | 0.14% | 0.48% | 5.06% | 57.6% | 72.3% | 6.50 | 8.25 | 0.98% |
+| κ 0.25 in the world, 0.15 in the model, one run | 1.52% | 0.14% | 1.91% | 14.8% | 69.8% | 80.7% | 7.50 | 8.75 | 0.71% |
+| κ 0.25 in the world, 0.25 in the model, one run | 0.76% | 0% | 0.86% | 4.40% | 55.0% | 70.3% | 7.50 | 8.50 | 0.79% |
+| κ 0.25 in the world, 0.35 in the model, one run | 0.29% | 0% | 0.29% | 1.63% | 39.2% | 56.1% | 7.00 | 8.50 | 1.15% |
+| κ 0.35 in the world, 0.25 in the model, one run | 0.19% | 0.14% | 0.48% | 6.04% | 52.6% | 64.3% | 7.50 | 9.25 | 1.17% |
+| κ 0.35 in the world, 0.35 in the model, one run | 0.095% | 0% | 0.19% | 1.79% | 38.3% | 53.2% | 7.50 | 8.75 | 0.93% |
 
 ### V10's constants
 
@@ -789,15 +790,15 @@ One constant changed at a time from V10; round trips also set the server's usabl
 
 |  | False rejects: tiny country | large country, 5 km in | Region misses the truth (tiny) | Power: 300 km | 1,000 km | 3,000 km | Median stop, s | p90 stop, s | At the cap |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| k_early 4 | 0.57% | 0.19% | 0.72% | 5.98% | 57.9% | – | 7.50 | 8.75 | 0.88% |
-| round trips 12 | 0.51% | 0.29% | 0.66% | 5.76% | 57.3% | – | 8.50 | 9.75 | 1.39% |
-| round trips 16 | 0.51% | 0.19% | 0.66% | 5.76% | 57.4% | – | 9.50 | 10.50 | 2.50% |
-| window 1000 ms | 0.46% | 0.29% | 0.55% | 5.76% | 55.1% | – | 5.25 | 7.00 | 0.56% |
-| window 3000 ms | 0.51% | 0.19% | 0.66% | 6.09% | 58.1% | – | 8.75 | 10.75 | 4.17% |
-| area ratio 1.05 | 0.57% | 0.19% | 0.72% | 5.87% | 58.0% | – | 7.75 | 9.50 | 2.98% |
-| area ratio 1.2 | 0.51% | 0.19% | 0.60% | 5.65% | 57.8% | – | 7.25 | 8.25 | 0.60% |
-| extenders 6 | 0.57% | 0.19% | 0.78% | 6.09% | 57.3% | – | 7.50 | 8.50 | 0.88% |
-| extenders 10 | 0.51% | 0.19% | 0.66% | 5.98% | 57.4% | – | 7.50 | 8.75 | 0.94% |
+| k_early 4 | 0.57% | 0.19% | 0.69% | 5.98% | 57.9% | – | 7.50 | 8.75 | 0.88% |
+| round trips 12 | 0.51% | 0.29% | 0.63% | 5.76% | 57.3% | – | 8.50 | 9.75 | 1.39% |
+| round trips 16 | 0.51% | 0.19% | 0.63% | 5.76% | 57.4% | – | 9.50 | 10.50 | 2.50% |
+| window 1000 ms | 0.46% | 0.29% | 0.52% | 5.76% | 55.1% | – | 5.25 | 7.00 | 0.56% |
+| window 3000 ms | 0.51% | 0.19% | 0.63% | 6.09% | 58.1% | – | 8.75 | 10.75 | 4.17% |
+| area ratio 1.05 | 0.57% | 0.19% | 0.69% | 5.87% | 58.0% | – | 7.75 | 9.50 | 2.98% |
+| area ratio 1.2 | 0.51% | 0.19% | 0.57% | 5.65% | 57.8% | – | 7.25 | 8.25 | 0.60% |
+| extenders 6 | 0.57% | 0.19% | 0.74% | 6.09% | 57.3% | – | 7.50 | 8.50 | 0.88% |
+| extenders 10 | 0.51% | 0.19% | 0.63% | 5.98% | 57.4% | – | 7.50 | 8.75 | 0.94% |
 
 ### Other worlds
 
@@ -805,9 +806,9 @@ After 1 run at 99%, at V11's k for the address's continent, k_early KEarly(k).
 
 |  | False rejects: tiny country | large country, 5 km in | Region misses the truth (tiny) | Power: 300 km | 1,000 km | 3,000 km | Median stop, s | p90 stop, s | At the cap |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| main | 0.52% | 0.43% | 0.60% | 5.98% | 55.4% | 70.4% | 7.50 | 8.75 | 1.05% |
-| misplaced | 0.97% | 0.29% | 1.27% | 6.20% | 56.9% | – | 7.50 | 8.75 | 0.92% |
-| normal stretch | 1.03% | 0.19% | 1.57% | 7.39% | 54.3% | – | 7.50 | 8.75 | 1.20% |
+| main | 0.52% | 0.43% | 0.63% | 5.98% | 55.4% | 70.4% | 7.50 | 8.75 | 1.05% |
+| misplaced | 0.97% | 0.29% | 1.20% | 6.20% | 56.9% | – | 7.50 | 8.75 | 0.92% |
+| normal stretch | 1.03% | 0.19% | 1.49% | 7.39% | 54.3% | – | 7.50 | 8.75 | 1.20% |
 
 ### Oceania
 
@@ -815,30 +816,30 @@ Oceania's visitors, one run each, at the textbook k, k_early 4, where V11 now ju
 
 | Oceania | Region misses the truth, 99% (tiny) | False rejects, 99%: tiny | large country, 5 km in | real countries | real countries, 99.9% | Power, 99%: 300 km | 1,000 km | σ_major, km | b held at 0 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| base: the study's world | 3.10% (2.12–4.50) | 2.00% | 2.00% | 0.75% | 0.75% | 2.29% | 62.0% | 557 | 20.9% |
-| normal stretch: the route stretch normal and unfloored: no long tail of detours | 3.76% (2.66–5.29) | 2.42% | 1.33% | 0.75% | 0.75% | 2.29% | 65.0% | 581 | 20.2% |
-| no long-path error: no route error on paths of 2,500 km or more | 2.88% (1.97–4.19) | 1.67% | 1.00% | 0.50% | 0.25% | 4.00% | 68.0% | 471 | 6.42% |
-| no short-path error: no route error on paths under 2,500 km | 4.02% (2.89–5.57) | 2.58% | 2.00% | 1.00% | 1.00% | 2.29% | 59.0% | 503 | 20.2% |
-| no place error: every extender exactly at its place | 3.58% (2.52–5.06) | 2.33% | 2.33% | 0.75% | 0.75% | 2.29% | 66.0% | 560 | 21.1% |
-| ideal pings: no queue, jitter, spike or loss | 3.19% (2.20–4.60) | 2.00% | 2.00% | 0.75% | 0.75% | 1.71% | 65.0% | 554 | 22.4% |
-| denser fleet: 9 more extenders: Adelaide, Canberra, Hobart, Darwin, Wellington, Christchurch, Port Moresby, Suva, Nouméa | 0.35% (0.14–0.90) | 0.25% | 0% | 0% | 0% | 20.6% | 96.0% | 275 | 5.50% |
-| model κ 0.30: the model's κ 0.30 for Oceania (a κ calibrated per continent, V4) | 1.53% (0.88–2.66) | 0.92% | 2.00% | 0.75% | 0.75% | 0.57% | 46.0% | 606 | 20.6% |
-| model κ 0.35: the model's κ 0.35 for Oceania | 1.38% (0.75–2.52) | 0.83% | 2.00% | 0.75% | 0.75% | 0.57% | 43.0% | 656 | 20.7% |
-| model κ 0.45: the model's κ 0.45 for Oceania | 1.48% (0.78–2.78) | 0.67% | 1.67% | 0.75% | 0.75% | 0% | 29.0% | 757 | 21.0% |
-| s_ext by distance: each extender's place error at least 5% of its distance from the address's place, within lagdrift's [10, 100] km hold | 3.11% (2.13–4.52) | 2.00% | 2.00% | 0.75% | 0.75% | 1.71% | 62.0% | 561 | 20.8% |
+| base: the study's world | 3.27% (2.40–4.44) | 2.00% | 2.00% | 0.75% | 0.75% | 2.29% | 62.0% | 852 | 20.9% |
+| normal stretch: the route stretch normal and unfloored: no long tail of detours | 3.86% (2.91–5.11) | 2.42% | 1.33% | 0.75% | 0.75% | 2.29% | 65.0% | 896 | 20.2% |
+| no long-path error: no route error on paths of 2,500 km or more | 2.60% (1.84–3.67) | 1.67% | 1.00% | 0.50% | 0.25% | 4.00% | 68.0% | 722 | 6.42% |
+| no short-path error: no route error on paths under 2,500 km | 3.69% (2.76–4.92) | 2.58% | 2.00% | 1.00% | 1.00% | 2.29% | 59.0% | 776 | 20.2% |
+| no place error: every extender exactly at its place | 3.36% (2.47–4.54) | 2.33% | 2.33% | 0.75% | 0.75% | 2.29% | 66.0% | 857 | 21.1% |
+| ideal pings: no queue, jitter, spike or loss | 3.35% (2.47–4.53) | 2.00% | 2.00% | 0.75% | 0.75% | 1.71% | 65.0% | 843 | 22.4% |
+| denser fleet: 9 more extenders: Adelaide, Canberra, Hobart, Darwin, Wellington, Christchurch, Port Moresby, Suva, Nouméa | 0.33% (0.13–0.86) | 0.25% | 0% | 0% | 0% | 20.6% | 96.0% | 283 | 5.50% |
+| model κ 0.30: the model's κ 0.30 for Oceania (a κ calibrated per continent, V4) | 1.59% (1.02–2.48) | 0.92% | 2.00% | 0.75% | 0.75% | 0.57% | 46.0% | 992 | 20.6% |
+| model κ 0.35: the model's κ 0.35 for Oceania | 1.26% (0.76–2.07) | 0.83% | 2.00% | 0.75% | 0.75% | 0.57% | 43.0% | 1143 | 20.7% |
+| model κ 0.45: the model's κ 0.45 for Oceania | 1.17% (0.70–1.96) | 0.67% | 1.67% | 0.75% | 0.75% | 0% | 29.0% | 1455 | 21.0% |
+| s_ext by distance: each extender's place error at least 5% of its distance from the address's place, within lagdrift's [10, 100] km hold | 3.27% (2.40–4.44) | 2.00% | 2.00% | 0.75% | 0.75% | 1.71% | 62.0% | 860 | 20.8% |
 
 The base world per city:
 
 | City | Tiny: visitors | region misses, 99% | σ_major, km | Real country: false rejects, 99% | 99.9% | distance to the border, km |
 |---|--:|--:|--:|--:|--:|--:|
-| Sydney | 150 | 0% | 279 | 0% | 0% | 9 |
-| Melbourne | 150 | 0% | 604 | 0% | 0% | 10 |
-| Brisbane | 150 | 0% | 479 | 0% | 0% | 13 |
-| Perth | 150 | 0% | 842 | 0% | 0% | 10 |
-| Adelaide | 150 | 2.13% | 474 | 0% | 0% | 10 |
-| Auckland | 150 | 16.7% | 1216 | 0% | 0% | 2 |
-| Wellington | 150 | 13.0% | 1268 | 0% | 0% | 2 |
-| Christchurch | 150 | 30.0% | 1198 | 6.00% | 6.00% | 8 |
+| Sydney | 150 | 0% | 290 | 0% | 0% | 9 |
+| Melbourne | 150 | 0% | 607 | 0% | 0% | 10 |
+| Brisbane | 150 | 0.67% | 483 | 0% | 0% | 13 |
+| Perth | 150 | 0% | 843 | 0% | 0% | 10 |
+| Adelaide | 150 | 2.04% | 480 | 0% | 0% | 10 |
+| Auckland | 150 | 4.67% | 3812 | 0% | 0% | 2 |
+| Wellington | 150 | 8.67% | 2229 | 0% | 0% | 2 |
+| Christchurch | 150 | 10.1% | 2166 | 6.00% | 6.00% | 8 |
 
 ### What a fit costs
 
@@ -846,12 +847,12 @@ By who fits and what. In the study: every fit's wall-clock duration, shown as th
 
 | Fit | In the study: fits | mean, ms | p50 under, ms | p95 under, ms | One at a time: fits | p50, ms | p90, ms | p95, ms | p99, ms | most, ms |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| the frame's full fit, one run | 1,901,952 | 0.91 | 0.5 | 4 | 1491 | 0.40 | 0.97 | 1.21 | 1.86 | 3.72 |
-| the frame's full fit, pooled runs | 2,729,885 | 2.56 | 2 | 16 | 1466 | 1.05 | 2.33 | 3.00 | 5.44 | 9.08 |
-| the server's fit, one run | 404,429 | 0.94 | 0.5 | 4 | 1471 | 0.42 | 0.87 | 1.08 | 1.67 | 2.75 |
-| the server's fit, pooled runs | 453,334 | 2.91 | 2 | 16 | 1456 | 1.16 | 2.40 | 3.00 | 4.59 | 14.61 |
-| the frame's warm refit, one run | 4,311,965 | 0.09 | 0.25 | 0.25 | 1493 | 0.03 | 0.10 | 0.14 | 0.27 | 0.82 |
-| the frame's warm refit, pooled runs | 5,840,097 | 0.27 | 0.25 | 1 | 1500 | 0.09 | 0.28 | 0.39 | 0.66 | 1.48 |
+| the frame's full fit, one run | 1,901,930 | 1.09 | 0.5 | 4 | 1491 | 0.38 | 0.89 | 1.10 | 2.19 | 3.33 |
+| the frame's full fit, pooled runs | 2,729,830 | 2.89 | 2 | 16 | 1466 | 1.06 | 2.37 | 3.18 | 5.50 | 9.31 |
+| the server's fit, one run | 404,423 | 1.18 | 0.5 | 4 | 1471 | 0.42 | 0.88 | 1.06 | 1.64 | 2.12 |
+| the server's fit, pooled runs | 453,325 | 3.37 | 2 | 16 | 1455 | 1.19 | 2.31 | 2.95 | 4.50 | 9.63 |
+| the frame's warm refit, one run | 4,311,883 | 0.11 | 0.25 | 0.25 | 1493 | 0.03 | 0.10 | 0.14 | 0.28 | 0.90 |
+| the frame's warm refit, pooled runs | 5,839,854 | 0.32 | 0.25 | 1 | 1500 | 0.10 | 0.29 | 0.40 | 0.67 | 1.63 |
 
 ### Checks against lagdrift
 
@@ -859,61 +860,61 @@ The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide
 
 | Part | EvaluateStop checks | disagree | Decide checks | disagree | Warm refits | moved ≥ 1 km | farthest, km | Grids | lower χ² | lower by > 1 | largest drop |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| main | 0 | 0 | 11,125 | 0 | 11,125 | 0% | 0.1 | 1119 | 23 | 8 | 62.44 |
-| staggered sessions | 0 | 0 | 8369 | 0 | 8369 | 0% | 0.1 | 917 | 19 | 8 | 19.50 |
-| no early stop | 0 | 0 | 959 | 0 | 959 | 0% | 0.1 | 321 | 13 | 5 | 1.87 |
-| cadence: refits | 0 | 0 | 2579 | 0 | 2579 | 0% | 0.1 | 259 | 11 | 0 | 0.80 |
-| cadence: full fits | 29,555 | 0 | 2576 | 0 | 2576 | 0% | 0.1 | 259 | 11 | 0 | 0.80 |
-| κ 0.15/0.15 | 0 | 0 | 528 | 0 | 528 | 0% | 0.1 | 175 | 1 | 0 | 0.91 |
-| κ 0.15/0.25 | 0 | 0 | 515 | 0 | 515 | 0% | 0.1 | 167 | 2 | 1 | 1.60 |
-| κ 0.25/0.15 | 0 | 0 | 532 | 0 | 532 | 0% | 0.1 | 176 | 6 | 1 | 4.75 |
-| κ 0.25/0.25 | 0 | 0 | 512 | 0 | 512 | 0% | 0.1 | 168 | 5 | 3 | 3.31 |
-| κ 0.25/0.35 | 0 | 0 | 494 | 0 | 494 | 0% | 0.1 | 159 | 7 | 1 | 1.68 |
-| κ 0.35/0.25 | 0 | 0 | 499 | 0 | 499 | 0% | 0.1 | 167 | 3 | 1 | 1.09 |
-| κ 0.35/0.35 | 0 | 0 | 488 | 0 | 488 | 0% | 0.1 | 160 | 4 | 2 | 1.41 |
-| stop rule | 0 | 0 | 3552 | 0 | 3552 | 0% | 0.1 | 1187 | 22 | 18 | 16.99 |
-| misplaced | 0 | 0 | 657 | 0 | 657 | 0% | 0.1 | 219 | 4 | 3 | 2.77 |
-| normal stretch | 0 | 0 | 658 | 0 | 658 | 0% | 0.1 | 220 | 5 | 2 | 2.28 |
-| V11: lag.dev tracks | 0 | 0 | 8168 | 0 | 8168 | 0% | 0.1 | 2714 | 121 | 24 | 2.82 |
-| V11 drift: default k | 0 | 0 | 4347 | 0 | 4347 | 0% | 0.1 | 484 | 11 | 2 | 2.94 |
-| V11 drift: lag k | 0 | 0 | 4349 | 0 | 4349 | 0% | 0.1 | 484 | 11 | 2 | 2.94 |
-| V11 table | 0 | 0 | 9818 | 0 | 9818 | 0% | 0.1 | 1068 | 41 | 19 | 6.05 |
-| late sessions: stops on 4 | 0 | 0 | 10,229 | 0 | 10,229 | 0% | 0.1 | 1113 | 28 | 11 | 22.22 |
-| late sessions: stops on usable | 0 | 0 | 10,334 | 0 | 10,334 | 0% | 0.1 | 1128 | 26 | 9 | 2.98 |
-| calibration: base | 0 | 0 | 387 | 0 | 387 | 0% | 0.1 | 129 | 6 | 0 | 0.80 |
-| calibration: ideal pings | 0 | 0 | 386 | 0 | 386 | 0% | 0.1 | 128 | 5 | 0 | 0.58 |
-| calibration: no place error | 0 | 0 | 387 | 0 | 387 | 0% | 0.1 | 129 | 5 | 0 | 0.50 |
-| calibration: normal stretch | 0 | 0 | 379 | 0 | 379 | 0% | 0.1 | 126 | 3 | 0 | 0.86 |
-| calibration: model's world | 0 | 0 | 380 | 0 | 380 | 0% | 0.1 | 126 | 4 | 1 | 1.52 |
-| starts: lagdrift | 0 | 0 | 416 | 0 | 416 | 0% | 0.1 | 137 | 2 | 1 | 8.12 |
-| starts: wide | 0 | 0 | 414 | 0 | 414 | 0% | 0.1 | 137 | 1 | 0 | 0.23 |
-| VPN dense: E2 | 0 | 0 | 1953 | 0 | 1953 | 0% | 0.1 | 164 | 1 | 1 | 3.61 |
-| VPN dense: joint spread | 0 | 0 | 1812 | 0 | 1812 | 0% | 0.1 | 156 | 4 | 2 | 3.05 |
-| VPN dense: VPN hubs | 0 | 0 | 1749 | 0 | 1749 | 0% | 0.1 | 166 | 4 | 2 | 16.99 |
-| VPN dense: information | 0 | 0 | 1765 | 0 | 1765 | 0% | 0.1 | 152 | 9 | 4 | 5.11 |
-| VPN dense: information ring | 0 | 0 | 1894 | 0 | 1894 | 0% | 0.1 | 176 | 13 | 4 | 17.60 |
-| VPN dense: ring mid band | 0 | 0 | 1932 | 0 | 1932 | 0% | 0.1 | 156 | 6 | 3 | 3.59 |
-| VPN dense: hybrid | 0 | 0 | 1984 | 0 | 1984 | 0% | 0.1 | 164 | 2 | 0 | 0.84 |
-| VPN sparse: E2 | 0 | 0 | 1842 | 0 | 1842 | 0% | 0.1 | 172 | 1 | 0 | 0.13 |
-| VPN sparse: joint spread | 0 | 0 | 1821 | 0 | 1821 | 0% | 0.1 | 168 | 1 | 0 | 0.58 |
-| VPN sparse: VPN hubs | 0 | 0 | 1822 | 0 | 1822 | 0% | 0.1 | 175 | 5 | 2 | 2.83 |
-| VPN sparse: information | 0 | 0 | 1894 | 0 | 1894 | 0% | 0.1 | 162 | 7 | 4 | 2.53 |
-| VPN sparse: information ring | 0 | 0 | 1956 | 0 | 1956 | 0% | 0.1 | 183 | 6 | 3 | 4.99 |
-| VPN sparse: ring mid band | 0 | 0 | 1973 | 0 | 1973 | 0% | 0.1 | 181 | 3 | 1 | 1.18 |
-| VPN sparse: hybrid | 0 | 0 | 1839 | 0 | 1839 | 0% | 0.1 | 173 | 1 | 0 | 0.13 |
-| interrupted: counted | 0 | 0 | 951 | 0 | 951 | 0% | 0.1 | 316 | 17 | 6 | 18.11 |
-| interrupted: review's rule | 0 | 0 | 564 | 0 | 564 | 0% | 0.1 | 190 | 10 | 4 | 18.11 |
-| Oceania: base | 0 | 0 | 224 | 0 | 224 | 0% | 0.1 | 78 | 2 | 0 | 0.71 |
-| Oceania: normal stretch | 0 | 0 | 219 | 0 | 219 | 0% | 0.1 | 76 | 1 | 0 | 0.90 |
-| Oceania: no long-path error | 0 | 0 | 241 | 0 | 241 | 0% | 0.1 | 80 | 1 | 0 | 0.01 |
-| Oceania: no short-path error | 0 | 0 | 223 | 0 | 223 | 0% | 0.1 | 76 | 2 | 1 | 3.42 |
-| Oceania: no place error | 0 | 0 | 222 | 0 | 222 | 0% | 0.1 | 77 | 1 | 1 | 2.14 |
-| Oceania: ideal pings | 0 | 0 | 226 | 0 | 226 | 0% | 0.1 | 78 | 2 | 0 | 0.67 |
-| Oceania: denser fleet | 0 | 0 | 300 | 0 | 300 | 0% | 0.1 | 99 | 5 | 2 | 2.73 |
-| Oceania: model κ 0.30 | 0 | 0 | 204 | 0 | 204 | 0% | 0.1 | 72 | 2 | 0 | 0.49 |
-| Oceania: model κ 0.35 | 0 | 0 | 187 | 0 | 187 | 0% | 0.1 | 63 | 3 | 1 | 1.39 |
-| Oceania: model κ 0.45 | 0 | 0 | 159 | 0 | 159 | 0% | 0.1 | 50 | 3 | 0 | 0.85 |
-| Oceania: s_ext by distance | 0 | 0 | 224 | 0 | 224 | 0% | 0.1 | 78 | 2 | 0 | 0.68 |
+| main | 0 | 0 | 11,623 | 0 | 11,623 | 0% | 0.1 | 1191 | 24 | 9 | 62.44 |
+| staggered sessions | 0 | 0 | 8746 | 0 | 8746 | 0% | 0.1 | 973 | 20 | 9 | 19.50 |
+| no early stop | 0 | 0 | 996 | 0 | 996 | 0% | 0.1 | 336 | 13 | 5 | 1.87 |
+| cadence: refits | 0 | 0 | 2666 | 0 | 2666 | 0% | 0.1 | 269 | 11 | 0 | 0.80 |
+| cadence: full fits | 29,555 | 0 | 2665 | 0 | 2665 | 0% | 0.1 | 269 | 11 | 0 | 0.80 |
+| κ 0.15/0.15 | 0 | 0 | 550 | 0 | 550 | 0% | 0.1 | 186 | 1 | 0 | 0.91 |
+| κ 0.15/0.25 | 0 | 0 | 548 | 0 | 548 | 0% | 0.1 | 183 | 2 | 1 | 1.60 |
+| κ 0.25/0.15 | 0 | 0 | 554 | 0 | 554 | 0% | 0.1 | 186 | 6 | 1 | 4.75 |
+| κ 0.25/0.25 | 0 | 0 | 548 | 0 | 548 | 0% | 0.1 | 183 | 5 | 3 | 3.31 |
+| κ 0.25/0.35 | 0 | 0 | 549 | 0 | 549 | 0% | 0.1 | 184 | 8 | 2 | 1.68 |
+| κ 0.35/0.25 | 0 | 0 | 546 | 0 | 546 | 0% | 0.1 | 184 | 4 | 1 | 1.09 |
+| κ 0.35/0.35 | 0 | 0 | 548 | 0 | 548 | 0% | 0.1 | 184 | 4 | 2 | 1.41 |
+| stop rule | 0 | 0 | 3707 | 0 | 3707 | 0% | 0.1 | 1230 | 24 | 20 | 16.99 |
+| misplaced | 0 | 0 | 683 | 0 | 683 | 0% | 0.1 | 226 | 4 | 3 | 2.77 |
+| normal stretch | 0 | 0 | 687 | 0 | 687 | 0% | 0.1 | 230 | 5 | 2 | 2.28 |
+| V11: lag.dev tracks | 0 | 0 | 9935 | 0 | 9935 | 0% | 0.1 | 3310 | 130 | 25 | 5.38 |
+| V11 drift: default k | 0 | 0 | 4508 | 0 | 4508 | 0% | 0.1 | 502 | 11 | 2 | 2.94 |
+| V11 drift: lag k | 0 | 0 | 4507 | 0 | 4507 | 0% | 0.1 | 502 | 11 | 2 | 2.94 |
+| V11 table | 0 | 0 | 10,282 | 0 | 10,282 | 0% | 0.1 | 1131 | 42 | 19 | 6.05 |
+| late sessions: stops on 4 | 0 | 0 | 10,695 | 0 | 10,695 | 0% | 0.1 | 1179 | 28 | 11 | 22.22 |
+| late sessions: stops on usable | 0 | 0 | 10,787 | 0 | 10,787 | 0% | 0.1 | 1184 | 26 | 9 | 2.98 |
+| calibration: base | 0 | 0 | 400 | 0 | 400 | 0% | 0.1 | 134 | 6 | 0 | 0.80 |
+| calibration: ideal pings | 0 | 0 | 399 | 0 | 399 | 0% | 0.1 | 133 | 6 | 1 | 10.65 |
+| calibration: no place error | 0 | 0 | 400 | 0 | 400 | 0% | 0.1 | 134 | 5 | 0 | 0.50 |
+| calibration: normal stretch | 0 | 0 | 400 | 0 | 400 | 0% | 0.1 | 134 | 3 | 0 | 0.86 |
+| calibration: model's world | 0 | 0 | 399 | 0 | 399 | 0% | 0.1 | 133 | 4 | 1 | 1.52 |
+| starts: lagdrift | 0 | 0 | 467 | 0 | 467 | 0% | 0.1 | 156 | 2 | 1 | 8.12 |
+| starts: wide | 0 | 0 | 467 | 0 | 467 | 0% | 0.1 | 156 | 1 | 0 | 0.23 |
+| VPN dense: E2 | 0 | 0 | 2096 | 0 | 2096 | 0% | 0.1 | 196 | 1 | 1 | 3.61 |
+| VPN dense: joint spread | 0 | 0 | 2031 | 0 | 2031 | 0% | 0.1 | 195 | 5 | 3 | 3.23 |
+| VPN dense: VPN hubs | 0 | 0 | 1940 | 0 | 1940 | 0% | 0.1 | 188 | 5 | 2 | 16.99 |
+| VPN dense: information | 0 | 0 | 1958 | 0 | 1958 | 0% | 0.1 | 194 | 9 | 4 | 5.11 |
+| VPN dense: information ring | 0 | 0 | 2040 | 0 | 2040 | 0% | 0.1 | 192 | 13 | 4 | 17.60 |
+| VPN dense: ring mid band | 0 | 0 | 2038 | 0 | 2038 | 0.049% | 107.5 | 192 | 6 | 3 | 3.59 |
+| VPN dense: hybrid | 0 | 0 | 2126 | 0 | 2126 | 0% | 0.1 | 197 | 2 | 0 | 0.84 |
+| VPN sparse: E2 | 0 | 0 | 1951 | 0 | 1951 | 0% | 0.1 | 195 | 1 | 0 | 0.13 |
+| VPN sparse: joint spread | 0 | 0 | 1956 | 0 | 1956 | 0% | 0.1 | 194 | 2 | 1 | 2.61 |
+| VPN sparse: VPN hubs | 0 | 0 | 1948 | 0 | 1948 | 0.10% | 1355.2 | 196 | 5 | 2 | 2.83 |
+| VPN sparse: information | 0 | 0 | 2003 | 0 | 2003 | 0% | 0.1 | 196 | 7 | 4 | 2.53 |
+| VPN sparse: information ring | 0 | 0 | 2017 | 0 | 2017 | 0% | 0.1 | 204 | 7 | 3 | 4.99 |
+| VPN sparse: ring mid band | 0 | 0 | 2037 | 0 | 2037 | 0.049% | 2004.4 | 197 | 4 | 1 | 1.18 |
+| VPN sparse: hybrid | 0 | 0 | 1942 | 0 | 1942 | 0% | 0.1 | 196 | 1 | 0 | 0.13 |
+| interrupted: counted | 0 | 0 | 1083 | 0 | 1082 | 0% | 0.1 | 360 | 17 | 6 | 18.11 |
+| interrupted: review's rule | 0 | 0 | 596 | 0 | 596 | 0% | 0.1 | 199 | 10 | 4 | 18.11 |
+| Oceania: base | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 2 | 0 | 0.71 |
+| Oceania: normal stretch | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 1 | 0 | 0.90 |
+| Oceania: no long-path error | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 1 | 0 | 0.01 |
+| Oceania: no short-path error | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 3 | 2 | 3.42 |
+| Oceania: no place error | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 1 | 1 | 2.14 |
+| Oceania: ideal pings | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 2 | 0 | 0.67 |
+| Oceania: denser fleet | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 5 | 2 | 2.73 |
+| Oceania: model κ 0.30 | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 2 | 0 | 0.49 |
+| Oceania: model κ 0.35 | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 3 | 1 | 1.39 |
+| Oceania: model κ 0.45 | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 3 | 0 | 0.85 |
+| Oceania: s_ext by distance | 0 | 0 | 310 | 0 | 310 | 0% | 0.1 | 103 | 2 | 0 | 0.68 |
 
 - main: visitor 693 (Europe, Lille) 0@30|8: χ² 7.10 at 50.272,3.688, 62 km from the truth; a start converges to χ² 4.15 at 54.199,9.025, 568 km away and 561 km from the truth
 - main: visitor 1512 (North America, Buffalo) 0@21|8: χ² 4.98 at 42.620,-78.875, 37 km from the truth; a start converges to χ² 3.60 at 46.018,-78.214, 381 km away and 345 km from the truth
@@ -930,6 +931,7 @@ The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide
 - κ 0.25/0.25: visitor 1386 (Asia, Bangalore) 0@39|8: χ² 5.71 at 14.388,79.141, 237 km from the truth; a start converges to χ² 3.69 at 8.921,78.282, 615 km away and 443 km from the truth
 - κ 0.25/0.25: visitor 1575 (Africa, Kampala) 0@32|8: χ² 9.65 at 1.607,33.495, 175 km from the truth; a start converges to χ² 6.34 at -1.789,43.644, 1190 km away and 1260 km from the truth
 - κ 0.25/0.35: visitor 1575 (Africa, Kampala) 0@32|8: χ² 4.94 at 1.600,33.450, 171 km from the truth; a start converges to χ² 3.26 at -1.624,43.573, 1181 km away and 1249 km from the truth
+- κ 0.25/0.35: visitor 3444 (Eastern Europe, Middle East, Chisinau) 0@19|8: χ² 3.68 at 63.316,-20.088, 3475 km from the truth; a start converges to χ² 2.64 at 49.510,28.444, 3251 km away and 283 km from the truth
 - κ 0.35/0.25: visitor 2961 (Africa, Durban) 0@32|8: χ² 3.00 at -23.635,24.517, 952 km from the truth; a start converges to χ² 1.91 at -30.648,36.476, 1416 km away and 533 km from the truth
 - κ 0.35/0.35: visitor 693 (South America, Porto Alegre) 0@31|8: χ² 5.10 at -27.554,-56.271, 563 km from the truth; a start converges to χ² 3.68 at -39.915,-43.828, 1789 km away and 1291 km from the truth
 - κ 0.35/0.35: visitor 3423 (Eastern Europe, Middle East, Kyiv) 0@20|8: χ² 5.53 at 43.581,28.688, 772 km from the truth; a start converges to χ² 4.44 at 41.451,21.413, 641 km away and 1214 km from the truth
@@ -957,10 +959,12 @@ The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide
 - late sessions: stops on usable: visitor 693 (Europe, Lille) 0@30|8: χ² 7.10 at 50.272,3.688, 62 km from the truth; a start converges to χ² 4.15 at 54.199,9.025, 568 km away and 561 km from the truth
 - late sessions: stops on usable: visitor 693 (Europe, Lille) 0@33|12: χ² 7.07 at 50.252,3.718, 65 km from the truth; a start converges to χ² 4.09 at 54.233,9.115, 575 km away and 568 km from the truth
 - late sessions: stops on usable: visitor 1512 (North America, Buffalo) 0@21|8: χ² 4.98 at 42.620,-78.875, 37 km from the truth; a start converges to χ² 3.60 at 46.018,-78.214, 381 km away and 345 km from the truth
+- calibration: ideal pings: visitor 2730 (Oceania, Wellington) 0@31|8: χ² 21.59 at -36.851,174.874, 494 km from the truth; a start converges to χ² 10.94 at -35.020,-166.484, 1688 km away and 1784 km from the truth
 - calibration: model's world: visitor 399 (North America, Boston) 0@27|8: χ² 8.96 at 42.720,-71.728, 69 km from the truth; a start converges to χ² 7.44 at 42.108,-66.902, 402 km away and 341 km from the truth
 - starts: lagdrift: visitor 2541 (Eastern Europe, Middle East, Moscow) 0@24|8: χ² 14.68 at 60.300,20.410, 1118 km from the truth; a start converges to χ² 6.56 at 57.129,41.657, 1270 km away and 294 km from the truth
 - VPN dense: E2: visitor 0 (Europe, Paris) 0@48|8: χ² 5.09 at 51.807,2.900, 329 km from the truth; a start converges to χ² 1.48 at 49.930,-5.702, 638 km away and 608 km from the truth
 - VPN dense: joint spread: visitor 0 (Europe, Paris) 0@48|8: χ² 4.56 at 52.037,2.516, 353 km from the truth; a start converges to χ² 1.51 at 49.239,-5.638, 653 km away and 597 km from the truth
+- VPN dense: joint spread: visitor 1176 (North America, Buffalo) 0@36|8: χ² 4.65 at 35.549,-178.351, 8088 km from the truth; a start converges to χ² 1.42 at 31.088,-93.714, 7625 km away and 1844 km from the truth
 - VPN dense: joint spread: visitor 3129 (Europe, Paris) 0@48|8: χ² 5.91 at 50.548,8.770, 496 km from the truth; a start converges to χ² 4.19 at 47.716,1.501, 615 km away and 146 km from the truth
 - VPN dense: VPN hubs: visitor 2961 (Africa, Abuja) 0@30|8: χ² 5.70 at 9.080,7.909, 61 km from the truth; a start converges to χ² 3.46 at -0.296,-6.381, 1895 km away and 1851 km from the truth
 - VPN dense: VPN hubs: visitor 3339 (Africa, Lagos) 0@33|8: χ² 27.55 at 40.825,31.545, 4723 km from the truth; a start converges to χ² 10.56 at 7.144,12.744, 4183 km away and 1039 km from the truth
@@ -973,6 +977,7 @@ The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide
 - VPN dense: ring mid band: visitor 651 (Eastern Europe, Middle East, Moscow) 0@13|8: χ² 8.01 at 58.933,19.806, 1119 km from the truth; a start converges to χ² 4.42 at 61.924,49.222, 1633 km away and 945 km from the truth
 - VPN dense: ring mid band: visitor 924 (Eastern Europe, Middle East, Ankara) 0@22|8: χ² 17.53 at 34.671,23.950, 989 km from the truth; a start converges to χ² 15.93 at 40.035,29.010, 745 km away and 337 km from the truth
 - VPN dense: ring mid band: visitor 1428 (Europe, Basel) 0@20|8: χ² 5.04 at 47.468,7.478, 16 km from the truth; a start converges to χ² 3.85 at 46.443,11.032, 293 km away and 302 km from the truth
+- VPN sparse: joint spread: visitor 1134 (Europe, Birmingham) 0@22|8: χ² 5.68 at 19.954,-5.192, 3633 km from the truth; a start converges to χ² 3.07 at 55.032,-5.705, 3901 km away and 376 km from the truth
 - VPN sparse: VPN hubs: visitor 672 (Eastern Europe, Middle East, Riyadh) 0@18|8: χ² 1.81 at 26.503,44.393, 317 km from the truth; a start converges to χ² 0.75 at -3.699,38.196, 3424 km away and 3284 km from the truth
 - VPN sparse: VPN hubs: visitor 903 (North America, Calgary) 0@33|8: χ² 11.52 at 44.634,-109.796, 770 km from the truth; a start converges to χ² 8.69 at 18.586,-107.182, 2907 km away and 3651 km from the truth
 - VPN sparse: information: visitor 672 (Eastern Europe, Middle East, Riyadh) 0@22|8: χ² 3.16 at 27.908,45.094, 401 km from the truth; a start converges to χ² 0.64 at -4.026,37.957, 3632 km away and 3326 km from the truth
@@ -989,6 +994,7 @@ The study's stops and verdicts against lagdrift.EvaluateStop and lagdrift.Decide
 - interrupted: review's rule: visitor 1533 (North America, Austin) 0@21|8: χ² 6.24 at 29.942,-97.636, 50 km from the truth; a start converges to χ² 4.69 at 31.023,-91.777, 574 km away and 574 km from the truth
 - interrupted: review's rule: visitor 3528 (Europe, Basel) 0@22|8: χ² 21.14 at 53.194,30.184, 1719 km from the truth; a start converges to χ² 3.02 at 62.537,-22.650, 3189 km away and 2503 km from the truth
 - Oceania: no short-path error: visitor 1260 (Oceania, Adelaide) 0@48|8: χ² 13.72 at -36.066,141.971, 342 km from the truth; a start converges to χ² 10.30 at -46.154,144.373, 1140 km away and 1342 km from the truth
+- Oceania: no short-path error: visitor 1827 (Oceania, Christchurch) 0@48|8: χ² 3.88 at -46.868,173.563, 370 km from the truth; a start converges to χ² 2.50 at -18.296,-175.474, 3331 km away and 3032 km from the truth
 - Oceania: no place error: visitor 924 (Oceania, Adelaide) 0@33|8: χ² 10.92 at -35.436,144.052, 495 km from the truth; a start converges to χ² 8.78 at -44.492,147.858, 1058 km away and 1322 km from the truth
 - Oceania: denser fleet: visitor 231 (Oceania, Christchurch) 0@26|8: χ² 7.47 at -41.881,172.489, 181 km from the truth; a start converges to χ² 4.73 at -47.151,-179.832, 844 km away and 715 km from the truth
 - Oceania: denser fleet: visitor 1302 (Oceania, Wellington) 0@23|8: χ² 6.60 at -40.942,173.626, 100 km from the truth; a start converges to χ² 5.59 at -42.079,178.320, 411 km away and 312 km from the truth
