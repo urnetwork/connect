@@ -4728,6 +4728,7 @@ paths:
                         renews: false
                         indicative_tao: "0.003547"
                     auto_min_daily_cap_gamma: "40"
+                    daily_cap_gamma: "50"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
                     updated_at: "2026-11-11T12:00:00Z"
@@ -4783,6 +4784,7 @@ paths:
                         renews: false
                         indicative_tao: ""
                     auto_min_daily_cap_gamma: "40"
+                    daily_cap_gamma: "50"
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
                     updated_at: "2026-11-10T19:30:00Z"
@@ -4940,6 +4942,7 @@ paths:
                     spender: ""
                     min_daily_cap_gamma: "40"
                     auto_min_daily_cap_gamma: "40"
+                    mint_daily_cap_gamma: "50"
                     min_mint_gamma: "0.1"
                     indicative_tao: "0.189165"
                     mint_available: true
@@ -8655,11 +8658,12 @@ paths:
                     spender: ""
                     min_daily_cap_gamma: "89.97"
                     auto_min_daily_cap_gamma: "89.97"
+                    mint_daily_cap_gamma: "113"
                     min_mint_gamma: "0.1"
                     indicative_tao: "0.423592"
                     mint_available: true
-                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 50 --dry-run
-                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 50 -w <your_coldkey>
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 113 --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 113 -w <your_coldkey>
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: ""
                     expires_at: "2026-11-15T12:00:00Z"
