@@ -12744,7 +12744,8 @@ paths:
         loaded the custom-host map version it entered with and passed the dns
         edges' route probes (sidecar DESIGN.md §13.4), and one that is not names
         those interfaces in `pending_interfaces`. A device starts a TLS-ALPN-01
-        order only for a ready host; DNS-01 never waits.
+        order only for a ready host; DNS-01 never waits. Each custom domain lists
+        the DKIM CNAMEs it owes, looked up at each read.
       operationId: networkDns
       security:
         - BearerAuth: []
@@ -32235,6 +32236,21 @@ components:
           type: string
         acme_challenge_target:
           description: <acme_token>.acme.<root>, with no final dot.
+          type: string
+        dkim_cnames:
+          description: The per-selector DKIM CNAMEs the domain owes at this read (QD-1130); absent when it owes none.
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsDkimCname"
+    DnsDkimCname:
+      type: object
+      required: [name, target]
+      properties:
+        name:
+          description: "`<sel>._domainkey.<domain>`, with no final dot."
+          type: string
+        target:
+          description: "`<sel>._domainkey.<label>.<root>`, with no final dot."
           type: string
     DnsLabelReclaimRequest:
       type: object
