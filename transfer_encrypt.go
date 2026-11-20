@@ -563,6 +563,11 @@ type EncryptionEvent struct {
 	// Reason is the short human-readable cause for failure/blocked events
 	// (empty for `EncryptionEventSealed`).
 	Reason string
+	// CancellationSource is the first cancellation of the handshake epoch's
+	// context observed before failure cleanup. Set only on context-canceled
+	// establishment failures. It identifies a lifetime transition, not the
+	// caller's intent or the outcome of an application flow.
+	CancellationSource string `json:",omitempty"`
 }
 
 // PeerEncryptionState is the aggregated per-peer encryption status across the
@@ -1025,9 +1030,9 @@ type tlsHandshakeEpoch struct {
 // ReceiveSequence that talks to the same peer/stream. The session lives
 // inside `EncryptionSessionManager`.
 type peerEncryptionSession struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers *lifecycleAdmission
+	ctx         context.Context
+	cancelCause context.CancelCauseFunc
+	workers     *lifecycleAdmission
 
 	manager *EncryptionSessionManager
 	client  *Client
@@ -1220,7 +1225,7 @@ func newPeerEncryptionSession(
 	// companion is the session's identity companion (see the `companion` field).
 	companion bool,
 ) *peerEncryptionSession {
-	ctx, cancel := context.WithCancel(parentCtx)
+	ctx, cancel := context.WithCancelCause(parentCtx)
 	// Client carrier rides the identity bit; a server reply always rides
 	// EncryptionControlUseCompanion.
 	carrierCompanion := companion
@@ -1229,7 +1234,7 @@ func newPeerEncryptionSession(
 	}
 	s := &peerEncryptionSession{
 		ctx:              ctx,
-		cancel:           cancel,
+		cancelCause:      cancel,
 		workers:          newLifecycleAdmission(),
 		manager:          manager,
 		client:           client,
@@ -1285,7 +1290,7 @@ func (self *peerEncryptionSession) startWorker(
 // mirroring the SendBuffer / SendSequence pattern.
 func (self *peerEncryptionSession) Run() {
 	defer func() {
-		self.cancel()
+		self.cancelCause(tlsSessionRetired)
 		self.closeTls()
 		self.workers.close()
 		if self.beforeWorkerWaitForTest != nil {
@@ -1504,10 +1509,11 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	if self.epoch != nil && self.epoch != self.establishedEpoch {
 		self.epoch.cancel()
 	}
-	ctx, cancel := context.WithCancel(self.ctx)
+	ctx, cancel := context.WithCancelCause(self.ctx)
+	recoverWorker := func() { cancel(tlsWorkerRecovery) }
 	e := &tlsHandshakeEpoch{
 		ctx:               ctx,
-		cancel:            cancel,
+		cancel:            func() { cancel(tlsEpochRetired) },
 		transport:         newSequenceTlsTransport(ctx),
 		handshakeDone:     make(chan struct{}),
 		establishmentDone: make(chan struct{}),
@@ -1553,9 +1559,9 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	self.notifyRequiredCipherChangedWithLock()
 
 	// drain TLS outbox → outbound EncryptedControl
-	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, e.cancel)
+	self.startWorker("TLS outbox", func() { self.outboxLoop(e) }, recoverWorker)
 	// drive the TLS handshake
-	self.startWorker("TLS handshake", func() { self.runHandshake(e) }, e.cancel)
+	self.startWorker("TLS handshake", func() { self.runHandshake(e) }, recoverWorker)
 	// Bound the complete TLS + identity-proof establishment. A TLS-only
 	// timeout leaves a successfully handshaken epoch waiting forever when the
 	// peer proof or contract key never arrives, which in turn pins the
@@ -1564,7 +1570,7 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 		self.startWorker(
 			"TLS establishment timeout",
 			func() { self.establishmentTimeoutWatcher(e) },
-			e.cancel,
+			recoverWorker,
 		)
 	}
 }
@@ -1799,9 +1805,9 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 				afterSent()
 			}
 		} else if e.ctx.Err() == nil && self.isCurrentEpoch(e) {
-			self.close()
+			self.closeWithCause(tlsControlEnqueueRejected)
 		}
-	}, self.cancel)
+	}, func() { self.cancelCause(tlsWorkerRecovery) })
 }
 
 // epochIdOf reads an epoch's wire identity under the state lock.
@@ -1821,6 +1827,7 @@ func (self *peerEncryptionSession) epochIdOf(e *tlsHandshakeEpoch) Id {
 // subsequent traffic flows in plaintext.
 func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err error) {
 	logFailure := false
+	var cancellationOwner *tlsCancellationOwner
 	// read under the lock for the capability evidence below
 	negotiatedCurveId := tls.CurveID(0)
 	done := func() bool {
@@ -1866,6 +1873,10 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		if err != nil && self.epoch == e {
 			self.recordInitialHandshakeFailureWithLock(time.Now())
 			logFailure = self.shouldLogEstablishmentFailureWithLock(err.Error())
+			if logFailure && err == context.Canceled {
+				// Read before failure cleanup cancels the epoch itself.
+				cancellationOwner = tlsHandshakeCancellationOwner(e.ctx)
+			}
 			self.lastEstablishFailureReason = err.Error()
 		}
 		return true
@@ -1921,11 +1932,17 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		self.client.log.Errorf("[tls]%s completeHandshake failed: %s\n", self.logTag, err)
 		// event cadence deliberately matches the log coalescing above, so a
 		// retry loop against a departed peer does not flood the callback
+		var source string
+		if cancellationOwner != nil {
+			cancellationOwner.record(self.role, self.companion)
+			source = cancellationOwner.name
+		}
 		if self.manager != nil {
 			self.manager.encryptionEvent(&EncryptionEvent{
-				PeerId: self.peerId,
-				Type:   EncryptionEventEstablishFailed,
-				Reason: err.Error(),
+				PeerId:             self.peerId,
+				Type:               EncryptionEventEstablishFailed,
+				Reason:             err.Error(),
+				CancellationSource: source,
 			})
 		}
 	}
@@ -3294,7 +3311,12 @@ func (self *peerEncryptionSession) retain() {
 // wire — there is no explicit TLS close. A later SendSequence that
 // re-acquires the peer starts a fresh session and handshake.
 func (self *peerEncryptionSession) close() {
-	self.cancel()
+	self.closeWithCause(tlsSessionRetired)
+}
+
+// Set the owning cause before transport close wakes the TLS reader.
+func (self *peerEncryptionSession) closeWithCause(owner *tlsCancellationOwner) {
+	self.cancelCause(owner)
 	self.closeTls()
 }
 
@@ -3359,10 +3381,10 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 	if settings == nil {
 		settings = DefaultEncryptionSettings()
 	}
-	managerCtx, cancel := context.WithCancel(ctx)
+	managerCtx, cancel := context.WithCancelCause(ctx)
 	m := &EncryptionSessionManager{
 		ctx:              managerCtx,
-		cancel:           cancel,
+		cancel:           func() { cancel(tlsManagerRetired) },
 		client:           client,
 		clientKeyManager: clientKeyManager,
 		settings:         settings,
