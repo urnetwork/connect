@@ -9671,7 +9671,12 @@ func (self *SendSequence) writeNoAckFastPath(
 	}
 	var cipher *sequenceCipher
 	if self.session != nil {
-		cipher = self.session.Cipher()
+		// the cipher and its own epoch's verification come from one read
+		sealing := self.session.sealingState()
+		if hook := self.session.afterSealingEpochForTest; hook != nil {
+			hook()
+		}
+		cipher = sealing.cipher
 		if cipher == nil && self.session.RequireEncryption() {
 			snapshot.release(messageByteCount)
 			return false
@@ -9686,10 +9691,10 @@ func (self *SendSequence) writeNoAckFastPath(
 			}
 		}
 		if cipher != nil && !self.companionContract {
-			// the loop verifies the peer's certificate against the contract
-			// before it seals; here that has to be already settled
-			verified, noCommitment := self.session.CertVerificationState()
-			if !verified && !noCommitment {
+			// the loop verifies the sealing epoch's certificate against the
+			// contract before it seals; here that has to be already settled
+			// for the epoch whose cipher this write takes
+			if !sealing.certVerified && !sealing.noCommitment {
 				snapshot.release(messageByteCount)
 				return false
 			}
@@ -15050,10 +15055,17 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		item.forceUnwrapped = true
 		forceUnwrapped = true
 	}
-	var cipher *sequenceCipher
+	// One locked read pins the epoch whose cipher seals this frame. The
+	// certificate check below is of that same epoch, so a rekey promoted in
+	// between neither inherits this epoch's verification nor lends it its own.
+	var sealing sealingEpochState
 	if self.session != nil && !forceUnwrapped {
-		cipher = self.session.Cipher()
+		sealing = self.session.sealingState()
+		if hook := self.session.afterSealingEpochForTest; hook != nil {
+			hook()
+		}
 	}
+	cipher := sealing.cipher
 	if cipher == nil && self.session != nil && !forceUnwrapped && self.session.RequireEncryption() {
 		// Fail-closed backstop (EncryptionModeRequired): an application frame
 		// reached the writer without a cipher. The entry gate
@@ -15104,7 +15116,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		}
 		return disposition, err
 	}
-	if err := self.verifyPeerCertAgainstContract(); err != nil {
+	if err := self.verifyPeerCertAgainstContract(sealing); err != nil {
 		return transferWriteDisposition{}, err
 	}
 	wrapped, err := cipher.SealOuterFrame(
@@ -15262,8 +15274,12 @@ func writeMultiRouteWithCarrier(
 //     `ProvideTlsCertificate`): skip without latching, so a later contract with
 //     a cert re-arms verification.
 //
-// Once matched, the result is cached and not re-run for this session.
-func (self *SendSequence) verifyPeerCertAgainstContract() error {
+// The check is bound to `sealing.epoch`, the epoch whose cipher seals this
+// frame: that epoch's own flag decides whether to check, its own cert is
+// checked, and only it is marked. Once matched, the result is cached on that
+// epoch; a rekey epoch starts unverified, so its own cert is checked before
+// its cipher first seals.
+func (self *SendSequence) verifyPeerCertAgainstContract(sealing sealingEpochState) error {
 	if self.session == nil {
 		return nil
 	}
@@ -15278,18 +15294,15 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 		}
 		return nil
 	}
-	verified, noCommitment := self.session.CertVerificationState()
-	if verified || noCommitment {
+	if sealing.certVerified || sealing.noCommitment {
 		return nil
 	}
 	expected := self.session.trustedPeerCertSnapshot()
-	// V(2) diagnostic: verify against the established epoch (whose cipher seals
-	// this frame), not the in-flight currentEpoch() whose ConnectionState() blocks
-	// on the running handshake. Logged so reaching this path (trusted set armed) is
+	// V(2) diagnostic: logged so reaching this path (trusted set armed) is
 	// observable.
 	if self.log.V(2).Enabled() {
 		self.log.Infof(
-			"[s][cert-verify]%s->%s s(%s) verifying established-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
+			"[s][cert-verify]%s->%s s(%s) verifying sealing-epoch peer certs (non-blocking); trustedSet=%d companion=%t\n",
 			self.client.ClientTag(),
 			self.destination,
 			self.contractMultiRouteWriterAlias.StreamId,
@@ -15297,7 +15310,11 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 			self.companionContract,
 		)
 	}
-	peerCerts := self.session.establishedPeerCertificates()
+	// The sealing epoch was promoted only after its handshake completed, so
+	// reading its certs never blocks. An in-flight epoch's ConnectionState()
+	// blocks on its running handshake, whose ClientHello can be waiting to be
+	// packed onto this same send sequence: verifying it here deadlocked.
+	peerCerts := self.session.peerCertificatesOfEpoch(sealing.epoch)
 	ok, err := verifyPeerCertificateAgainstContract(peerCerts, expected)
 	if err != nil {
 		self.log.Errorf(
@@ -15322,7 +15339,10 @@ func (self *SendSequence) verifyPeerCertAgainstContract() error {
 		)
 		return errors.New("sequence TLS cert verification failed")
 	}
-	self.session.MarkCertVerified()
+	if hook := self.session.beforeCertVerifiedMarkForTest; hook != nil {
+		hook()
+	}
+	self.session.markCertVerifiedForEpoch(sealing.epoch)
 	return nil
 }
 

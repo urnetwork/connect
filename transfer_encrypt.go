@@ -972,7 +972,11 @@ type tlsHandshakeEpoch struct {
 	// `peerIdentityVerified`). Held separately so identity-proof code
 	// can sign the exporter without exposing the cipher early.
 	derivedTlsCipher *sequenceCipher
-	certVerified     bool
+	// certVerified records that this epoch's own peer certificate matched the
+	// trusted set. It belongs to the epoch, not the session: a rekey epoch
+	// starts unverified and is marked only by a check of its own certificate
+	// (see `markCertVerifiedForEpoch`).
+	certVerified bool
 	// tlsExporter holds the 32-byte output of
 	// `ExportKeyingMaterial("urnetwork-sequence-identity-proof", ...)` from the
 	// completed TLS connection. Both peers sign it with their client identity
@@ -1182,6 +1186,11 @@ type peerEncryptionSession struct {
 	beforeWorkerWaitForTest func()
 	// Nil test observer borrows the constructed unknown-wrap nack before send.
 	unknownWrapNackForTest func(*protocol.EncryptedControl)
+	// Nil test barriers around certificate verification on send: after a send
+	// takes the epoch whose cipher seals its frame, and after a certificate
+	// matched but before that match is recorded.
+	afterSealingEpochForTest      func()
+	beforeCertVerifiedMarkForTest func()
 	// peerClientPublicKey is the peer's long-lived Ed25519 public identity key,
 	// set via `SetPeerClientPublicKey` (from the SendSequence after a contract
 	// for the peer arrives). nil until a contract has been seen; until then any
@@ -3012,61 +3021,78 @@ func (self *peerEncryptionSession) closeTls() {
 	// starts a fresh handshake instead.
 }
 
-// PeerCertificates returns the peer's certificate chain observed during
-// the current epoch's TLS handshake. Returns nil if the handshake has not
-// completed.
-func (self *peerEncryptionSession) PeerCertificates() []*x509.Certificate {
-	return self.peerCertificatesOfEpoch(self.currentEpoch())
+// The epoch whose cipher seals one send: a single locked read of the
+// established epoch, its cipher, and that same epoch's certificate
+// verification. A send seals with exactly this cipher and checks exactly this
+// epoch's certificate, so a rekey promoted in between can neither borrow the
+// verification of the epoch it replaces nor lend its own to it. The zero value
+// has no cipher, the same as a nil `Cipher()`.
+type sealingEpochState struct {
+	// nil exactly when cipher is nil
+	epoch  *tlsHandshakeEpoch
+	cipher *sequenceCipher
+	// the epoch's own flag, read with its cipher
+	certVerified bool
+	// the trusted set is empty: verification skips without marking, so a later
+	// commitment still arms it
+	noCommitment bool
 }
 
-// establishedPeerCertificates returns the peer certificate chain from the
-// established epoch — the epoch whose cipher `Cipher()` hands out and which
-// therefore seals outbound frames. That is the identity a SendSequence must
-// verify against the contract commitment.
-//
-// Unlike `currentEpoch()` — which during a re-handshake is an in-flight epoch
-// whose `tls.Conn.ConnectionState()` blocks on the handshake mutex — the
-// established epoch's handshake is by definition complete (it is promoted only
-// after the handshake finished and the identity proof verified, see
-// markEstablishedWithLock), so reading its peer certificates never blocks.
-// Verifying the in-flight epoch here was the source of a deadlock: the
-// SendSequence Run loop parked on the in-flight handshake's mutex while that
-// same handshake's ClientHello waited to be packed onto the very same
-// (unbuffered) send sequence.
-//
-// Returns nil if no epoch has established yet; in practice verification is only
-// reached once `Cipher()` is non-nil, which implies an established epoch.
-func (self *peerEncryptionSession) establishedPeerCertificates() []*x509.Certificate {
+// Snapshots the sealing epoch for one send. The cipher is the one `Cipher()`
+// returns at the same instant.
+func (self *peerEncryptionSession) sealingState() sealingEpochState {
 	self.stateLock.Lock()
-	e := self.establishedEpoch
-	self.stateLock.Unlock()
-	return self.peerCertificatesOfEpoch(e)
+	defer self.stateLock.Unlock()
+	state := sealingEpochState{
+		cipher:       self.cipherWithLock(),
+		noCommitment: len(self.trustedPeerCertPems) == 0,
+	}
+	if state.cipher != nil {
+		state.epoch = self.establishedEpoch
+		state.certVerified = state.epoch.certVerified
+	}
+	return state
 }
 
-// CertVerificationState returns the cached certificate verification result.
-// `verified` is true once a peer cert was matched to the trusted set, and is
-// sticky for the session lifetime. `noCommitment` is true exactly when the
-// trusted set is empty, so callers can distinguish "no commitment held yet"
-// (verification should skip without latching) from "have a commitment not yet
-// checked" (verification should run). Not sticky: if an empty-chain contract is
-// later followed by one with a cert, noCommitment flips off and verification
-// runs against the new commitment.
+// CertVerificationState reports the established epoch's own certificate
+// verification: `verified` is true once that epoch's peer cert matched the
+// trusted set. A rekey epoch starts unverified, so after its promotion this
+// reads false until its own cert is checked. `noCommitment` is true exactly
+// when the trusted set is empty, so callers can distinguish "no commitment
+// held yet" (verification should skip without latching) from "have a
+// commitment not yet checked" (verification should run). Not sticky: if an
+// empty-chain contract is later followed by one with a cert, noCommitment
+// flips off and verification runs against the new commitment. A send does not
+// pair this with a separately read cipher; it uses `sealingState`.
 func (self *peerEncryptionSession) CertVerificationState() (verified bool, noCommitment bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	verified = self.epoch != nil && self.epoch.certVerified
+	verified = self.establishedEpoch != nil && self.establishedEpoch.certVerified
 	return verified, len(self.trustedPeerCertPems) == 0
 }
 
-// MarkCertVerified records that the peer's TLS-handshake cert was matched
-// against the trusted set. Sticky for the current epoch; a re-handshake
-// (new epoch) re-verifies against the peer's freshly presented cert.
+// MarkCertVerified records a cert match for the established epoch, never for
+// an in-flight rekey epoch. It marks whichever epoch is established when it
+// runs, so a caller that checked a cert before taking the lock marks that
+// exact epoch with `markCertVerifiedForEpoch` instead.
 func (self *peerEncryptionSession) MarkCertVerified() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.epoch != nil {
-		self.epoch.certVerified = true
+	if self.establishedEpoch != nil {
+		self.establishedEpoch.certVerified = true
 	}
+}
+
+// Records that e's own peer certificate matched the trusted set. Only e is
+// marked, whether or not it is still established: a rekey promoted after the
+// check stays unverified, so its certificate is checked before it seals.
+func (self *peerEncryptionSession) markCertVerifiedForEpoch(e *tlsHandshakeEpoch) {
+	if e == nil {
+		return
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	e.certVerified = true
 }
 
 // AddTrustedPeerCertChain extends the session's trusted peer cert set with
