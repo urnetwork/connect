@@ -94,15 +94,11 @@ func platformH3FixedMemoryByteCount() ByteCount {
 // hybrid stream queue holds 64 KiB, and the batch writer holds 64 KiB. The rest
 // of the 256-KiB row covers producer/reader holds, pool headers, and descriptors.
 //
-// The fixed rows sum to 1600 KiB; they are not unused receive permission. Up
-// through a 24-MiB target the 3-MiB claim therefore caps connection/stream
-// credit at 1472/1104 KiB. In particular the 20-MiB iOS target must retain that
-// claim so a nested DNS extender and pending H1 fit the 5-MiB child. Above
-// 24 MiB through 32 MiB the claim instead adds those fixed rows to the base
-// T/8 connection credit: Android's 28-MiB target keeps 3.5 MiB receive credit
-// in a 5184-KiB claim inside its 7-MiB child. This is an explicit piecewise
-// admission policy, not a process-target scaling cap. Larger/server targets
-// retain their existing window policy, and unbudgeted defaults are unchanged.
+// The fixed rows sum to 1600 KiB; they are not unused receive permission, and
+// receive credit is charged on top of them (ApplyMobilePlatformTransportMemoryPolicy).
+// Targets through 32 MiB take the mobile policy on every surface; larger and
+// server targets retain their existing window policy unless their embedder
+// selects the mobile one, and unbudgeted defaults are unchanged.
 func applyPlatformH3MemoryPolicy(settings *PlatformTransportSettings, target ByteCount) {
 	settings.h3RetainedByteAccounting = 0 < target && target <= mib(32)
 	settings.h1RetainedByteAccounting = settings.h3RetainedByteAccounting
@@ -112,11 +108,51 @@ func applyPlatformH3MemoryPolicy(settings *PlatformTransportSettings, target Byt
 	ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 }
 
+// The parameters of the mobile H3 claim (mobilePlatformH3ClaimByteCount).
+// They are the policy ApplyMobilePlatformTransportMemoryPolicy installs into
+// the settings it is given, not settings of their own.
+const (
+	// A phone's carrier budget is sized to hold this many complete H3 graphs
+	// at once: its provider's three control paths (the v4 and v6 pins and
+	// the standby) and two consumer window transports (server LBALTOPT2 R20).
+	mobilePlatformH3ClaimsPerBudget = 5
+	// The least connection receive credit a mobile H3 claim keeps where a
+	// fifth of the budget cannot cover it on top of the fixed rows. 448 KiB
+	// makes the claim 2 MiB: two fit the 5-MiB budget of a 20-MiB target with
+	// room left for an h1 fallback, three fit 24 MiB and four fit 32 MiB. It
+	// bounds a transport's reliable stream to about 28 Mbit/s at 100 ms RTT
+	// (37 for the connection), near the 38-52 Mbit/s MEMSTEADY measured on
+	// the mobile h1 path a transport falls back to. DATAGRAMs are not flow
+	// controlled and are not bounded by it.
+	mobilePlatformH3MinConnectionReceiveWindowByteCount ByteCount = 448 * 1024
+)
+
+// mobilePlatformH3ClaimByteCount is the complete inner H3 claim the mobile
+// policy gives a transport of an owner with this memory target: a fifth of
+// the owner's carrier budget, so its provider's three control paths and two
+// consumer transports fit at once, but never less than the fixed rows plus
+// the least receive credit. The fixed rows are charged in full either way;
+// only the receive credit shrinks. A fifth of the budget covers the fixed
+// rows plus the least credit from a 40-MiB target up, so smaller targets fit
+// fewer complete graphs, and a transport the budget cannot admit carries on
+// h1 instead (transport_h3_budget_fallback.go).
+func mobilePlatformH3ClaimByteCount(target ByteCount) ByteCount {
+	return max(
+		platformH3FixedMemoryByteCount()+mobilePlatformH3MinConnectionReceiveWindowByteCount,
+		platformTransportBudgetByteCountForMemoryTarget(target)/mobilePlatformH3ClaimsPerBudget,
+	)
+}
+
 // ApplyMobilePlatformTransportMemoryPolicy keeps mobile carrier ownership
-// accounted at every positive target. A larger mobile allowance increases the
-// receive window and its composed claim; it must not turn off retained-send,
-// speculative-dial, socket, or application-queue accounting. Call after target
-// sizing and before starting transports. Desktop/server constructors retain
+// accounted at every positive target and sizes each H3 claim so several fit
+// the owner's carrier budget (mobilePlatformH3ClaimByteCount). The claim is
+// exactly the connection receive credit plus the fixed rows: the credit is
+// what remains of the claim after the fixed rows, never more than the base
+// window, and the stream credit stays three quarters of it. A larger mobile
+// allowance never lowers the receive window or the claim, and it must not
+// turn off retained-send, speculative-dial, socket, or application-queue
+// accounting. Call after target sizing and before starting transports.
+// Applying it twice changes nothing. Desktop/server constructors retain
 // their existing policy unless their embedder explicitly selects this one.
 func ApplyMobilePlatformTransportMemoryPolicy(settings *PlatformTransportSettings, target ByteCount) {
 	if settings == nil || target <= 0 {
@@ -127,14 +163,19 @@ func ApplyMobilePlatformTransportMemoryPolicy(settings *PlatformTransportSetting
 	settings.H3SocketReadBufferByteCount = min(settings.H3SocketReadBufferByteCount, platformH3SocketByteCount)
 	settings.H3SocketWriteBufferByteCount = min(settings.H3SocketWriteBufferByteCount, platformH3SocketByteCount)
 	fixed := platformH3FixedMemoryByteCount()
-	if target <= mib(24) {
-		connection := min(settings.H3MaxConnectionReceiveWindowByteCount, settings.H3BudgetByteCount-fixed)
-		settings.H3MaxConnectionReceiveWindowByteCount = connection
-		settings.H3MaxStreamReceiveWindowByteCount = min(settings.H3MaxStreamReceiveWindowByteCount, connection*3/4)
-	} else {
-		settings.H3BudgetByteCount = max(settings.H3BudgetByteCount,
-			settings.H3MaxConnectionReceiveWindowByteCount+fixed)
+	connection := mobilePlatformH3ClaimByteCount(target) - fixed
+	// A non-positive window would resolve to the unbounded default in the
+	// QUIC config, outside the claim; it takes the policy's credit instead.
+	if 0 < settings.H3MaxConnectionReceiveWindowByteCount {
+		connection = min(connection, settings.H3MaxConnectionReceiveWindowByteCount)
 	}
+	stream := connection * 3 / 4
+	if 0 < settings.H3MaxStreamReceiveWindowByteCount {
+		stream = min(stream, settings.H3MaxStreamReceiveWindowByteCount)
+	}
+	settings.H3MaxConnectionReceiveWindowByteCount = connection
+	settings.H3MaxStreamReceiveWindowByteCount = stream
+	settings.H3BudgetByteCount = connection + fixed
 	settings.H3InitialStreamReceiveWindowByteCount = min(settings.H3InitialStreamReceiveWindowByteCount,
 		settings.H3MaxStreamReceiveWindowByteCount, kib(128))
 	settings.H3InitialConnectionReceiveWindowByteCount = min(settings.H3InitialConnectionReceiveWindowByteCount,

@@ -56,10 +56,11 @@ func assertIosMemoryLiveSettings(t *testing.T, settings *PlatformTransportSettin
 		t.Fatalf("current iOS carrier profile=%+v", stats)
 	}
 	config := newPlatformQuicConfig(settings, 1)
-	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != kib(5696) ||
+	// R20: a 2-MiB claim, 448 KiB of connection credit, so four fit
+	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != kib(2048) ||
 		settings.H3SocketReadBufferByteCount != kib(64) || settings.H3SocketWriteBufferByteCount != kib(64) ||
 		config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) ||
-		config.MaxStreamReceiveWindow != uint64(kib(3072)) || config.MaxConnectionReceiveWindow != uint64(mib(4)) ||
+		config.MaxStreamReceiveWindow != uint64(kib(336)) || config.MaxConnectionReceiveWindow != uint64(kib(448)) ||
 		config.Allow0RTT || !settings.h3RetainedByteAccounting ||
 		(&PlatformTransport{settings: settings}).h3TransportBufferSize() != 4 {
 		t.Fatalf("current iOS carrier windows/claims drifted: settings=%+v config=%+v", settings, config)
@@ -438,13 +439,15 @@ func testIosMemoryLiveAlt(t *testing.T, whodis bool) {
 		strategySettings.ExpandExtenderProfileCount = 0
 		strategySettings.DnsTlds = [][]byte{[]byte(testAltDnsTld)}
 		policy := newExtenderQuicMemoryPolicy(requestCtx, &strategySettings.ConnectSettings)
-		want := kib(1664)
+		// R20: the outer window is the 448-KiB mobile window, below the
+		// policy's 512-KiB cap, so the claim is 1600 KiB where it was 1664
+		want := kib(1600)
 		if whodis {
 			policy.packetTranslationSettings()
 			want += kib(144)
 		}
 		if policy.budget != apiBudget || policy.byteCount != want || !policy.usesSlot || policy.unbudgeted ||
-			policy.quicConfig.MaxConnectionReceiveWindow != uint64(kib(512)) ||
+			policy.quicConfig.MaxConnectionReceiveWindow != uint64(kib(448)) ||
 			policy.quicConfig.MaxStreamReceiveWindow != uint64(kib(256)) || policy.quicConfig.Allow0RTT {
 			t.Fatalf("standalone current-profile API policy=%+v", policy)
 		}

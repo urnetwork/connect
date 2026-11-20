@@ -125,7 +125,7 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	child := newPlatformTransportBudget(mib(5), 16, root)
 	settings.PlatformTransportBudget = child
 	t.Cleanup(func() { requirePlatformHierarchyBalanced(t, root, child) })
-	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != mib(3) {
+	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != mib(2) {
 		t.Fatal("regression requires the actual 20/32-MiB carrier profile")
 	}
 	stopObserver, observerDone := make(chan struct{}), make(chan struct{})
@@ -172,7 +172,9 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	oldA, oldB := newH1(), newH1()
 	requirePlatformHierarchyAcquire(t, oldA.h1BudgetReservation)
 	requirePlatformHierarchyAcquire(t, oldB.h1BudgetReservation)
-	fillers := make([]*PlatformTransport, 7)
+	// enough H1 that the first H3 replacement fits the child only on its
+	// loan: 13 H1 claims and the 2-MiB claim are 256 KiB over the 5 MiB
+	fillers := make([]*PlatformTransport, 11)
 	for i := range fillers {
 		fillers[i] = newH1()
 		requirePlatformHierarchyAcquire(t, fillers[i].h1BudgetReservation)
@@ -192,7 +194,9 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	fillers[0].h1BudgetReservation.Release()
 	fillers[1].h1BudgetReservation.Release()
 	// These are the actual standalone API/feed QUIC policy claims, not fake
-	// unowned H1 transports: each is 1,664 KiB and never borrows itself.
+	// unowned H1 transports: each is 1,600 KiB and never borrows itself.
+	// With the child's 4,864 KiB they leave the root 128 KiB, less than the
+	// H1 the second replacement needs.
 	ownerlessContext := context.WithValue(t.Context(), platformTransportNestedBudgetContextKey{}, root)
 	policy := newExtenderQuicMemoryPolicy(ownerlessContext, DefaultConnectSettings())
 	for range 2 {
@@ -202,8 +206,8 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 		}
 		t.Cleanup(claim.Release)
 	}
-	if root.Stats().UsedByteCount != mib(8) {
-		t.Fatalf("ordinary ownerless pressure did not fill the root: %+v", root.Stats())
+	if policy.byteCount != kib(1600) || root.Stats().UsedByteCount != mib(8)-kib(128) {
+		t.Fatalf("ordinary ownerless pressure did not fill the root: claim %d, %+v", policy.byteCount, root.Stats())
 	}
 	newB := newH1()
 	secondOld := &FamilyPlatformTransportGroup{standbyTransport: oldB}
@@ -218,7 +222,7 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 		snapshot.RootAdditionalHandoff != snapshot.BudgetHandoff ||
 		snapshot.BudgetAdditionalHandoff != snapshot.RootHandoff ||
 		snapshot.RootHandoff.Owner != "device" || snapshot.BudgetHandoff.Owner != "device" ||
-		snapshot.Root.UsedByteCount != mib(8)+kib(256) || snapshot.Budget.UsedByteCount != mib(5) {
+		snapshot.Root.UsedByteCount != mib(8)+kib(128) || snapshot.Budget.UsedByteCount != mib(5) {
 		t.Fatalf("overlapping manager loans lost identity or changed capacity: %+v", snapshot)
 	}
 	select {

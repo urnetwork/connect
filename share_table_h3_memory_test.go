@@ -22,13 +22,15 @@ func shareTableH3LedgerForTarget(target ByteCount) shareTableH3Ledger {
 		connection:  max(kib(512), draw),
 	}
 	if 0 < target && target <= mib(32) {
+		// R20: the claim is a fifth of the owner's carrier budget, never less
+		// than the fixed rows plus 448 KiB of connection credit, and it is
+		// exactly that credit plus the fixed rows
 		ledger.fixed = shareTableH3FixedByteCount
-		if target <= mib(24) {
-			ledger.connection = min(ledger.connection, ledger.reservation-ledger.fixed)
-			ledger.stream = min(ledger.stream, ledger.connection*3/4)
-		} else {
-			ledger.reservation = max(ledger.reservation, ledger.connection+ledger.fixed)
-		}
+		budget := min(target, max(mib(3), target/4))
+		claim := max(ledger.fixed+kib(448), budget/5)
+		ledger.connection = min(ledger.connection, claim-ledger.fixed)
+		ledger.stream = min(ledger.stream, ledger.connection*3/4)
+		ledger.reservation = ledger.connection + ledger.fixed
 	}
 	return ledger
 }
@@ -43,15 +45,18 @@ func TestTheShareTableH3RetainedPolicyBoundaries(t *testing.T) {
 		target, reservation, connection, stream ByteCount
 		retained                                bool
 	}{
-		{mib(8), kib(3072), kib(1024), kib(768), true},
-		{kib(11776) - 8, kib(3072), kib(1472) - 1, kib(1104) - 1, true},
-		{kib(11776), kib(3072), kib(1472), kib(1104), true},
-		{mib(16), kib(3072), kib(1472), kib(1104), true},
-		{mib(20), kib(3072), kib(1472), kib(1104), true},
-		{mib(24), kib(3072), kib(1472), kib(1104), true},
-		{mib(24) + 8, kib(4672) + 1, kib(3072) + 1, kib(2304), true},
-		{mib(28), kib(5184), kib(3584), kib(2688), true},
-		{mib(32), kib(5696), kib(4096), kib(3072), true},
+		// every retained target through 32 MiB takes the 2-MiB floor claim:
+		// a fifth of its budget is less than the fixed rows plus the least
+		// credit, so the old 24-MiB step and its draw boundary are gone
+		{mib(8), kib(2048), kib(448), kib(336), true},
+		{kib(11776) - 8, kib(2048), kib(448), kib(336), true},
+		{kib(11776), kib(2048), kib(448), kib(336), true},
+		{mib(16), kib(2048), kib(448), kib(336), true},
+		{mib(20), kib(2048), kib(448), kib(336), true},
+		{mib(24), kib(2048), kib(448), kib(336), true},
+		{mib(24) + 8, kib(2048), kib(448), kib(336), true},
+		{mib(28), kib(2048), kib(448), kib(336), true},
+		{mib(32), kib(2048), kib(448), kib(336), true},
 		{mib(32) + 8, kib(4096) + 1, kib(4096) + 1, kib(3072), false},
 		{mib(48), kib(6144), kib(6144), kib(4608), false},
 		{mib(128), kib(16384), kib(16384), kib(12288), false},

@@ -49,7 +49,9 @@ func TestPlatformH3ExtenderPacketConnPreservesMemoryOwner(t *testing.T) {
 				}
 				outerBytes := kib(256)
 				if carrier != ExtenderConnectModeTcpTls {
-					outerBytes = kib(512 + 512 + 256 + 128)
+					// the outer window is the platform's, at most 512 KiB:
+					// R20's 448-KiB mobile window here
+					outerBytes = min(settings.H3MaxConnectionReceiveWindowByteCount, kib(512)) + kib(512+256+128)
 					if carrier == ExtenderConnectModeDns {
 						outerBytes += kib(144)
 					}

@@ -556,9 +556,11 @@ func TestTheShareTableIsBackedAtEveryLevel(t *testing.T) {
 
 		// On the finite profile the difference is live non-receive ownership,
 		// not idle memory. Only legacy/server targets still use §43.2's
-		// receive-only reservation equality.
-		if fixed > 0 && reservation != max(mib(3), connection+fixed) {
-			t.Errorf("at target %d, H3 reservation %d does not exactly back receive %d plus fixed %d (3 MiB admission floor)",
+		// receive-only reservation equality. Since R20 the finite claim is
+		// exactly the receive credit plus the fixed rows: it keeps no 3 MiB
+		// admission floor above them, so several fit a phone's budget.
+		if fixed > 0 && reservation != connection+fixed {
+			t.Errorf("at target %d, H3 reservation %d does not exactly back receive %d plus fixed %d",
 				surface, reservation, connection, fixed)
 		} else if fixed == 0 && rows["H3 reservation"].floorCrossingByteCount() <= surface && connection != reservation {
 			t.Errorf(

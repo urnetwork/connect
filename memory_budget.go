@@ -31,14 +31,21 @@ func newDefaultPlatformTransportBudgetWithParent(
 	parent *PlatformTransportBudget,
 ) *PlatformTransportBudget {
 	return newPlatformTransportBudget(
-		// Keep the normal share at one quarter, but leave room for one H3
-		// carrier at the supported low-memory floor. Without this matching
-		// floor, an explicit H3 selection on the 8 MiB legacy host target
-		// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim.
-		min(budgetByteCount, max(mib(3), budgetByteCount/4)),
+		platformTransportBudgetByteCountForMemoryTarget(budgetByteCount),
 		16,
 		parent,
 	)
+}
+
+// platformTransportBudgetByteCountForMemoryTarget is the carrier budget one
+// owner's memory target gets. Keep the normal share at one quarter, but leave
+// room for one H3 carrier at the supported low-memory floor. Without this
+// matching floor, an explicit H3 selection on the 8 MiB legacy host target
+// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim. The mobile
+// H3 policy sizes its claims from this same total
+// (ApplyMobilePlatformTransportMemoryPolicy).
+func platformTransportBudgetByteCountForMemoryTarget(budgetByteCount ByteCount) ByteCount {
+	return min(budgetByteCount, max(mib(3), budgetByteCount/4))
 }
 
 // NewPlatformTransportBudgetForMemoryTarget creates an independent carrier
