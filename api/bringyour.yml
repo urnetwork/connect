@@ -4662,8 +4662,11 @@ paths:
         - `daily_cap_gamma`: the daily spend cap a new deposit opens with
           (the mint command names it): `auto_min_daily_cap_gamma` plus a
           quarter, rounded up to a whole gamma. A spend larger than its
-          deposit's cap never passes; the headroom lets a raised price or a
-          second charge the same day pass without raising the cap.
+          deposit's cap never passes; the headroom lets a raised price, or a
+          smaller second charge the same day, pass at once. A deposit opened
+          with a cap starts full; a changed cap keeps what it allows now, so
+          a higher cap refills faster, and removing it allows the whole
+          balance.
         - `spender`: retired with runtime 493; always "".
 
         `disclaimer` is the wording every surface shows; `automatic_notice`
@@ -5272,8 +5275,9 @@ paths:
       description: |
         Since Bittensor runtime 493 anyone holding an SN25 gamma deposit can
         spend it straight at URnetwork's listed service from their own hotkey
-        (`btcli gamma spend --netuid 25 --service-hotkey <service_hotkey>`),
-        without this API: a direct payment. The chain keeps what each hotkey
+        (`btcli gamma spend --netuid 25 --service-hotkey <service_hotkey>
+        --amount-gamma <amount> -w <wallet> -H <hotkey>`, btcli 11.3.5 or
+        later), without this API: a direct payment. The chain keeps what each hotkey
         has spent at the service, so the payment is never lost, but nothing
         says which account it was for. Claim it for the caller's network:
         this call returns the one line (`message`) to sign with the hotkey
