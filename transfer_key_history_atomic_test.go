@@ -373,15 +373,15 @@ func TestSignedIdentityAtomicAdmissionHonorsCancellation(t *testing.T) {
 			armKeyHistoryGate(session)
 			switch phase {
 			case "before":
-				session.cancel()
+				session.cancelCause(tlsSessionRetired)
 			case "snapshot":
-				store.afterRead = func(int32, ClientKeyPinSnapshot) { session.cancel() }
+				store.afterRead = func(int32, ClientKeyPinSnapshot) { session.cancelCause(tlsSessionRetired) }
 			case "admitted":
-				store.afterCompare = func(int32) { session.cancel() }
+				store.afterCompare = func(int32) { session.cancelCause(tlsSessionRetired) }
 			case "conflict":
 				store.beforeCompare = func(int32) {
 					store.SetSignedHistorySeen()
-					session.cancel()
+					session.cancelCause(tlsSessionRetired)
 				}
 			}
 			session.applyPeerClientKeyHistoryFetchError(goldenHeadPublicKey(t), errors.New("network unavailable"))

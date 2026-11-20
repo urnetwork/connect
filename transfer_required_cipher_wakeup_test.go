@@ -17,13 +17,13 @@ import (
 // payload, or background client. The sentinel cipher is never used to encrypt.
 func newRequiredCipherWakeFixture() (*SendSequence, *peerEncryptionSession, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	sessionCtx, cancelSession := context.WithCancel(ctx)
+	sessionCtx, cancelSession := context.WithCancelCause(ctx)
 	settings := DefaultEncryptionSettings()
 	settings.Mode = EncryptionModeRequired
 	settings.TlsTimeout = 0
 	settings.RequiredCipherPollInterval = time.Hour
 	session := &peerEncryptionSession{
-		ctx: sessionCtx, cancel: cancelSession,
+		ctx: sessionCtx, cancelCause: cancelSession,
 		client: &Client{log: NewNoopLogger()}, settings: settings,
 		role: sequenceTlsRoleServer, refs: 1,
 		epoch: &tlsHandshakeEpoch{
@@ -180,7 +180,7 @@ func TestRequiredCipherWakeSessionCancellation(t *testing.T) {
 		defer func() { cancel(); synctest.Wait() }()
 		done := startRequiredCipherWakePack(sequence, sequence.ctx, -1)
 		synctest.Wait()
-		session.cancel()
+		session.cancelCause(tlsSessionRetired)
 		synctest.Wait()
 		select {
 		case result := <-done:
