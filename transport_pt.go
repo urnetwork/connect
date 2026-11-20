@@ -701,6 +701,52 @@ func packetTranslationReadRetries(err error) bool {
 	return errors.As(err, &netErr) && netErr.Temporary()
 }
 
+// The DNS translation's expiry timer, armed for its oldest entry's deadline.
+//
+// A pending timer is never moved. Moving a timer in a P's timer heap makes the
+// runtime walk that whole heap once the new deadline arrives (Go 1.23+
+// timers.adjust), and the translation re-arms on every packet, so a server
+// translating DNS walked its heaps continually (server LBALTOPT2 §3.4). The
+// oldest entry only gets younger, so a pending deadline is never later than
+// the one wanted: it fires, at worst early, the loop removes what has expired
+// and arms again from there. A fired timer is in no heap, so arming it again
+// only adds it.
+type dnsExpiryTimer struct {
+	timer *time.Timer
+	// the deadline armed and not yet fired; zero when none is
+	deadline time.Time
+}
+
+func newDnsExpiryTimer() *dnsExpiryTimer {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	return &dnsExpiryTimer{timer: timer}
+}
+
+// Makes the timer fire no later than deadline, and returns its channel.
+func (self *dnsExpiryTimer) armBy(deadline time.Time) <-chan time.Time {
+	if !self.deadline.IsZero() {
+		if !deadline.Before(self.deadline) {
+			return self.timer.C
+		}
+		// earlier than the pending deadline, which the queue's order rules
+		// out; move it rather than expire late
+		self.timer.Stop()
+	}
+	self.timer.Reset(max(time.Duration(0), time.Until(deadline)))
+	self.deadline = deadline
+	return self.timer.C
+}
+
+// Records that the armed deadline fired.
+func (self *dnsExpiryTimer) fired() {
+	self.deadline = time.Time{}
+}
+
+func (self *dnsExpiryTimer) stop() {
+	self.timer.Stop()
+}
+
 func (self *packetTranslation) decodeDns() {
 	type readData struct {
 		addr   net.Addr
@@ -751,26 +797,15 @@ func (self *packetTranslation) decodeDns() {
 				}
 			}
 		}()
-		expiryTimer := time.NewTimer(time.Hour)
-		if !expiryTimer.Stop() {
-			<-expiryTimer.C
-		}
-		defer expiryTimer.Stop()
+		expiryTimer := newDnsExpiryTimer()
+		defer expiryTimer.stop()
 		var expiry <-chan time.Time
 		resetExpiry := func() {
-			if !expiryTimer.Stop() && expiry != nil {
-				select {
-				case <-expiryTimer.C:
-				default:
-				}
-			}
 			if oldest, ok := dnsCombineQueue.OldestUpdateTime(); ok {
-				delay := time.Until(oldest.Add(self.settings.DnsStateTimeout))
-				expiryTimer.Reset(max(time.Duration(0), delay))
-				expiry = expiryTimer.C
-			} else {
-				expiry = nil
+				expiry = expiryTimer.armBy(oldest.Add(self.settings.DnsStateTimeout))
 			}
+			// with nothing to expire, a pending timer fires once more and
+			// finds nothing
 		}
 
 		for {
@@ -778,6 +813,8 @@ func (self *packetTranslation) decodeDns() {
 			case <-self.ctx.Done():
 				return
 			case <-expiry:
+				expiryTimer.fired()
+				expiry = nil
 				dnsCombineQueue.RemoveOlder(time.Now().Add(-self.settings.DnsStateTimeout))
 				resetExpiry()
 			case r := <-readPipeline:
