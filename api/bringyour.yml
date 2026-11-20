@@ -12070,6 +12070,58 @@ paths:
         "503":
           description: The client cannot be minted now; the block asks again.
 
+  /internal/gate/abuse-notice:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: File the notice a role mail is, from its header facts
+      description: |
+        The platform listener's role-mail intake posts, for a mail to
+        abuse@ or postmaster@ on `<root>`, the recipient's local part, its
+        root and each DKIM signature's d= and RFC 8601 result, never a body,
+        a subject, a From or the message; a field beyond these, or a second
+        value after the request, is refused 400 with nothing filed. api
+        matches the verdicts to `abuse.yml`'s `notice_senders`, and a mail
+        whose signature passed under a listed domain opens a notice case of
+        that domain's class about the root and pages both rota members under
+        the case's key, as the staff route's `file_notice` does. `notice` is
+        false for any other mail, which opens nothing. `paged` is false when
+        the pager did not take the page: the case stands, and taskworker's
+        clock pass pages it again within the minute. The platform listener's
+        bearer only (`mxedge-platform`). 503 with Retry-After when a
+        signature under a listed domain met a key that did not answer and
+        none passed, when a store did not answer, or in a binary without
+        the abuse tables, so the listener answers 451 and the sender sends
+        the mail again.
+      operationId: internalGateAbuseNotice
+      security:
+        - InternalGateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalGateAbuseNoticeArgs"
+      responses:
+        "200":
+          description: Judged, and filed when it was a notice.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateAbuseNoticeResult"
+        "400":
+          description: |
+            The body does not parse, holds a field or a value beyond the
+            format's, more than eight signatures, a result that is no RFC 8601
+            dkim result, or a root that is no host name.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or it is not the platform listener's.
+            The body is the plain text "Forbidden.".
+        "503":
+          description: The mail cannot be judged or filed now; the sender sends it again.
+
   /sidecar/push-token:
     post:
       x-internal: true
@@ -16764,6 +16816,17 @@ paths:
         - `close_legal_request` {request_id}: legal.
         - `transparency_counts` {from_time_ms, to_time_ms}: legal. The
           transparency report's totals over the window, naming no network.
+        - `file_notice` {class, target, category, barred, case_id}: reviewer
+          or legal. A notice the company mailbox paged: `registrar`,
+          `registry`, `law_enforcement_emergency`, `eu_removal_order` or
+          `production_order`, about a root or a host under one. Opens its
+          case due within the hour and pages both rota members at once,
+          keyed by the case; `case_id` in place of the rest pages a notice
+          filed before again, opening nothing. Answers the case, whether it
+          opened one, whether the pager took the page, who handles it
+          (`rota` or `counsel`, with counsel's contact) and the hour's end. A
+          page the pager did not take answers `paged` false, the case
+          standing for the clock pass to page.
 
         Every refusal of the credential answers one 403 "Forbidden.". 503
         with Retry-After when a store, a mailer or an effect did not answer.
@@ -17100,11 +17163,12 @@ components:
       scheme: bearer
       description: |
         A service's internal bearer: 256 random bits in unpadded base64url,
-        which each service with no Postgres holds in its own credential file
-        with its previous value during a rotation. api holds only their
-        SHA-256, each with its service, compares in constant time, and each
-        internal gate route takes only the services it lists. Not a URnetwork
-        JWT, and never a user's.
+        which each service with no Postgres, and the platform listener for
+        its role-mail notices, holds in its own credential file with its
+        previous value during a rotation. api holds only their SHA-256, each
+        with its service, compares in constant time, and each internal gate
+        route takes only the services it lists. Not a URnetwork JWT, and
+        never a user's.
 
   schemas:
     ClientInfo:
@@ -31916,6 +31980,45 @@ components:
         platform_url:
           description: Where the client connects.
           type: string
+    InternalGateAbuseNoticeArgs:
+      type: object
+      additionalProperties: false
+      required: [recipient_local_part, root, signatures]
+      properties:
+        recipient_local_part:
+          description: The recipient's local part as the listener took it, `abuse` or `postmaster`; at most 64 octets.
+          type: string
+        root:
+          description: The root the role address sits under, which the notice is about; at most 253 octets.
+          type: string
+        signatures:
+          description: The mail's DKIM signatures in header order, at most eight.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateAbuseNoticeSignature"
+    InternalGateAbuseNoticeSignature:
+      type: object
+      additionalProperties: false
+      required: [domain, result]
+      properties:
+        domain:
+          description: The signature's d=, lowercased; empty for one that did not parse far enough to name one.
+          type: string
+        result:
+          description: |
+            RFC 8601's dkim result: `pass`, `fail`, `policy`, `neutral`,
+            `temperror`, `permerror` or `none`. Only `pass` verifies.
+          type: string
+    InternalGateAbuseNoticeResult:
+      type: object
+      required: [notice, paged]
+      properties:
+        notice:
+          description: The mail was a notice, and its case is open.
+          type: boolean
+        paged:
+          description: The pager took the notice's page; false beside `notice` is a page taskworker's clock pass owes.
+          type: boolean
     SidecarIdentityResult:
       type: object
       required:
