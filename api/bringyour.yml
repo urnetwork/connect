@@ -4638,9 +4638,10 @@ paths:
           chain, or has not run for three minutes), `runtime_unsupported` (the
           chain runs a runtime whose Gamma calls or events are not as
           reviewed; billing pauses until it is reviewed),
-          `service_not_published`, `service_spender_mismatch`,
-          `billing_proxy_missing`, `fee_float_low`, `watcher_behind` or
-          `batch_in_review`.
+          `service_not_published`, `watcher_behind` or `batch_in_review`.
+          Since runtime 493 a deposit names no spender: its own hotkey,
+          which URnetwork holds for a hotkey it assigned, spends it, fee-free,
+          so the spender's checks are gone.
         - `mint_available`: minting works now. Otherwise
           `mint_unavailable_reason`: `gamma_disabled` (off network-wide),
           `subnet_gamma_disabled` (SN25 has not switched gamma on),
@@ -4658,6 +4659,12 @@ paths:
           (`renews`).
         - `auto_min_daily_cap_gamma`: the daily cap that lets every
           automatic charge (a renewal, a top-up, a seat upgrade) be spent.
+        - `daily_cap_gamma`: the daily spend cap a new deposit opens with
+          (the mint command names it): `auto_min_daily_cap_gamma` plus a
+          quarter, rounded up to a whole gamma. A spend larger than its
+          deposit's cap never passes; the headroom lets a raised price or a
+          second charge the same day pass without raising the cap.
+        - `spender`: retired with runtime 493; always "".
 
         `disclaimer` is the wording every surface shows; `automatic_notice`
         says what is charged automatically. Unauthenticated.
@@ -4678,7 +4685,7 @@ paths:
                     mint_available: true
                     netuid: 25
                     service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
-                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    spender: ""
                     services_url: https://api.bringyour.com/pay/gamma/services.json
                     price_tier: standard
                     tao_usd: "217.808001475"
@@ -4733,7 +4740,7 @@ paths:
                     mint_unavailable_reason: price_stale
                     netuid: 25
                     service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
-                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    spender: ""
                     services_url: https://api.bringyour.com/pay/gamma/services.json
                     price_tier: standard
                     tao_usd: "217.808001475"
@@ -4801,20 +4808,27 @@ paths:
 
         ```bash
         btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> \
-          --amount-tao <TAO> --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
+          --amount-tao <TAO> --daily-spend-cap-gamma 50 --dry-run
         ```
 
-        `--service-hotkey` names URnetwork's spender for a new deposit, and
-        refuses a deposit that names another. The mint is the only step
+        It needs btcli 11.3.5 or later (Bittensor runtime 493). A new
+        deposit opens with the daily spend cap `mint_daily_cap_gamma` names
+        (the command carries it); a mint into an existing deposit keeps that
+        deposit's cap, so the command leaves the flag out and
+        `mint_daily_cap_gamma` is "" (naming another cap fails the mint with
+        `GammaDepositDailySpendCapMismatch`). The mint is the only step
         outside this API, and the only signature: the bearer token is the only
         authentication, since whoever mints into this account's hotkey pays
         for this account. The same hotkey serves every later purchase; each
-        purchase has its own 32-byte `reference`, which our spend carries.
+        purchase has its own 32-byte `reference`, which names it here and in
+        its status (a spend on chain carries none).
 
         Once the deposit can pay (its spendable gamma covers the price), the
-        biller spends exactly `amount_gamma` with `spend_gamma` and credits
-        the purchase only when that spend is finalized. A spend the chain
-        skips (the gamma moved away, the cap, another spender) buys nothing,
+        biller spends exactly `amount_gamma` with `spend_gamma`, signed by
+        the deposit's own hotkey at URnetwork's service, and credits the
+        purchase only when that spend is finalized. While the deposit's cap
+        has not refilled enough the purchase waits (its status says for how
+        long); a spend the chain refuses (the gamma moved away) buys nothing,
         and is tried again only after the deposit changes. Poll
         /pay/gamma/status with `status_token`, a bearer secret for this one
         purchase (keep it out of urls and logs).
@@ -4920,14 +4934,14 @@ paths:
                     netuid: 25
                     deposit_hotkey: "<deposit_hotkey>"
                     service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
-                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    spender: ""
                     min_daily_cap_gamma: "40"
                     auto_min_daily_cap_gamma: "40"
                     min_mint_gamma: "0.1"
                     indicative_tao: "0.189165"
                     mint_available: true
-                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
-                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --daily-spend-cap-gamma 50 --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.189165 --daily-spend-cap-gamma 50 -w <your_coldkey>
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: "Unless you turn them off, we charge the same deposit automatically: plans paid with Gamma renew at the end of each term, a data pack (1 TiB unless you choose another) is added when your data runs out, and a free account that reaches its client limit is upgraded to Pro."
                     expires_at: "2026-11-12T12:00:00Z"
@@ -5008,12 +5022,13 @@ paths:
         - `seen`: the deposit holds gamma but cannot pay yet: less than the
           price (`remaining_gamma` is how much more to mint), a daily cap
           below the price (`daily_cap_too_low`; raise it to at least
-          `min_daily_cap_gamma`), another spender (`wrong_spender`; point it
-          back with `btcli gamma set-spender --netuid 25 --hotkey
-          <deposit_hotkey> --service-hotkey <service_hotkey>`), or our last
-          spend was skipped (`error.code` from the chain's reason:
-          `insufficient_gamma`, `daily_cap_exceeded`, `wrong_spender`,
-          `no_deposit`), tried again only after the deposit changes.
+          `min_daily_cap_gamma` with `btcli gamma set-cap`), a cap that has
+          not refilled enough yet (`daily_cap_exceeded`: the payment goes
+          through by itself once it has, and `error.message` says in how
+          long), or our last spend was refused (`error.code`:
+          `insufficient_gamma`, `daily_cap_exceeded`, `daily_cap_too_low`,
+          `no_deposit`, `invalid_amount`), tried again only after the deposit
+          changes.
         - `pending`: no gamma at the hotkey yet.
 
         Amounts are exact decimal strings of gamma (10^9 units per gamma), as
@@ -5250,6 +5265,94 @@ paths:
 
   # ----- store and processor notifications -----
 
+  /pay/gamma/claim/challenge:
+    post:
+      tags: [Other]
+      summary: Gamma Claim Challenge
+      description: |
+        Since Bittensor runtime 493 anyone holding an SN25 gamma deposit can
+        spend it straight at URnetwork's listed service from their own hotkey
+        (`btcli gamma spend --netuid 25 --service-hotkey <service_hotkey>`),
+        without this API: a direct payment. The chain keeps what each hotkey
+        has spent at the service, so the payment is never lost, but nothing
+        says which account it was for. Claim it for the caller's network:
+        this call returns the one line (`message`) to sign with the hotkey
+        that paid, and what that hotkey can claim now (`claimable_gamma`, and
+        the data it buys); /pay/gamma/claim takes the signature.
+
+        Sign with btcli 11.3.5 or later (`sign_command`):
+
+        ```bash
+        btcli wallet sign --use-hotkey --message "<message>" -w <your_wallet> -H <your_hotkey>
+        ```
+
+        The message names the network, the hotkey, URnetwork's service and
+        when it was issued, and expires 15 minutes later. Refusals return
+        `error`: `invalid_request` (not an SS58 address), `deposit_hotkey` (a
+        hotkey URnetwork assigned: its spends were URnetwork's own charges),
+        `nothing_to_claim`, `asset_unavailable` (Gamma is not selling now, or
+        the chain could not be read), `rate_limited`.
+      operationId: gammaClaimChallenge
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GammaClaimChallengeArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaClaimChallengeResult"
+        "401":
+          description: Missing or invalid bearer token.
+  /pay/gamma/claim:
+    post:
+      tags: [Other]
+      summary: Gamma Claim
+      description: |
+        Claim a direct payment for the caller's network with the signed
+        challenge of /pay/gamma/claim/challenge. The claim takes the part of
+        the hotkey's total at URnetwork's service, read from the chain at the
+        finalized head, that no claim has taken yet: a payment from before
+        claims existed is in it too. With no `plan` it is credited as data,
+        at the gamma price of the 1 TiB data pack, rounded down to a whole
+        MiB (`data_bytes`); with `plan` (`monthly` or `yearly`) it buys that
+        Pro plan at the caller's price, when the claimable amount covers it,
+        and the rest stays claimable. Credit follows within a minute: poll
+        /pay/gamma/status with `intent_id` and `status_token`.
+
+        One hotkey's claims are serialized, so the same gamma is claimed
+        once; a second claim answers `nothing_to_claim`. Refusals return
+        `error` and claim nothing: `invalid_request` (not this account's
+        challenge for this hotkey and service), `claim_expired`,
+        `signature_invalid`, `deposit_hotkey`, `nothing_to_claim`,
+        `insufficient_gamma` (the plan costs more than is claimable),
+        `plan_unavailable`, `already_subscribed` (another Pro subscription
+        renews, or a Gamma plan charge is in flight), `asset_unavailable`,
+        `rate_limited`, `start_failed`.
+      operationId: gammaClaim
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GammaClaimArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GammaClaimResult"
+        "401":
+          description: Missing or invalid bearer token.
   /pay/stripe:
     post:
       tags: [Other]
@@ -8545,14 +8648,14 @@ paths:
                     netuid: 25
                     deposit_hotkey: "<deposit_hotkey>"
                     service_hotkey: 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG
-                    spender: 5EUQU938kFzJsVBjn9ch5RNNG4191j7mSz5Djf5vghrmWgUC
+                    spender: ""
                     min_daily_cap_gamma: "89.97"
                     auto_min_daily_cap_gamma: "89.97"
                     min_mint_gamma: "0.1"
                     indicative_tao: "0.423592"
                     mint_available: true
-                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG --dry-run
-                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --service-hotkey 5CyQFykVpfa9xgZVGgBsiNUpjbo1EihBTSkPvDC1FZbL1wxG -w <your_coldkey>
+                    mint_dry_run_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 50 --dry-run
+                    mint_command: btcli tx mint-gamma --netuid 25 --hotkey <deposit_hotkey> --amount-tao 0.423592 --daily-spend-cap-gamma 50 -w <your_coldkey>
                     disclaimer: Gamma can't be refunded or transferred. We charge only the price of what you buy. Unspent Gamma stays in your deposit and works only on SN25.
                     automatic_notice: ""
                     expires_at: "2026-11-15T12:00:00Z"
@@ -28068,7 +28171,7 @@ components:
           type: boolean
         unavailable_reason:
           type: string
-          enum: [not_configured, chain_unreachable, runtime_unsupported, service_not_published, service_spender_mismatch, billing_proxy_missing, fee_float_low, watcher_behind, batch_in_review]
+          enum: [not_configured, chain_unreachable, runtime_unsupported, service_not_published, watcher_behind, batch_in_review]
         mint_available:
           type: boolean
         mint_unavailable_reason:
@@ -28080,7 +28183,7 @@ components:
           type: string
         spender:
           type: string
-          description: The SS58 account every URnetwork deposit names as its spender.
+          description: Retired with runtime 493 (a deposit names no spender; its own hotkey spends it); always "".
         services_url:
           type: string
         price_tier:
@@ -28106,6 +28209,9 @@ components:
         auto_min_daily_cap_gamma:
           type: string
           description: The daily cap every automatic charge needs.
+        daily_cap_gamma:
+          type: string
+          description: The daily spend cap a new deposit opens with (the mint command names it), auto_min_daily_cap_gamma plus a quarter, rounded up to a whole gamma.
         disclaimer:
           type: string
         automatic_notice:
@@ -28180,10 +28286,14 @@ components:
           type: string
         spender:
           type: string
+          description: Retired with runtime 493; always "".
         min_daily_cap_gamma:
           type: string
         auto_min_daily_cap_gamma:
           type: string
+        mint_daily_cap_gamma:
+          type: string
+          description: The daily spend cap the mint command opens a new deposit with; "" when the deposit exists, whose own cap the mint keeps.
         min_mint_gamma:
           type: string
         indicative_tao:
@@ -28355,6 +28465,90 @@ components:
           description: "`confirming`: its payment was sent to the chain, or landed and is being credited."
           enum: [confirming]
 
+    GammaClaimChallengeArgs:
+      type: object
+      required: [hotkey]
+      properties:
+        hotkey:
+          type: string
+          description: The SS58 address of the hotkey that paid URnetwork's service directly.
+
+    GammaClaimChallengeResult:
+      type: object
+      properties:
+        hotkey:
+          type: string
+        netuid:
+          type: integer
+        service_hotkey:
+          type: string
+        message:
+          type: string
+          description: The one line to sign with the hotkey, exactly. It names the network, the hotkey, URnetwork's service and when it was issued.
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: 15 minutes after issued_at.
+        sign_command:
+          type: string
+          description: How to sign it with btcli 11.3.5 or later; btcli prints the signature as bare hex (signed_message).
+        claimable_gamma:
+          type: string
+          description: What the hotkey spent at URnetwork's service that no claim has taken, at the finalized head, as an exact decimal string of gamma.
+        claimable_data_bytes:
+          type: integer
+          format: int64
+          description: The data claimable_gamma buys now.
+        error:
+          $ref: "#/components/schemas/GammaPaymentError"
+
+    GammaClaimArgs:
+      type: object
+      required: [hotkey, message, signature]
+      properties:
+        hotkey:
+          type: string
+        message:
+          type: string
+          description: The challenge, exactly as /pay/gamma/claim/challenge gave it.
+        signature:
+          type: string
+          description: The hotkey's signature of the message, in hex (with or without 0x); raw or <Bytes>-wrapped.
+        plan:
+          type: string
+          enum: ["", monthly, yearly]
+          description: '"" credits everything claimable as data; monthly or yearly buys that Pro plan at the caller''s price when the claimable amount covers it, and leaves the rest claimable.'
+
+    GammaClaimResult:
+      type: object
+      properties:
+        intent_id:
+          type: string
+        status_token:
+          type: string
+          description: A bearer secret for this claim's status (/pay/gamma/status).
+        hotkey:
+          type: string
+        plan:
+          type: string
+        amount_gamma:
+          type: string
+          description: What this claim took, in gamma.
+        data_bytes:
+          type: integer
+          format: int64
+          description: The data it credits; 0 for a plan.
+        remaining_gamma:
+          type: string
+          description: What stays claimable after it.
+        status:
+          $ref: "#/components/schemas/GammaPaymentStatusResult"
+        error:
+          $ref: "#/components/schemas/GammaPaymentError"
+
     GammaPaymentError:
       type: object
       description: |
@@ -28377,13 +28571,23 @@ components:
             network's Pro plan); and Gamma's own:
             `insufficient_gamma`: the deposit holds, or held when we spent,
             less gamma than the price.
-            `daily_cap_exceeded`: the deposit's daily spend cap did not allow
-            the price when we spent.
+            `daily_cap_exceeded`: the deposit's daily spend cap does not
+            allow the price yet; it refills over a day, and the payment goes
+            through by itself once it does (`message` says in how long).
             `daily_cap_too_low`: the deposit's daily spend cap is below the
             price, so no spend can pass; raise it to `min_daily_cap_gamma`.
-            `wrong_spender`: the deposit names another spender.
-            `no_deposit`: there was no deposit at the hotkey when we spent.
-            `invalid_amount`: the chain refused the amount.
+            `no_deposit`: there was no deposit at the hotkey when we went to
+            spend.
+            `invalid_amount`: the chain refused the amount or the spend.
+            /pay/gamma/claim and /pay/gamma/claim/challenge:
+            `deposit_hotkey`: the hotkey is one URnetwork assigned; what it
+            spent were URnetwork's own charges, so there is nothing to claim.
+            `nothing_to_claim`: the hotkey has spent nothing at URnetwork's
+            service that is not claimed already.
+            `signature_invalid`: the signature is not the hotkey's signature
+            of the challenge.
+            `claim_expired`: the challenge is older than 15 minutes; ask for
+            a new one.
             `deposit_coldkey_mismatch`: the hotkey's deposit, or the hotkey,
             belongs to another coldkey (the chain's `NonAssociatedColdKey`);
             ask again with `coldkey`.
@@ -28399,6 +28603,6 @@ components:
             `gift_note_has_link`, `gift_daily_limit`, and
             `payment_in_progress` (an earlier gift's Gamma payment is still
             being processed).
-          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, wrong_spender, no_deposit, invalid_amount, deposit_coldkey_mismatch, mint_too_small, mint_liquidity_exceeded, mint_slippage, gift_sales_closed, invalid_quantity, invalid_recipients, invalid_send_on, message_too_long, gift_note_has_link, gift_daily_limit, payment_in_progress]
+          enum: [invalid_request, asset_unavailable, plan_unavailable, item_unavailable, offer_unavailable, guest_sign_in_required, invalid_email, rate_limited, start_failed, quote_expired, already_subscribed, insufficient_gamma, daily_cap_exceeded, daily_cap_too_low, no_deposit, invalid_amount, deposit_coldkey_mismatch, deposit_hotkey, nothing_to_claim, signature_invalid, claim_expired, mint_too_small, mint_liquidity_exceeded, mint_slippage, gift_sales_closed, invalid_quantity, invalid_recipients, invalid_send_on, message_too_long, gift_note_has_link, gift_daily_limit, payment_in_progress]
         message:
           type: string
