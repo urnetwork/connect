@@ -103,6 +103,12 @@ class SpecTest(unittest.TestCase):
         ("/acl/ack", "post"),
         ("/evs/v1/repos/{repo_id}", "put"),
         ("/evs/v1/repos/{repo_id}/segments/{segment_id}", "put"),
+        ("/evs/v1/repos/{repo_id}/reseed", "post"),
+        ("/evs/v1/repos/{repo_id}/push/{push_id}/{part}", "post"),
+        ("/evs/v1/repos/{repo_id}/push/{push_id}/lease", "post"),
+        ("/evs/v1/repos/{repo_id}/read", "post"),
+        ("/evs/v1/repos/{repo_id}/refs", "get"),
+        ("/evs/v1/repos/{repo_id}/log", "get"),
     }
 
     def test_sidecar_routes_are_documented_and_planned(self):

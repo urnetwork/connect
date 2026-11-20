@@ -14964,10 +14964,24 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Re-seed a repo after a site loss
-      description: Needs `admin`. Honored only in the deployment's re-seed mode.
+      description: |
+        Needs `admin`. Taken only while the deployment's re-seed mode is on; outside
+        it every call answers 503. After a site loss a repo admin's device sends back
+        what its mirror holds, one `EvsReseedRequest` a call, never re-signed: a
+        one-part push, one part of a push in parts, that push's seal naming the
+        places its part calls answered, one slot, or one Signed `EvsReseed`. evs runs
+        the push route's steps in a re-seed mode that skips the statement's time
+        window, the 24-hour receipt rule and the quota gate, and checks the signature
+        at the statement's own auth pin. Slots come last: a slot is taken only once a
+        re-seeded version names it, stripped of every key an ERASE evs holds covers.
+
+        The repo must be one the projection lists live, or deleted and still
+        restorable; such a repo's record moves to deleted before anything is taken.
+        No refusal is recorded, so the device sends a call again once what it lacked
+        is there. Every answer but a 200 is an `EvsRefusalReply`, whose code fixes
+        the status; a 429 or 503 carries `Retry-After`.
       operationId: evsRepoReseed
       security:
         - ServiceTokenAuth: []
@@ -14976,13 +14990,98 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsReseedRequest"
       responses:
         "200":
-          description: OK.
+          description: |
+            An `EvsPushReply`: a push's or seal's version, the original one when it
+            stands committed already; a part's `place`, or its push's version once
+            that push stands committed; the version a kept `EvsReseed` names; and an
+            empty one for a slot, stored, or left with no key and so not stored.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsPushReply"
+        "400":
+          description: |
+            `INVALID`: a body past 2 MiB or out of shape, two forms in one call, a push
+            in parts sent whole or more than one part a call, a statement, payload,
+            part or slot that does not parse, a statement of another repo, or a
+            signature that does not verify at the statement's own auth pin.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token or below `admin`, a repo the projection does
+            not list or of another network, an `EvsReseed` no repo admin of the
+            newest state signed, or a statement whose signer the refs table refuses at
+            the statement's own auth pin.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo is not placed, or its record is not written."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: |
+            `SHREDDING` for a repo whose `RepoDelete` carries `now` or is past the
+            7-day restore window, or that is shredding or shredded; `REPO_DELETED` for
+            a repo deleted under another deletion than the unrestored `RepoDelete`
+            the projection ends in; `REPO_KEYING` before activation. A push or seal
+            gets the push route's 409s, never recorded: `PARTS_MISSING` for a part
+            place that holds no part of the statement or whose batch minute is over 24
+            hours old, `SEGMENT_GONE` for a segment evs does not hold yet,
+            `BASE_STALE` and `PUSH_ID_REUSED` among them; a part only
+            `PUSH_ID_REUSED`; and any of them `FORMAT_UNSUPPORTED` with
+            `needs_format` for format 2 at a format-1 instance. A slot gets
+            `SLOT_UNKNOWN` while no re-seeded version names it and `SLOT_STALE` when
+            another object stands at its id; an `EvsReseed` gets `BASE_STALE` unless
+            it names the ref's current head.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "412":
+          description: |
+            `GATE_CLOSED` for a pin below the head's or off evs's chain, and the push
+            route's path-epoch 412s, never recorded.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: |
+            `BUSY`, `FOLD_BEHIND`, `WAIT` while another push's seal lease is live, or
+            the write budget's `RESOURCE_EXHAUSTED`, with `retry_after_ms`. Nothing is
+            refused.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: the re-seed mode is off, evs's gate is
+            closed to the network, its clock is unsure, a statement's auth pin is
+            above or no longer in evs's state, a store did not answer, or a push's
+            outcome is unknown (`outcome`), which the same call settles.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/segments/{segment_id}:
     servers:
@@ -15194,13 +15293,21 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Post one part of a large push
       description: |
-        `{part, receipts}` for one part of a push over 1 MiB or 1,024 entry writes.
-        Needs `rw`, and `deposit` allows only the caller's deposit ref. At most 4 at
-        once. A git-mode push takes the seal lease first.
+        `{statement, part, receipts}` for one part of a push over 1 MiB or 1,024
+        entry writes: the Signed `EvsPush`, its `EvsPushPart` k as sent and the
+        receipts of the segments the part's entries upload, with format 2's staged
+        segments. Needs `rw`, and `deposit` allows only the caller's deposit ref.
+        The client posts at most 4 at once. A git-mode push takes the seal lease
+        first. evs checks the part's own entries as a push's (steps 5b to 5e, 5g and
+        5h) and appends it to a batch record; nothing commits until the seal. A part
+        posted twice is two records, and the seal names one.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 429 or 503 carries `Retry-After`. A part's refusal is never
+        recorded, since only its push's seal commits.
       operationId: evsPushPart
       security:
         - ServiceTokenAuth: []
@@ -15210,30 +15317,120 @@ paths:
         - name: part
           in: path
           required: true
+          description: The part's number k, from 1 to the statement's `part_count`, at most 1,024.
           schema:
             type: integer
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsPartRequest"
       responses:
         "200":
-          description: The part's `place`, which the seal names.
+          description: |
+            An `EvsPushReply` with the part's `place`, which the seal names; or with
+            the push's `version` when it stands committed already.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsPushReply"
+        "400":
+          description: |
+            `INVALID`: a push id or part number that does not parse, a body past 2
+            MiB, a statement, part or receipt that does not parse or verify, or a
+            part of another push than the path's or numbered unlike it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "402":
+          description: |
+            `QUOTA_PAYMENT`: at the storage limit or spent where a purchase lifts the
+            limit, with `quota` naming it and `upgrade` set.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: "`SCOPE`, or `QUOTA_LIMIT` at a limit no purchase lifts."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo was never placed."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: |
+            `PUSH_ID_REUSED` for a push id under another statement, a refusal the
+            head records for this push again with `recorded: true`, or the push
+            route's other 409s for the part's own entries, such as `TIME_STALE`,
+            `REPO_KEYING`, `REPO_DELETED`, `SHREDDING`, `REF_MODE`,
+            `FORMAT_UNSUPPORTED` with `needs_format`, `VERSIONING`, `INDEX_EPOCH`,
+            `PATH_CONFLICT`, `DIRECTORY_FULL`, `SEGMENT_GONE`, `SLOT_UNKNOWN` and
+            `DROPPED`, each with the push id.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "412":
+          description: One of `GATE_CLOSED`, `PATH_EPOCH`, `PATH_EPOCH_DUE` or `EPOCH_SOURCES_FULL`, with the push id.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "429":
+          description: |
+            `TIME_AHEAD`, `BUSY`, or the `RESOURCE_EXHAUSTED` of the write budget or of
+            a quota's rate, with `retry_after_ms`. Nothing is refused.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network or
+            its clock is unsure, its authorization state is not loaded, or a store
+            did not answer. The client posts the part again.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "507":
+          description: "`CLUSTER_FULL`: the repo's metadata cluster stands at its cohort limit."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/push/{push_id}/lease:
     servers:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Take a git-mode seal lease
       description: |
-        Takes the ref's seal lease for this push, after its segments and before its
-        parts. Needs `rw`.
+        `{ref_id, base_version, ms}`: takes the ref's seal lease for this push for
+        `ms`, at most 120,000, after its segments and before its parts. Needs `rw`.
+        One head CAS sets the lease and raises the fence, changing no version, only
+        while the head stands at `base_version` and no other push's lease is live;
+        a ref with no head takes it in a placeholder head. Other pushes to the ref
+        then wait until the lease ends or the seal clears it, and reads never wait.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 429 or 503 carries `Retry-After`. A push the head's refusal
+        records hold gets that refusal again, with `recorded: true`.
       operationId: evsPushLease
       security:
         - ServiceTokenAuth: []
@@ -15243,16 +15440,70 @@ paths:
       requestBody:
         required: true
         content:
-          application/json:
+          application/x-protobuf:
             schema:
-              $ref: "#/components/schemas/EvsPushLeaseArgs"
+              $ref: "#/components/schemas/EvsLeaseRequest"
       responses:
         "200":
-          description: This push holds the lease.
+          description: |
+            This push holds the lease, with no body: taken now, already its own and
+            live, or moot since the push committed.
+        "400":
+          description: |
+            `INVALID`: a push id, body or ref id that does not parse, or `ms` of 0 or
+            past 120,000.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`, or a revocation voids it.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token, or no `rw` or `admin` on the repo that the
+            newest verified state holds; a deposit-only token is refused.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo was never placed."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "409":
-          description: Non-fast-forward, read from the cluster.
+          description: |
+            `NON_FAST_FORWARD`: the head, read from the cluster, stands at another
+            version than `base_version`. `REF_MODE`: a file-mode ref, which takes no
+            lease. Or a refusal the head records for this push, with `recorded: true`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "429":
-          description: "`BUSY`, or another push's live lease, with `retry_after_ms`."
+          description: |
+            `WAIT` while another push's lease is live, `BUSY` once the head changed
+            under every attempt, or the write budget's `RESOURCE_EXHAUSTED`, with
+            `retry_after_ms`. Nothing is refused.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network or
+            its clock is unsure, its authorization state is not loaded, or a store
+            did not answer. A lease's write is found on the next read, so the client
+            asks again.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/path-epoch:
     servers:
@@ -15336,14 +15587,23 @@ paths:
       - url: https://evs.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a ref, or up to 64 owned streams
       description: |
-        Needs `r`. Either `{ref_id, pin_version, fresh, paths, ...}`, up to 64 paths
-        with what the caller wants of each, or `{refs}`, up to 64 `(ref_id,
-        pin_version)` of a record-class repo's owned streams. The answer is one
-        framed stream that the caller verifies against its pins.
+        Needs `r`, which `rw` and `admin` imply; a deposit-only token is refused. An
+        `EvsReadRequest`, either `{ref_id, pin_version, fresh, paths, ...}`, up to 64
+        paths with what the caller wants of each and the ranges, slots, map parts,
+        log pages and push records it names, or `{refs}` alone, up to 64 `(ref_id,
+        pin_version)` of a record-class repo's owned file-mode streams. The answer
+        is one framed stream that the caller verifies against its pins: the head,
+        from evs's cache where its rules allow and never for `fresh`, every
+        statement after the pin or `behind` with the first missing version, each
+        path, then the objects. A streams read stays within 4 MiB, answering `more`
+        with the next version of each ref past it.
+
+        A refused answer is an `EvsRefusalReply`, whose code fixes the status; a 503
+        carries `Retry-After`. A read that fails once the 200 is written ends its
+        stream with an `error` frame, `UNAVAILABLE`, in the end frame's place.
       operationId: evsRead
       security:
         - ServiceTokenAuth: []
@@ -15352,31 +15612,96 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsReadRequest"
       responses:
         "200":
-          description: One framed stream.
+          description: One framed stream, the last frame with `end` set or `error` in its place.
           content:
-            application/octet-stream:
+            application/x-protobuf:
               schema:
-                type: string
-                format: binary
+                $ref: "#/components/schemas/EvsReadFrames"
+        "400":
+          description: |
+            `INVALID`: a body past 16 MiB, or one that does not parse or passes its
+            bounds (64 paths, 8 token paths a path, 64 ranges and 32 MiB of them, 64
+            slots, map parts, log pages or push records); a ref, slot or segment id
+            of the wrong length or a range of no length; a path naming no token path,
+            one that does not parse, or an epoch twice or none; or a
+            `commit_version` with no `version`. A streams read: any other field, more
+            than 64 refs or one named twice, a repo not record-class, or a ref that
+            stands and is not an owned file-mode stream.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "402":
+          description: |
+            `QUOTA_PAYMENT`: the caller's network is spent and the repo is another
+            network's, with `upgrade` set. A spent network reads its own repos, paced.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token, or no `r`, `rw` or `admin` on the repo that
+            the newest verified state holds.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo is not placed, or its record is not written."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: |
+            `REPO_DELETED` while the repo is deleted, `SHREDDING` once it is shredding
+            or shredded, before anything is read. `FORMAT_UNSUPPORTED` with
+            `needs_format: 2` for a batch or record of a format past this instance's.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network, its
+            authorization state is not loaded, a store did not answer before the
+            first frame, or a read by number passed its scan bound unfinished.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/refs:
     servers:
       - url: https://evs.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List a repo's refs
       description: |
-        Needs `r`. With `moved_after`, only the refs whose last commit raised the
-        repo's push sequence past that value. A value from before the sequence's
-        restart answers every ref.
+        Needs `r`, which `rw` and `admin` imply; a deposit-only token is refused.
+        The repo's refs as their heads stand on the cluster, each a head summary
+        with the push sequence its last commit raised, beside the repo's object
+        format and push sequence; a placeholder head is left out. With
+        `moved_after`, only the refs whose last commit raised the repo's push
+        sequence past that value. A value from before the sequence's restart, or one
+        evs's cache cannot place, answers every ref with `all` set, as no
+        `moved_after` does.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 503 carries `Retry-After`.
       operationId: evsRefs
       security:
         - ServiceTokenAuth: []
@@ -15390,17 +15715,77 @@ paths:
             type: string
       responses:
         "200":
-          description: OK.
+          description: The refs.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefsReply"
+        "400":
+          description: "`INVALID`: a `moved_after` that is not a decimal number below 2^64."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "402":
+          description: |
+            `QUOTA_PAYMENT`: the caller's network is spent and the repo is another
+            network's, with `upgrade` set.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token, or no `r`, `rw` or `admin` on the repo that
+            the newest verified state holds.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo is not placed, or its record is not written."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: "`REPO_DELETED` while the repo is deleted; `SHREDDING` once it is shredding or shredded."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network, its
+            authorization state is not loaded, or the listing, the repo's record or a
+            head read did not answer.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/log:
     servers:
       - url: https://evs.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Page a ref's statements
-      description: Needs `r`. At most 1,000 statements a page, for a pin older than the head's window.
+      description: |
+        Needs `r`, which `rw` and `admin` imply; a deposit-only token is refused. The
+        ref's Signed `EvsPush` statements as received, from version `since`, at most
+        1,000 a page, for a pin older than the head's window. Nothing is served
+        above the head the page read; a ref with no head, or a head below `since`,
+        answers an empty page.
+
+        Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
+        status; a 503 carries `Retry-After`.
       operationId: evsLog
       security:
         - ServiceTokenAuth: []
@@ -15409,17 +15794,73 @@ paths:
         - name: ref
           in: query
           required: true
+          description: The ref's id, 32 lowercase hex digits.
           schema:
             type: string
         - name: since
           in: query
           required: true
-          description: The version the page starts after.
+          description: The page's first version, from 1; a reader pinned at v asks from v + 1.
           schema:
             type: integer
       responses:
         "200":
-          description: OK.
+          description: |
+            An `EvsLogReply`: each statement with its version, and `next_version`, the
+            version the next page starts at, 0 once the page reaches the head.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsLogReply"
+        "400":
+          description: "`INVALID`: a `ref` that is not 32 lowercase hex digits, or a `since` that is not a decimal number from 1."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "401":
+          description: The token does not verify for `evs`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "402":
+          description: |
+            `QUOTA_PAYMENT`: the caller's network is spent and the repo is another
+            network's, with `upgrade` set.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "403":
+          description: |
+            `SCOPE`: not a sidecar's token, or no `r`, `rw` or `admin` on the repo that
+            the newest verified state holds.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "404":
+          description: "`NOT_FOUND`: the repo is not placed, or its record is not written."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "409":
+          description: "`REPO_DELETED` while the repo is deleted; `SHREDDING` once it is shredding or shredded."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
+        "503":
+          description: |
+            Unavailable, with `Retry-After`: evs's gate is closed to the network, its
+            authorization state is not loaded, or a head or statement read did not
+            answer.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/slots/delete:
     servers:
@@ -17010,7 +17451,7 @@ components:
       schema:
         type: string
       required: true
-      description: The push's 16 random bytes, which name one statement.
+      description: The push's 16 random bytes as 32 lowercase hex digits, which name one statement.
     Dpop:
       in: header
       name: DPoP
@@ -32997,20 +33438,68 @@ components:
       type: string
       format: binary
 
-    EvsPushLeaseArgs:
-      type: object
-      required:
-        - ref_id
-        - base_version
-        - ms
-      properties:
-        ref_id:
-          type: string
-        base_version:
-          type: integer
-        ms:
-          description: At most 120,000.
-          type: integer
+    EvsPartRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsPartRequest`: the Signed `EvsPush` bytes as
+        signed, its `EvsPushPart` k as sent, which `parts_sha256` covers, the upload
+        receipts of the part's new segments, and format 2's staged segments.
+      type: string
+      format: binary
+
+    EvsLeaseRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsLeaseRequest`: the ref's id, the version
+        the push builds on, `base_version`, and the lease's length `ms`, at most
+        120,000.
+      type: string
+      format: binary
+
+    EvsReseedRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsReseedRequest`, one form a call: a
+        re-seeded Signed `EvsPush` as its device kept it with a one-part push's
+        `payload`; with `part_number` and `parts`, one part of a push in parts; with
+        `part_places`, that push's seal; with `slot_id` and `slot`, one slot and the
+        statement of a re-seeded version naming it; or `statement` alone, a Signed
+        `EvsReseed`.
+      type: string
+      format: binary
+
+    EvsReadRequest:
+      description: |
+        sidecar protocol/evs.proto's `EvsReadRequest`: a ref, the caller's pin,
+        `fresh`, at most 64 paths, each by its token path in each epoch it names,
+        and the segment ranges, slots, map parts, log pages and push records to
+        send, with format 2's held drops; or `refs` alone, at most 64 `(ref_id,
+        pin_version)` of a record-class repo's owned streams.
+      type: string
+      format: binary
+
+    EvsReadFrames:
+      description: |
+        A read's reply: frames, each a u32 big-endian length and then sidecar
+        protocol/evs.proto's `EvsReadFrame` of that length, each one part of the
+        reply by its set fields: the head summary, a statement, `behind`, `more`,
+        a path, an object, and last `end`, or `error`, an `EvsRefusalReply`, in its
+        place when the reply cannot be finished.
+      type: string
+      format: binary
+
+    EvsRefsReply:
+      description: |
+        sidecar protocol/evs.proto's `EvsRefsReply`: the repo's object format, its
+        push sequence, each ref's head summary with the push sequence its last
+        commit raised, and `all` when every ref is listed.
+      type: string
+      format: binary
+
+    EvsLogReply:
+      description: |
+        sidecar protocol/evs.proto's `EvsLogReply`: at most 1,000 statements, each
+        with its version, and `next_version`, where the next page starts, 0 once
+        the page reaches the head.
+      type: string
+      format: binary
 
     EvsPathMapRequest:
       description: |
