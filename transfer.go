@@ -1708,6 +1708,14 @@ type ClientSettings struct {
 	// a short pause that lets a full queue drain is enough. Non-positive does
 	// not retry: they wait for the next quality change.
 	NetworkQualityNotificationRetryInterval time.Duration
+	// SkipNetworkQualityListener leaves this client out of the process-wide
+	// list that NetworkQualityChanged calls (AddNetworkQualityChangeListener).
+	// Only the clients of a device hear that device's network quality change,
+	// and every add and remove clones the whole list, so a process holding
+	// many clients that never hear one (a server's residents) skips it. The
+	// client still sends and receives its peers' quality notifications. False,
+	// the default, registers.
+	SkipNetworkQualityListener bool
 	// CloseSequencesMaxPendingCount bounds the contract and peer ids from the
 	// platform's CloseSequences that wait for the client's close worker. Ids
 	// past it are dropped and counted, and their contracts close as they did
@@ -10043,22 +10051,32 @@ func newSequenceDeadlineTimer() *sequenceDeadlineTimer {
 
 // Makes the next wake come no later than deadline. Reports whether it moved
 // the timer.
+//
+// A pending timer is never moved. The runtime (Go 1.23+) marks a timer moved
+// while it is in a P's timer heap, and once the moved deadline arrives, the
+// next scheduler check walks that P's whole heap to re-sort it. A receive
+// sequence moves its idle deadline in to the 10 ms ack compression deadline
+// on most bursts, so in a server holding a million timers those walks were
+// 8-12% of its CPU (server LBALTOPT2 §3.4). A stopped timer only marks itself
+// deleted, and the runtime removes deleted timers in batches, so an earlier
+// deadline stops the pending timer and arms a new one. A timer that already
+// fired is in no heap, so Reset only adds it.
 func (self *sequenceDeadlineTimer) armBy(deadline time.Time) bool {
 	if !self.armedDeadline.IsZero() && !deadline.Before(self.armedDeadline) {
 		return false
 	}
 	self.armedDeadline = deadline
-	if self.timer == nil {
-		wake := self.wake
-		self.timer = time.AfterFunc(time.Until(deadline), func() {
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
-		})
-	} else {
+	if self.timer != nil && !self.timer.Stop() {
 		self.timer.Reset(time.Until(deadline))
+		return true
 	}
+	wake := self.wake
+	self.timer = time.AfterFunc(time.Until(deadline), func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	})
 	return true
 }
 

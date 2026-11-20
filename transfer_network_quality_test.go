@@ -494,3 +494,33 @@ func TestSendBufferNetworkQualityPeersPrefersForwardLane(t *testing.T) {
 		}
 	}
 }
+
+// A client that skips the process-wide network quality listener list never
+// joins it, so a process of many such clients doesn't clone the list on each
+// client created and closed, while a default client still joins it. Either way
+// the client's own NetworkQualityChanged still runs.
+func TestClientNetworkQualitySkipsTheProcessListenerListWhenAsked(t *testing.T) {
+	listening := newNetworkQualityTestClient(t)
+	if !listening.networkQuality.globalListener {
+		t.Fatal("a default client did not join the process-wide listener list")
+	}
+	skipping := newNetworkQualityTestClient(t, func(settings *ClientSettings) {
+		settings.SkipNetworkQualityListener = true
+	})
+	if skipping.networkQuality.globalListener {
+		t.Fatal("a client that skips the listener list joined it")
+	}
+	skipping.NetworkQualityChanged()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := skipping.CloseAndWait(ctx); err != nil {
+		t.Fatalf("close the skipping client: %v", err)
+	}
+}
+
+// The default client settings keep joining the listener list.
+func TestDefaultClientSettingsJoinTheNetworkQualityListenerList(t *testing.T) {
+	if DefaultClientSettings().SkipNetworkQualityListener {
+		t.Fatal("the default client settings skip the network quality listener list")
+	}
+}
