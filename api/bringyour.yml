@@ -16477,10 +16477,11 @@ paths:
         after which the mail edge stops routing the network's mail. A receiver
         that later fails its checks stays published until DELETE, and the
         network's receivers are told. The caller is the network's Owner or an
-        Admin, with the network credential: a client token is refused. Naming a
-        receiver already named changes nothing. 402 outside the Team tier; 409
-        while mail is off or two receivers are named already; 503 with
-        Retry-After while the server does not serve mail yet.
+        Admin, with the network credential: a client token is refused, and so
+        is a network credential of no Owner or Admin, 403 with nothing written.
+        Naming a receiver already named changes nothing. 402 outside the Team
+        tier; 409 while mail is off or two receivers are named already; 503
+        with Retry-After while the server does not serve mail yet.
       operationId: mailDirectMxPut
       security:
         - BearerAuth: []
@@ -16502,7 +16503,7 @@ paths:
         "402":
           description: Direct MX is a Team feature.
         "403":
-          description: The caller is not the network's Owner or an Admin.
+          $ref: "#/components/responses/ClientJwtRefused"
         "409":
           description: Mail is off, or two receivers are named already.
         "503":
@@ -16514,7 +16515,9 @@ paths:
       description: |
         Removes every direct-MX receiver of the network, and the mail edge's
         own addresses answer for the network's mail host again. The caller is
-        the network's Owner or an Admin, with the network credential.
+        the network's Owner or an Admin, with the network credential: a client
+        token is refused, and so is a network credential of no Owner or Admin,
+        403 with nothing removed.
       operationId: mailDirectMxDelete
       security:
         - BearerAuth: []
@@ -16526,7 +16529,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MailDirectMxResult"
         "403":
-          description: The caller is not the network's Owner or an Admin.
+          $ref: "#/components/responses/ClientJwtRefused"
         "503":
           description: Mail is not served, or the zone cannot be written now.
 
