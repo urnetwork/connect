@@ -12122,6 +12122,64 @@ paths:
         "503":
           description: The mail cannot be judged or filed now; the sender sends it again.
 
+  /internal/gate/mail-direct-mx-probe:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Record one probe of a Team direct MX
+      description: |
+        mxedge's direct-MX prober checks each receiver a Team's
+        `POST /mail/direct-mx` named from the edge (public TCP 25,
+        STARTTLS, and a handshake presenting one of the receiver's
+        published mail host keys) and posts each outcome here: the row's
+        network, receiver and address, in its canonical text, and whether
+        the probe passed, nothing more; a field beyond these, or a second
+        value after the request, is refused 400 with nothing recorded. api
+        records it only while the direct-MX row still stands: the row's
+        state and, on a pass, the network's mail host records pointed at
+        every verified or failing address of the network, in api's own
+        root, then the network's route projection. `recorded` is false for
+        a row a DELETE or a receiver's removal took first, which writes
+        nothing. The `edge` bearer only, so mxedge writes neither the
+        direct-MX rows nor the zone. 404 for a network api does not know;
+        409 when the zone refuses the records now (the network no longer a
+        Team, its mail off, the address past the record API's A rules or
+        the zone suspended); 503 with Retry-After while api's mail routes
+        are dark or the outcome cannot be recorded now. Every refusal
+        leaves the row as it was, for the prober's next pass.
+      operationId: internalGateMailDirectMxProbe
+      security:
+        - InternalGateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalGateMailDirectMxProbeArgs"
+      responses:
+        "200":
+          description: Recorded, or the row was gone and nothing was written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateMailDirectMxProbeResult"
+        "400":
+          description: |
+            The body does not parse, holds a field or a value beyond the
+            format's, names no network or receiver, or an address that is
+            not an IP address in its canonical text.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or it is not the `edge` service's. The
+            body is the plain text "Forbidden.".
+        "404":
+          description: The network is none api knows; nothing was recorded.
+        "409":
+          description: The zone refuses the records now; the row is as it was.
+        "503":
+          description: The outcome cannot be recorded now; the prober tries again at its next pass.
+
   /sidecar/push-token:
     post:
       x-internal: true
@@ -32018,6 +32076,31 @@ components:
           type: boolean
         paged:
           description: The pager took the notice's page; false beside `notice` is a page taskworker's clock pass owes.
+          type: boolean
+    InternalGateMailDirectMxProbeArgs:
+      type: object
+      additionalProperties: false
+      required: [network_id, receiver_sidecar_id, address, passed]
+      properties:
+        network_id:
+          type: string
+          format: uuid
+        receiver_sidecar_id:
+          description: The direct-MX receiver the probe checked.
+          type: string
+          format: uuid
+        address:
+          description: The row's address as the prober probed it, IPv4 or IPv6 in its canonical text.
+          type: string
+        passed:
+          description: Whether the probe passed.
+          type: boolean
+    InternalGateMailDirectMxProbeResult:
+      type: object
+      required: [recorded]
+      properties:
+        recorded:
+          description: The row stood and the outcome is recorded; false is a row gone, with nothing written.
           type: boolean
     SidecarIdentityResult:
       type: object
