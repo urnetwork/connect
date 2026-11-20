@@ -7,7 +7,6 @@ package connect
 import (
 	"runtime"
 	"sync"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -69,15 +68,6 @@ func TestSequenceDeadlineTimerReplacesAPendingTimerAndResetsAFiredOne(t *testing
 		default:
 		}
 	})
-}
-
-// processCpu is the process's user and system CPU time.
-func processCpu() time.Duration {
-	var usage syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
-		return 0
-	}
-	return time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
 }
 
 // Arming an earlier deadline among many pending timers, as a server's
