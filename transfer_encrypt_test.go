@@ -782,6 +782,62 @@ func TestServerEpochIdPoisoning(t *testing.T) {
 	}
 }
 
+// Researcher regression: verifying the established epoch's certificate must
+// not mark the background rekey epoch, which has not finished its handshake.
+func TestRekeyCertVerificationBypass(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	// Establish initial epoch e1
+	e1 := &tlsHandshakeEpoch{
+		ctx:                  ctx1,
+		cancel:               cancel1,
+		handshakeDone:        make(chan struct{}),
+		establishmentDone:    make(chan struct{}),
+		derivedTlsCipher:     &sequenceCipher{},
+		peerIdentityVerified: true,
+	}
+	close(e1.handshakeDone)
+	close(e1.establishmentDone)
+
+	sess.stateLock.Lock()
+	sess.establishedEpoch = e1
+	sess.epoch = e1
+	sess.stateLock.Unlock()
+
+	// Trigger background rekey epoch e2
+	sess.restartHandshake()
+	e2 := sess.currentEpoch()
+	if e2 == nil || e2 == e1 {
+		t.Fatal("expected restartHandshake to start a new in-flight epoch")
+	}
+
+	// Mark cert verified while checking e1
+	verifiedBefore, _ := sess.CertVerificationState()
+	sess.MarkCertVerified()
+
+	// Promote unverified rekey epoch e2
+	sess.stateLock.Lock()
+	e2.derivedTlsCipher = &sequenceCipher{}
+	e2.peerIdentityVerified = true
+	sess.markEstablishedWithLock(e2)
+	e1Verified := e1.certVerified
+	e2Verified := e2.certVerified
+	sess.stateLock.Unlock()
+
+	// verify promoted e2 still requires cert check
+	verifiedAfter, _ := sess.CertVerificationState()
+	if !e1Verified || e2Verified || verifiedAfter {
+		t.Fatalf(
+			"rekey cert check bypassed: before=%v e1.certVerified=%v e2.certVerified=%v afterPromotion=%v",
+			verifiedBefore, e1Verified, e2Verified, verifiedAfter,
+		)
+	}
+}
+
 func TestHandshakeFailureCancelsEpochWorkers(t *testing.T) {
 	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
 	defer cleanup()
