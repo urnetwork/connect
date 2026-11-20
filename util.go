@@ -695,15 +695,29 @@ func NewPacedReconnect(minTimeout time.Duration) *Reconnect {
 }
 
 func (self *Reconnect) After() <-chan time.Time {
+	return afterDelay(self.delay())
+}
+
+// The wait After draws: what is left of minTimeout since the attempt began,
+// fully jittered when randomized, or zero once it has passed.
+func (self *Reconnect) delay() time.Duration {
 	timeout := self.minTimeout - time.Now().Sub(self.startTime)
 	if timeout <= 0 {
+		return 0
+	}
+	if self.randomized {
+		timeout = time.Duration(mathrand.Int64N(int64(timeout)))
+	}
+	return timeout
+}
+
+// A channel that fires after delay: one already closed when delay is not
+// positive, so a wait on it ends at once.
+func afterDelay(delay time.Duration) <-chan time.Time {
+	if delay <= 0 {
 		c := make(chan time.Time)
 		close(c)
 		return c
-	} else {
-		if self.randomized {
-			timeout = time.Duration(mathrand.Int64N(int64(timeout)))
-		}
-		return time.After(timeout)
 	}
+	return time.After(delay)
 }
