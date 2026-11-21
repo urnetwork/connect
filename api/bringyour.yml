@@ -13045,9 +13045,12 @@ paths:
         disclosure accepted, since URnetwork could then publish the CAA record
         that governs the host. Naming the network's mail host as the owner maps
         a strict-mode MX host for the mail edge, which dns publishes nothing
-        for. An owner maps at most 64 custom hosts. The DNS permission by the
-        role gate; a host under no verified domain of the network is refused
-        403 with a DnsApiErrorBody.
+        for. Mapping one moves the envelope of mail sent From each verified
+        domain it stands at or under to `b.<domain>` at once, whether or not
+        `mail.strict` is signed; removing it moves the envelope back. An owner
+        maps at most 64 custom hosts. The DNS permission by the role gate; a
+        host under no verified domain of the network is refused 403 with a
+        DnsApiErrorBody.
       operationId: networkDnsCustomHostAdd
       security:
         - BearerAuth: []
@@ -16977,8 +16980,10 @@ paths:
       description: |
         Whether mail is on for the caller's network, whether the network is at
         its storage limit or spent, in which case its receivers defer new mail,
-        and whether it names a direct MX. A receiver reads it at most every
-        30 s. 503 with Retry-After while the server does not serve mail yet.
+        whether it names a direct MX, and its custom domains in strict mode,
+        which a sending device reads before each send of a custom domain's
+        mail. A receiver reads it at most every 30 s. 503 with Retry-After
+        while the server does not serve mail yet.
       operationId: mailStatus
       security:
         - BearerAuth: []
@@ -31569,7 +31574,7 @@ components:
           description: The network names a direct MX.
           type: boolean
         strict_domains:
-          description: Verified domains with an active strict MX, used for the outbound bounce domain.
+          description: The network's verified custom domains in strict mode, each at or above an active strict-mode MX host it maps, whose sent mail's envelope is `b.<domain>`; empty while none is.
           type: array
           items:
             type: string
