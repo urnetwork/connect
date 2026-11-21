@@ -10897,6 +10897,62 @@ paths:
           description: The object is unavailable or failed integrity.
         "503":
           description: The artifact reader or store is unavailable.
+    head:
+      tags: [Other]
+      summary: Check for one typed attempt object
+      description: |
+        Answer whether one attempt object is stored, with its kind's content
+        type and its exact length, without a body. The object is not read:
+        one bounded listing of its content address answers, so a `200` is not
+        proof of the bytes, which only the GET's full read is. An uploader asks
+        before repeating an upload whose acknowledgement it lost.
+
+        The query is the GET's: exactly `kind` and `hash`, and a `Range` header
+        is refused. The head shares the GET's 16 reader slots, and their `429`
+        with `Retry-After`. An absent object is `404` with
+        `Cache-Control: no-store`, since it may be stored later.
+      operationId: snAttemptArtifactHead
+      security: []
+      parameters:
+        - in: query
+          name: kind
+          required: true
+          schema:
+            type: string
+            enum: [metadata, records, proofs]
+        - in: query
+          name: hash
+          required: true
+          description: Canonical `0x`-prefixed lowercase sha256 of the object.
+          schema:
+            type: string
+            pattern: "^0x[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: |
+            The object is stored. `Content-Type` is the GET's for its kind
+            (`application/json` for `metadata`, `application/x-ndjson` for
+            `records` and `proofs`) and `Content-Length` is the object's exact
+            length. No body.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+        "400":
+          description: The query is not exactly `kind` and `hash`, the identity is not canonical, or a `Range` header was sent.
+        "404":
+          description: No object is stored at the address. Not cacheable.
+        "408":
+          description: The request was cancelled.
+        "429":
+          description: Every reader slot is busy.
+        "502":
+          description: The address could not be listed, or the stored object is outside its kind's byte bound.
+        "503":
+          description: The artifact reader or store is unavailable.
     post:
       tags: [Other]
       summary: Stage one typed attempt object
