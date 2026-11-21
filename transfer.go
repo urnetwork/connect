@@ -1816,6 +1816,8 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
+	// Wrapped frames withheld by GateReceiveOnSignedIdentity before decoding.
+	SignedIdentityDropCount uint64
 	// Transfer frames `ClientSettings.P2pPeerSourceOnly` refused, and their
 	// encoded bytes: read from a P2P route with a source other than its peer.
 	// Zero with the setting off.
@@ -2247,8 +2249,9 @@ type Client struct {
 	receiveQueueCommitShortfallCount       atomic.Uint64
 	receiveQueueExitWithdrawCount          atomic.Uint64
 	// Frames `ClientSettings.P2pPeerSourceOnly` refused, and their encoded bytes.
-	p2pSourceDropCount     atomic.Uint64
-	p2pSourceDropByteCount atomic.Uint64
+	p2pSourceDropCount      atomic.Uint64
+	p2pSourceDropByteCount  atomic.Uint64
+	signedIdentityDropCount atomic.Uint64
 	// A no-acknowledgement Pack asks for delivery out of sequence with no ack
 	// and no retry, so it should never be queued behind a retransmit buffer it
 	// will never occupy, and never dropped because one is full. Offered counts
@@ -2586,6 +2589,10 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 //   - the session holds no Ed25519-sized key;
 //   - the call returns an error.
 //
+// An opted-in session holding its signed-identity decision supplies no
+// receive cipher. If none of the other candidates opens the frame, return
+// errReceiveSignedIdentityGated so that the sender retains retry custody.
+//
 // `peerEncryptionSession.verifiedClientKey` decides the session's cases. A
 // non-nil key is shared with the session and every Peer that carries it, so it
 // must not be written.
@@ -2616,8 +2623,14 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 	if len(ordered) == 0 {
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
+	var identityGated bool
 	for _, session := range ordered {
-		for _, cipher := range session.decryptCiphers() {
+		ciphers, gated := session.decryptCiphers()
+		if gated {
+			identityGated = true
+			continue
+		}
+		for _, cipher := range ciphers {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
 				// Taken here, from the session that authenticated this frame,
 				// not later from the session a receive sequence holds.
@@ -2629,8 +2642,13 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 			}
 		}
 	}
+	if identityGated {
+		return nil, sequenceTlsRoleServer, false, nil, errReceiveSignedIdentityGated
+	}
 	return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s could decrypt", sourceId)
 }
+
+var errReceiveSignedIdentityGated = errors.New("receive cipher withheld by signed identity")
 
 func (self *Client) ClientKeyManager() *ClientKeyManager {
 	return self.clientKeyManager
@@ -2657,6 +2675,7 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
+		SignedIdentityDropCount:                self.signedIdentityDropCount.Load(),
 		P2pSourceDropCount:                     self.p2pSourceDropCount.Load(),
 		P2pSourceDropByteCount:                 self.p2pSourceDropByteCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
@@ -4869,6 +4888,12 @@ func (self *Client) run() {
 				// peer can park the single-threaded, all-peers receive loop.
 				unwrappedTransferFrameBytes, decryptRole, decryptCompanion, decryptClientKey, err := self.unwrapFrame(
 					path.SourceId, transferFrame.GetSessionRole(), transferFrame.SessionCompanion, transferFrame.EncryptedTransferFrame)
+				if err == errReceiveSignedIdentityGated {
+					self.signedIdentityDropCount.Add(1)
+					inboundDecodedTransferFrames.put(decodedFrame)
+					MessagePoolReturn(transferFrameBytes)
+					continue
+				}
 				if err != nil {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[cr]unwrap err = %s\n", err)

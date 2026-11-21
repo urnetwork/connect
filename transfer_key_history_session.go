@@ -7,12 +7,10 @@ package connect
 //
 // The shape is deliberately NOT "refuse to commit the contract key". The
 // contract key is still committed, so the certificate chain and the identity
-// proof verify exactly as before; what is withheld is `Cipher()`. Because the
-// Required send gate parks application data on `Cipher()` and the receive gate
-// discards plaintext application frames, withholding the cipher is sufficient:
-// no application byte leaves for, or is accepted from, a peer whose identity
-// key has not been corroborated. Withholding also keeps the change to the
-// handshake path small, which matters in a file this delicate.
+// proof verify exactly as before. The Required send gate parks application
+// data on `Cipher()`. Clients opting into GateReceiveOnSignedIdentity also
+// withhold the receive ciphers while that same identity decision is pending
+// or has failed.
 //
 // See DESIGNNOTES3 §5 for the policy this implements and §8 for what it does
 // and does not close.
@@ -47,6 +45,15 @@ const (
 	// is not evidence against the peer and must not poison peer exclusion.
 	clientKeyHistoryStoreUnavailable
 )
+
+// Whether the signed-identity decision withholds an otherwise established cipher.
+func (self clientKeyHistoryState) withholdsCipher() bool {
+	switch self {
+	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+		return true
+	}
+	return false
+}
 
 func (self clientKeyHistoryState) String() string {
 	switch self {

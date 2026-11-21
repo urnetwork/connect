@@ -160,6 +160,69 @@ func TestPeerVerifiedClientKeyReachesEveryDeliveryPath(t *testing.T) {
 	requireKey(requirePeerKeyDelivery(t, atA, "generic", "return"), bKey)
 }
 
+// A pending local lookup holds an ordinary Required send in the sender's
+// custody. Finishing the lookup lets its normal resend deliver and acknowledge it.
+func TestSignedIdentityReceiveGateResumesTheSameSend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	var senderId Id
+	idsReady := make(chan struct{})
+	allowLookup := make(chan struct{})
+	settings := func(s *ClientSettings) {
+		s.EncryptionSettings.GateReceiveOnSignedIdentity = true
+		s.EncryptionSettings.NewPeerClientKeyHistoryFetcher = func(peer Id) func(context.Context) ([][]byte, error) {
+			return func(ctx context.Context) ([][]byte, error) {
+				<-idsReady
+				if peer == senderId {
+					select {
+					case <-allowLookup:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				return nil, nil
+			}
+		}
+	}
+	a, b, aId, bId, attach, receives := requiredGatePair(ctx, EncryptionModeRequired, EncryptionModeRequired, settings, false)
+	defer a.Cancel()
+	defer b.Cancel()
+	senderId = aId
+	close(idsReady)
+	attach()
+	acks := make(chan error, 1)
+	if !a.SendWithTimeout(requiredGateFrame(t, "held for signed identity"), bId, func(err error) { acks <- err }, 20*time.Second) {
+		t.Fatal("send was not admitted")
+	}
+	if !waitForCondition(20*time.Second, func() bool { return b.ReceiveStats().SignedIdentityDropCount > 0 }) {
+		t.Fatal("the receiver never deferred the send")
+	}
+	select {
+	case content := <-receives:
+		t.Fatalf("received %q before the identity lookup finished", content)
+	case err := <-acks:
+		t.Fatalf("ack before the identity lookup finished: %v", err)
+	default:
+	}
+	close(allowLookup)
+	select {
+	case content := <-receives:
+		if content != "held for signed identity" {
+			t.Fatalf("unexpected content %q", content)
+		}
+	case <-ctx.Done():
+		t.Fatal("the sender's retry did not deliver")
+	}
+	select {
+	case err := <-acks:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("no ack after delivery")
+	}
+}
+
 // A no-contract peer takes the other branch of the receive head, so the key has
 // to ride that one too. Its session learned the key out of band.
 func TestPeerVerifiedClientKeyOnANoContractPeer(t *testing.T) {
