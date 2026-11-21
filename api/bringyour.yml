@@ -31568,6 +31568,9 @@ components:
           type: array
           items:
             type: string
+        may_send_from_custom_domains:
+          description: The Team entitlement or its downgrade grace currently permits sending from a verified customer domain.
+          type: boolean
         direct_mx_addresses:
           description: Public addresses assigned to this authenticated receiver, including assignments awaiting their first probe.
           type: array
