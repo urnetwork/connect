@@ -6,7 +6,8 @@
 #
 # The default checks the serving registries with Go and runs the OpenAPI schema
 # tests with Python and PyYAML. Use --source-only without the toolchains or
-# sibling modules. That path checks literal registrations only.
+# sibling modules. That path checks literal registrations and the API route
+# access catalog.
 #
 # Extracts every router.NewRoute("METHOD", "/path", ...) and
 # router.NewStreamingRoute("METHOD", "/path", ...) registration the api
@@ -104,7 +105,7 @@ if (( ! source_only )); then
     "${PYTHON:-python3}" -B "$script_dir/test_spec.py" || exit $?
     (
         cd "$server_dir" && go test -count=1 ./api ./evshost \
-            -run '^Test(Spec|CompetitionSpec|EngineRoutesAreBringyourYmlsEvsOperations)'
+            -run '^Test(Spec|CompetitionSpec|EngineRoutesAreBringyourYmlsEvsOperations$|EveryRouteIsClassified$)'
     ) || exit $?
     (
         cd "${server_dir:a:h}/sidecar" && go test -count=1 ./gkmservice ./socketsservice \
@@ -186,15 +187,22 @@ off_paths() {
 }
 
 # --- the route table -------------------------------------------------------
-# Every NewRoute( and NewStreamingRoute( occurrence, not every line: some
-# source lines hold two.
+# Read every literal registration and the classified routes of appended handlers.
+# Their routes can use constants for path fragments. The API's
+# TestEveryRouteIsClassified holds the catalog to the assembled route table.
 route_files=()
 for f in $server_dir/api/api.go $server_dir/oauth/handlers.go; do
     [[ -f $f ]] && route_files+=$f
 done
 
-grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
-    | sed -e 's/.*Route("//' -e 's/", "/ /' -e 's/"$//' \
+{
+    grep -ohE 'New(Streaming)?Route\("[A-Z*]*", "[^"]*"' $route_files \
+        | sed -e 's/.*Route("//' -e 's/", "/ /' -e 's/"$//'
+    if [[ -f $server_dir/api/route_authz.go ]]; then
+        sed -nE 's@^[[:space:]]*"([A-Z*]+ /[^"]+)":[[:space:]]*routeAccess[A-Za-z]+,.*@\1@p' \
+            $server_dir/api/route_authz.go
+    fi
+} \
     | sed -e 's/\\\\\./\./g' -e 's/(\[^\/\]+)/*/g' \
     | sort -u > $work/routes.all
 
