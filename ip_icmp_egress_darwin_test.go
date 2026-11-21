@@ -124,6 +124,8 @@ type icmpForeignEchoerForTest struct {
 	conn          *icmp.PacketConn
 	ipVersion     int
 	destinationIp net.IP
+	// the interface of a link-local destination
+	destinationZone string
 }
 
 func newIcmpForeignEchoerForTest(t *testing.T, ipVersion int, destinationIp net.IP) *icmpForeignEchoerForTest {
@@ -165,7 +167,7 @@ func (self *icmpForeignEchoerForTest) echo(identifier uint16, sequenceNumber uin
 	if err != nil {
 		self.t.Fatal(err)
 	}
-	if _, err := self.conn.WriteTo(message, &net.UDPAddr{IP: self.destinationIp}); err != nil {
+	if _, err := self.conn.WriteTo(message, &net.UDPAddr{IP: self.destinationIp, Zone: self.destinationZone}); err != nil {
 		self.t.Fatal(err)
 	}
 }
@@ -291,6 +293,57 @@ func TestIcmpEgressAwaitsNoReplyToAnEchoItCouldNotSendDarwin(t *testing.T) {
 	expectIcmpEchoTestEvent(t, ctx, "flow", events, icmpEchoKept(identifier, 9, "nine"))
 	foreign.echo(identifier, 9, "nine")
 	expectIcmpEchoTestEvent(t, ctx, "flow", events, icmpEchoDropped(identifier, 9))
+}
+
+// A reply the flow drops for its identifier or its peer does not take the
+// place of an echo the flow awaits under the same sequence number, so that
+// echo's own reply is still kept. A loopback echo is answered at once, so the
+// awaited echo is entered as WriteEcho enters it; the reply from another peer
+// is from fe80::1, lo0's link-local address.
+func TestIcmpEgressChecksIdentifierAndPeerBeforeTakingAnAwaitedEchoDarwin(t *testing.T) {
+	requireIcmpEgressVersion(t, 4)
+	requireIcmpEgressVersion(t, 6)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	awaited := func(egress *icmpEgressConn) []uint16 {
+		egress.echoesInFlight.stateLock.Lock()
+		defer egress.echoesInFlight.stateLock.Unlock()
+		return slices.Clone(egress.echoesInFlight.sequenceNumbers)
+	}
+
+	// another identifier
+	destinationIp := icmpLoopbackIpForTest(4)
+	identifier := uint16(0xf1a2)
+	egress, err := listenIcmpEgress(4, destinationIp, DefaultIcmpBufferSettings(), newIcmpEchoIdentifierSetForTest(t, identifier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := readIcmpEgressForTest(t, egress)
+	foreign := newIcmpForeignEchoerForTest(t, 4, destinationIp)
+	egress.echoesInFlight.add(5)
+	foreign.echo(identifier+1, 5, "other")
+	expectIcmpEchoTestEvent(t, ctx, "v4 flow", events, icmpEchoDropped(identifier+1, 5))
+	AssertEqual(t, awaited(egress), []uint16{5})
+	foreign.echo(identifier, 5, "five")
+	expectIcmpEchoTestEvent(t, ctx, "v4 flow", events, icmpEchoKept(identifier, 5, "five"))
+
+	// another peer
+	destinationIp = icmpLoopbackIpForTest(6)
+	identifier = uint16(0xf1a3)
+	egress, err = listenIcmpEgress(6, destinationIp, DefaultIcmpBufferSettings(), newIcmpEchoIdentifierSetForTest(t, identifier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events = readIcmpEgressForTest(t, egress)
+	foreign = newIcmpForeignEchoerForTest(t, 6, destinationIp)
+	linkLocal := newIcmpForeignEchoerForTest(t, 6, net.ParseIP("fe80::1"))
+	linkLocal.destinationZone = "lo0"
+	egress.echoesInFlight.add(5)
+	linkLocal.echo(identifier, 5, "other")
+	expectIcmpEchoTestEvent(t, ctx, "v6 flow", events, icmpEchoDropped(identifier, 5))
+	AssertEqual(t, awaited(egress), []uint16{5})
+	foreign.echo(identifier, 5, "five")
+	expectIcmpEchoTestEvent(t, ctx, "v6 flow", events, icmpEchoKept(identifier, 5, "five"))
 }
 
 // A flow whose socket the kernel bound to an identifier, as linux's are, takes
@@ -445,6 +498,23 @@ func TestLocalUserNatEchoFlowsSharingAnIdentifierKeepOnlyTheirOwnRepliesDarwin(t
 			t.Fatalf("nat %s: no reply %d", n.name, sequenceNumber)
 		}
 	}
+	// waits for the flow's drop of the other's reply, failing at once on a
+	// reply to the source meanwhile
+	expectDrop := func(n *natForTest, want icmpEchoTestEvent) {
+		t.Helper()
+		for {
+			select {
+			case event := <-n.drops:
+				if event == want {
+					return
+				}
+			case packet := <-n.replies:
+				t.Fatalf("nat %s handed its source a reply it did not await: %x", n.name, packet)
+			case <-ctx.Done():
+				t.Fatalf("nat %s's flow: no %+v", n.name, want)
+			}
+		}
+	}
 
 	natA := newNat("a")
 	natB := newNat("b")
@@ -453,10 +523,10 @@ func TestLocalUserNatEchoFlowsSharingAnIdentifierKeepOnlyTheirOwnRepliesDarwin(t
 	expectReply(natB, 0x2222, 10, "b10")
 	send(natA, 0x1111, 1, "a1")
 	expectReply(natA, 0x1111, 1, "a1")
-	expectIcmpEchoTestEvent(t, ctx, "nat b's flow", natB.drops, icmpEchoDropped(identifier, 1))
+	expectDrop(natB, icmpEchoDropped(identifier, 1))
 	send(natB, 0x2222, 11, "b11")
 	expectReply(natB, 0x2222, 11, "b11")
-	expectIcmpEchoTestEvent(t, ctx, "nat a's flow", natA.drops, icmpEchoDropped(identifier, 11))
+	expectDrop(natA, icmpEchoDropped(identifier, 11))
 	// each flow's reader handed on every reply before the drop it reported
 	AssertEqual(t, len(natA.replies), 0)
 	AssertEqual(t, len(natB.replies), 0)

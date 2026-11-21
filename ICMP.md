@@ -253,8 +253,16 @@ identifier is socket-scoped:
 - linux: the kernel rewrites the outgoing echo id to the socket's ident and
   delivers only matching replies — demux is free.
 - darwin: the id passes through but delivery to datagram icmp sockets is
-  promiscuous, so the read loop must filter by the id it sent; v4 reads
-  include the 20-byte IP header, which must be stripped.
+  promiscuous: every such socket on the host, another process's included,
+  receives every echo reply. So the flow draws its id at random
+  (crypto/rand), skipping any a live flow of the process holds, and the read
+  loop keeps a reply only under that id, from the flow destination, and for
+  a sequence number the flow sent and has not yet seen answered, at most
+  `InFlightEchoLimit` of them, the oldest forgotten past it (QD-1159). The
+  ids used to come from a process-wide counter starting at zero, so two
+  processes echoing to one address both used id 1 and each took the other's
+  replies, payload and all. v4 reads include the 20-byte IP header, which
+  must be stripped.
 
 Either way the sequence writes echo requests carrying the inner sequence
 number and data, and on read rewrites id → inner id, rebuilds the return
@@ -265,7 +273,9 @@ reuse `transportChecksum`), pseudo-header with protocol 58 for v6
 (`transportChecksum` is correct there). Sequence numbers and payload pass
 through untouched, so RTT, loss, and dedup semantics survive end to end and
 the client kernel's own id matching delivers the reply to the pinging
-process. Note `StreamState.IpPath()` hardcodes `IpProtocolUdp`; the icmp
+process. The one delta is darwin's: a reply beyond the echoes sent with its
+sequence number drops at the provider, so `ping` shows no DUP! through a
+darwin provider, as through a windows one. Note `StreamState.IpPath()` hardcodes `IpProtocolUdp`; the icmp
 sequence needs its own state or a protocol field.
 
 TTL passthrough (committed): copy the inner TTL / hop limit per write —
@@ -331,7 +341,9 @@ loopback echo (works unprivileged on windows runners).
 
 `IcmpBufferSettings` beside the udp/tcp settings: `ReadTimeout`,
 `WriteTimeout`, `IdleTimeout` (60s — an echo flow is chatty or dead),
-`SequenceBufferSize`, `UserLimit`, `GlobalLimit`, `OutstandingLimit`, mtu.
+`SequenceBufferSize`, `UserLimit`, `GlobalLimit`, `OutstandingLimit`,
+`InFlightEchoLimit` (64, darwin's awaited sequence numbers, two bytes each
+in the flow's reservation), mtu.
 Defaults scale by the memory budget like the others, with small caps (echo
 flows are one per ping process; floors well below the udp 256/512), pinned
 in `ip_flow_limit_test.go` alongside the existing pins.
@@ -431,6 +443,19 @@ allow/blocklist branch, the dmca no-tracking default, `ipOosRst`/
 client gate counters (disabled and enabled-through-policy), per-destination
 affinity vs the port-0 collapse, and the provider/budget cap pins
 (`ip_flow_limit_test.go`). Race mode clean on the new concurrency.
+
+Darwin's identifier draw and sequence check (QD-1159):
+`ip_icmp_egress_unix_test.go` holds the identifier set (held draws skip,
+zero skipped, the wrap, every identifier held) and the awaited sequence
+numbers (once per echo sent, the oldest forgotten past the limit, a refused
+send withdrawn); `ip_icmp_egress_darwin_test.go` runs real loopback sockets,
+ordered by the replies each flow reports kept or dropped rather than by
+time: two flows under one identifier each keep only their own replies (v4
+and v6), a reply to an unsent or already answered echo drops, a refused send
+awaits nothing, a kernel-bound identifier filters as before, the identifier
+is held until close, two NATs under one identifier hand each source only its
+replies, and two child processes of the test binary keep only their own;
+`ip_icmp_egress_linux_test.go` keeps the kernel's identifier on linux.
 
 The original plan, for reference:
 
