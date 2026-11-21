@@ -142,7 +142,10 @@ func borderDistanceKm(c *lagdrift.Country, p lagdrift.Point) (inside bool, dista
 // Judge projects every boundary point of a country, and the farther parts of
 // a large one can't decide a verdict near the places: a fit whose σ_major is
 // within lag.yml's 1,500 km is at least keepKm / 1,500 standard deviations
-// from them, and a fit far from every place is far from the truth.
+// from them, and a fit far from every place is far from the truth. A wider fit
+// (which, since max σ_major bounds rejection only, is judged too) could in
+// principle touch a dropped polygon; at keepKm 9,000 that needs σ_major
+// near 3,000 km, which the study's fits rarely reach.
 func localCountry(c *lagdrift.Country, keepKm float64, places ...lagdrift.Point) *lagdrift.Country {
 	if c == nil {
 		return nil
