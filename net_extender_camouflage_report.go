@@ -269,8 +269,11 @@ type ExtenderCamouflageReporterSettings struct {
 	ByJwt func() string
 	// The post.
 	Post HttpPostRawFunction
-	// Advances on every change of the identity. Nil for an identity that never
-	// changes.
+	// Advances on every change of the identity, in one step with ByJwt's change to
+	// it: ByJwt hands out no token of an identity the monitor has not announced, nor
+	// of one it has moved on from. A look reads the generation and then the token,
+	// and acts on the token only while the generation stays where it read it. Nil
+	// for an identity that never changes.
 	AccountMonitor *MonitorValue[uint64]
 
 	// The sender's build, and the version of the borrow list it reads, each read
@@ -550,6 +553,17 @@ func (self *ExtenderCamouflageReporter) accountGeneration() (uint64, chan struct
 	return self.settings.AccountMonitor.Get()
 }
 
+// Whether the account moved on since the generation `accountChange` came with;
+// never, for the nil channel of an identity that never changes.
+func (self *ExtenderCamouflageReporter) accountMovedOn(accountChange chan struct{}) bool {
+	select {
+	case <-accountChange:
+		return true
+	default:
+		return false
+	}
+}
+
 // The loop: look whether a report is due, make it, or wait for the earliest of the
 // due time, a change of the account and a change of the control.
 func (self *ExtenderCamouflageReporter) run() {
@@ -564,6 +578,14 @@ func (self *ExtenderCamouflageReporter) run() {
 		accountGeneration, accountChange := self.accountGeneration()
 
 		wait, due, active := self.next(accountGeneration)
+		if self.accountMovedOn(accountChange) {
+			// the account moved on during the look, so the token it read may be the
+			// next identity's and what it decided is the last one's: a post would
+			// carry the last identity's counts under the next one's token, and a
+			// park would be taken again at once. The next look is under the new
+			// generation.
+			continue
+		}
 		if due {
 			self.post(wake, accountChange)
 			continue
@@ -704,6 +726,11 @@ func (self *ExtenderCamouflageReporter) post(wake chan struct{}, accountChange c
 	byJwt := self.settings.ByJwt()
 	if byJwt == "" {
 		// the next look finds no identity
+		return
+	}
+	if self.accountMovedOn(accountChange) {
+		// read after the account moved on, so it may be the next identity's token,
+		// and the report is the last one's; the next look starts over
 		return
 	}
 	pending := self.pending

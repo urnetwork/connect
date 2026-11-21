@@ -231,9 +231,12 @@ func (self *testCamouflageReportHarness) setByJwt(byJwt string) {
 	self.stateLock.Unlock()
 }
 
-// A new identity, the way the space's account monitor says so.
+// A new identity, the way the space's account monitor says so: its token and its
+// announcement in one step, as the settings' AccountMonitor asks of a host.
 func (self *testCamouflageReportHarness) changeAccount(byJwt string) {
-	self.setByJwt(byJwt)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.byJwt = byJwt
 	self.account.Update(func(generation uint64) uint64 {
 		return generation + 1
 	})
@@ -909,6 +912,122 @@ func TestExtenderCamouflageReporterAccountChangeDropsEverything(t *testing.T) {
 			t.Errorf("discarded %d times", source.discarded)
 		}
 	})
+}
+
+// A harness whose reads of the credential can land an account change: at the
+// `readCount`th read from the call on, the host binds the identity of `byJwt`, its
+// token and its announcement in one step, before the read returns. That is where a
+// change that lands while a look is out meets the look, after its read of the
+// generation.
+func newTestCamouflageReportMidLookHarness(t *testing.T) (*testCamouflageReportHarness, func(readCount int, byJwt string)) {
+	t.Helper()
+	var harness *testCamouflageReportHarness
+	stateLock := sync.Mutex{}
+	changeReadCount := 0
+	changeByJwt := ""
+	harness = newTestCamouflageReportHarness(t, func(settings *ExtenderCamouflageReporterSettings) {
+		byJwt := settings.ByJwt
+		settings.ByJwt = func() string {
+			change, changeTo := func() (bool, string) {
+				stateLock.Lock()
+				defer stateLock.Unlock()
+				if changeReadCount == 0 {
+					return false, ""
+				}
+				changeReadCount -= 1
+				return changeReadCount == 0, changeByJwt
+			}()
+			if change {
+				harness.changeAccount(changeTo)
+			}
+			return byJwt()
+		}
+	})
+	changeAt := func(readCount int, byJwt string) {
+		stateLock.Lock()
+		defer stateLock.Unlock()
+		changeReadCount = readCount
+		changeByJwt = byJwt
+	}
+	return harness, changeAt
+}
+
+// A sign-in that lands while a look is out is scheduled once. The look read the
+// generation before it, so it is not the new identity's look: it would park, and
+// the change it missed would wake it to park again at once.
+func TestExtenderCamouflageReporterSchedulesASignInDuringALookOnce(t *testing.T) {
+	harness, changeAt := newTestCamouflageReportMidLookHarness(t)
+	harness.setByJwt("")
+	harness.requireInactive("before it is on")
+	changeAt(1, "token-1")
+	harness.reporter.SetEnabled(true)
+	wait := harness.requireParked("signed in")
+	harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
+		counters.BothFailedCount = 5
+	})
+	post := harness.postAfter(wait, "the report")
+	if post.byJwt != "token-1" {
+		t.Errorf("credential = %q", post.byJwt)
+	}
+	if count := post.args(t).Client.BothFailed; count != 5 {
+		t.Errorf("reported %d, and did 5", count)
+	}
+}
+
+// An account change that lands while a due look is out: the report the look made is
+// the last identity's, and the token it read is the next one's, so the report is
+// dropped rather than posted under that token, and the next identity reports only
+// what it did.
+func TestExtenderCamouflageReporterPostsNothingOfAChangeDuringALook(t *testing.T) {
+	harness, changeAt := newTestCamouflageReportMidLookHarness(t)
+	wait := harness.enable()
+	harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
+		counters.BothFailedCount = 5
+	})
+	changeAt(1, "token-2")
+	harness.fireAfter(wait)
+	wait = harness.requireParked("the next identity's first look")
+	if stats := harness.reporter.Stats(); stats.DroppedCount != 1 || stats.AttemptCount != 0 {
+		t.Errorf("stats = %+v", stats)
+	}
+	harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
+		counters.BothFailedCount = 6
+	})
+	post := harness.postAfter(wait, "the next identity's report")
+	if post.byJwt != "token-2" {
+		t.Errorf("credential = %q", post.byJwt)
+	}
+	if count := post.args(t).Client.BothFailed; count != 1 {
+		t.Errorf("the next identity reported %d, and did 1", count)
+	}
+}
+
+// The same change landing at the post's own read of the credential, after the look
+// found the account where it read it: the post reads the next identity's token, and
+// the report is still the last one's.
+func TestExtenderCamouflageReporterPostsNothingOfAChangeAtItsRead(t *testing.T) {
+	harness, changeAt := newTestCamouflageReportMidLookHarness(t)
+	wait := harness.enable()
+	harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
+		counters.BothFailedCount = 5
+	})
+	// the due look reads the credential once, and its post again
+	changeAt(2, "token-2")
+	harness.fireAfter(wait)
+	wait = harness.requireParked("the next identity's first look")
+	if stats := harness.reporter.Stats(); stats.DroppedCount != 1 || stats.AttemptCount != 0 {
+		t.Errorf("stats = %+v", stats)
+	}
+	harness.addCounts(func(counters *ExtenderTcpCamouflageClientStats) {
+		counters.BothFailedCount = 6
+	})
+	post := harness.postAfter(wait, "the next identity's report")
+	if post.byJwt != "token-2" {
+		t.Errorf("credential = %q", post.byJwt)
+	}
+	if count := post.args(t).Client.BothFailed; count != 1 {
+		t.Errorf("the next identity reported %d, and did 1", count)
+	}
 }
 
 // Signed out, nothing is sent and nothing is scheduled, and what was counted then is
