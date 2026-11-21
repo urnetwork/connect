@@ -4,9 +4,9 @@
 #
 #   ./check-routes.sh /path/to/urnetwork/server
 #
-# The default checks the serving registries and runs the OpenAPI schema tests.
-# Use --source-only in a checkout without the Go toolchain or the sibling
-# modules. That path checks literal registrations only.
+# The default checks the serving registries with Go and runs the OpenAPI schema
+# tests with Python and PyYAML. Use --source-only without the toolchains or
+# sibling modules. That path checks literal registrations only.
 #
 # Extracts every router.NewRoute("METHOD", "/path", ...) and
 # router.NewStreamingRoute("METHOD", "/path", ...) registration the api
@@ -44,8 +44,7 @@
 # in server/evshost's route table test, which reads this file against the
 # engine's routes.
 #
-# Deliberately dependency-free: zsh, awk, grep, sed, sort, comm. No yaml parser
-# and no go toolchain, so it runs in a bare checkout and in CI.
+# The source-only check uses zsh, awk, grep, sed, sort and comm.
 #
 # Normalization:
 #   route  ([^/]+)   -> *      spec  {name} -> *
