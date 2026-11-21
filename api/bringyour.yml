@@ -15268,7 +15268,11 @@ paths:
         Commits a signed push: `{statement, payload, receipts}`, or to seal a push
         of parts, `{statement, the parts' places}`. Needs `rw`, and `deposit` allows
         only the caller's deposit ref. DROP pushes and their cancels ride here too.
-        Until the seal is served it answers 503.
+        A file-mode writer can set `EVS_PUSH_EXACT_HEAD` (2048) in the signed
+        statement after a fresh read advertises `supports_exact_head`. The
+        commit, including a multipart seal, requires the signed `base_version`
+        and `base_chain` to equal the current head. A mismatch returns final 409
+        `BASE_STALE`. Ordinary file-mode pushes use the usual per-path checks.
 
         A push id names one statement. Retry with the same push id and statement,
         one attempt at a time, until a 200, 409 or 412: a committed id answers its
@@ -15326,7 +15330,7 @@ paths:
                 $ref: "#/components/schemas/EvsRefusalReply"
         "409":
           description: |
-            One of `REF_MODE`, `PUSH_ID_REUSED`, `SEGMENT_GONE`, `SEGMENT_STALE`,
+            One of `REF_MODE`, `BASE_STALE`, `PUSH_ID_REUSED`, `SEGMENT_GONE`, `SEGMENT_STALE`,
             `SLOT_STALE`, `PARTS_MISSING`, `VERSIONING`, `DIRECTORY_FULL`,
             `NOTHING_TO_ERASE`, `INDEX_EPOCH`, `SHREDDING`, `DROPPED`, `DROP_KIND`,
             `DROP_PATH`, `DROP_CONSENT`, `DROP_BOUNDARY`, `DROP_LIST`, `DROP_STATE`,
@@ -15380,7 +15384,8 @@ paths:
         The client posts at most 4 at once. A git-mode push takes the seal lease
         first. evs checks the part's own entries as a push's (steps 5b to 5e, 5g and
         5h) and appends it to a batch record; nothing commits until the seal. A part
-        posted twice is two records, and the seal names one.
+        posted twice is two records, and the seal names one. The seal checks the
+        signed exact-head precondition against the head it commits on.
 
         Every answer but a 200 is an `EvsRefusalReply`, whose code fixes the
         status; a 429 or 503 carries `Retry-After`. A part's refusal is never
@@ -15676,7 +15681,11 @@ paths:
         from evs's cache where its rules allow and never for `fresh`, every
         statement after the pin or `behind` with the first missing version, each
         path, then the objects. A streams read stays within 4 MiB, answering `more`
-        with the next version of each ref past it.
+        with the next version of each ref past it. On a fresh single-ref read
+        for a file-mode ref or a ref awaiting its first commit, a service that
+        enforces `EVS_PUSH_EXACT_HEAD` sets `supports_exact_head` in the head
+        frame. A writer requiring exact-head admission must receive this value
+        before submitting its signed push.
 
         A refused answer is an `EvsRefusalReply`, whose code fixes the status; a 503
         carries `Retry-After`. A read that fails once the 200 is written ends its
