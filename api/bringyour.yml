@@ -11924,15 +11924,15 @@ paths:
       summary: A network's authorization log, for a gate host with no metadata tier
       description: |
         `GET /network/config/projection`'s answer for a gate service that
-        reads the log through api (connect's contract gate, sockets,
-        tlsedge and mxedge): the entries after `after`, a page at most and
+        reads the log through api (connect's contract gate, sockets, DNS,
+        tlsedge, mxedge and smtpedge): the entries after `after`, a page at most and
         from the retention point when `after` is before it, the rows of each
         base among them and, from 0, the Signed Genesis, every message
         verbatim in base64. api carries the log and decides nothing: the
-        gate checks every entry's chain from its own pin. connect's,
-        sockets', tlsedge's and mxedge's bearers only; evs and gkm read the
-        store themselves. A network with no log answers an empty page. 503
-        while the log cannot be read.
+        gate checks every entry's chain from its own pin. The route accepts
+        only these services' bearers. EVS and GKM read the store directly.
+        A network with no log answers an empty page. 503 while the log cannot
+        be read.
       operationId: internalGateProjection
       security:
         - InternalGateAuth: []
@@ -12013,6 +12013,58 @@ paths:
           description: The store holds no rows of the network by that hash.
         "503":
           description: The rows cannot be read.
+
+  /internal/gate/listen-facts/{network_id}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: Read current server facts for socket registration
+      description: |
+        For the sockets gate's TLS and SMTP namespaces. These facts supplement
+        the network's verified signed policy and confer no new rights. The
+        internal gate bearer must belong to the sockets service.
+      operationId: internalGateListenFacts
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The facts for this network.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateListenFacts"
+        "400":
+          description: The network id is invalid or zero.
+          content:
+            text/plain:
+              schema: {type: string}
+        "403":
+          description: The sockets service credential could not be verified.
+          content:
+            text/plain:
+              schema: {type: string}
+        "404":
+          description: The network does not exist.
+          content:
+            text/plain:
+              schema: {type: string}
+        "503":
+          description: The facts could not be read.
+          content:
+            text/plain:
+              schema: {type: string}
 
   /internal/gate/edge-client:
     post:
@@ -32491,6 +32543,68 @@ components:
         applied:
           description: False when the batch id was applied before, so nothing was applied twice.
           type: boolean
+    InternalGateListenFacts:
+      type: object
+      required: [verified, standing, tier, mail_network]
+      properties:
+        verified:
+          type: boolean
+        standing:
+          type: string
+          enum: [probation, standard, trusted, restricted, suspended]
+        tier:
+          type: string
+          enum: [free, pro, team]
+        mail_network:
+          type: boolean
+        standing_grants_end_time:
+          type: string
+          format: date-time
+        hosted_sidecar_ids:
+          type: array
+          items: {type: string, format: uuid}
+        verified_domains:
+          type: array
+          items: {type: string}
+        scope_labels:
+          type: array
+          items: {type: string}
+        screen_allowed_hosts:
+          type: array
+          items: {type: string}
+        certs:
+          type: array
+          items:
+            type: object
+            required: [sidecar_id, not_after]
+            properties:
+              sidecar_id: {type: string, format: uuid}
+              not_after: {type: string, format: date-time}
+              network_pair: {type: boolean}
+              scope_pairs:
+                type: array
+                items: {type: string}
+        custom_certified:
+          type: array
+          items:
+            type: object
+            required: [sidecar_id, owner, name, not_after]
+            properties:
+              sidecar_id: {type: string, format: uuid}
+              owner: {type: string}
+              name: {type: string}
+              not_after: {type: string, format: date-time}
+        acme_claims:
+          type: array
+          items:
+            type: object
+            required: [sidecar_id, owner, name, claim_seq]
+            properties:
+              sidecar_id: {type: string, format: uuid}
+              owner: {type: string}
+              name: {type: string}
+              claim_seq: {type: integer, minimum: 0}
+
     InternalGateEdgeClientArgs:
       type: object
       required: [block, host, index]
@@ -32521,6 +32635,10 @@ components:
           description: The client's token, which ends at `expire_time_millis` with no grace.
           type: string
         expire_time_millis:
+          type: integer
+          format: int64
+        auth_time_millis:
+          description: A persistent monotonic authentication timestamp used to reserve the edge client's outbound stream numbers across restarts.
           type: integer
           format: int64
         platform_url:
