@@ -823,6 +823,12 @@ type EncryptionSettings struct {
 	// is `EncryptionModeOff`.
 	ExposeVerifiedPeerClientKey bool
 
+	// Withholds wrapped traffic while its session's signed identity is pending,
+	// rejected or locally unavailable. Such a frame receives no ack or
+	// re-handshake request. An ordinary resend recovers when verification clears.
+	// False preserves existing receive behavior.
+	GateReceiveOnSignedIdentity bool
+
 	// Nil test barrier pauses the actual certificate publisher after readiness.
 	beforeEncryptedKeyPublishForTest func()
 }
@@ -2908,11 +2914,9 @@ func (self *peerEncryptionSession) cipherWithLock() *sequenceCipher {
 	//
 	// Withholding rather than tearing down is deliberate. The contract key is
 	// still committed internally, so the cert chain and the identity proof
-	// verify normally; what does not happen is any application byte leaving
-	// for, or being accepted from, a peer whose key the platform may have
-	// chosen. A rejected resolution is terminal and never re-enters pending.
-	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+	// verify normally. Sends resume when the gate clears. Receive ciphers
+	// follow the same decision when GateReceiveOnSignedIdentity is set.
+	if self.keyHistoryState.withholdsCipher() {
 		if self.client.log.V(2).Enabled() {
 			self.client.log.V(2).Infof(
 				"[key]%s Cipher()=nil: signed identity %s\n", self.logTag, self.keyHistoryState,
@@ -3030,8 +3034,7 @@ func (self *peerEncryptionSession) notifyRequiredCipherChangedWithLock() {
 func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+	if self.keyHistoryState.withholdsCipher() {
 		return true
 	}
 	return self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil ||
@@ -3042,10 +3045,14 @@ func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 // frame: the established cipher and, briefly after a rekey, the prior
 // established cipher (a peer may still send under the old key until it swaps
 // to the new one). The unwrap path tries each until one authenticates. Empty
-// until the session establishes.
-func (self *peerEncryptionSession) decryptCiphers() []*sequenceCipher {
+// until the session establishes. The second result distinguishes a signed
+// identity still withholding the session from a lost or unknown cipher.
+func (self *peerEncryptionSession) decryptCiphers() ([]*sequenceCipher, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.settings.GateReceiveOnSignedIdentity && self.keyHistoryState.withholdsCipher() {
+		return nil, true
+	}
 	var out []*sequenceCipher
 	if self.establishedEpoch != nil && self.establishedEpoch.derivedTlsCipher != nil {
 		out = append(out, self.establishedEpoch.derivedTlsCipher)
@@ -3053,7 +3060,7 @@ func (self *peerEncryptionSession) decryptCiphers() []*sequenceCipher {
 	if self.priorEstablishedEpoch != nil && self.priorEstablishedEpoch.derivedTlsCipher != nil {
 		out = append(out, self.priorEstablishedEpoch.derivedTlsCipher)
 	}
-	return out
+	return out, false
 }
 
 // markEstablishedWithLock promotes epoch e to the established epoch — its
@@ -4173,8 +4180,7 @@ func (self *peerEncryptionSession) verifiedPeerIdentity() (ed25519.PublicKey, bo
 func (self *peerEncryptionSession) verifiedClientKey() *[ed25519.PublicKeySize]byte {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	switch self.keyHistoryState {
-	case clientKeyHistoryPending, clientKeyHistoryRejected, clientKeyHistoryStoreUnavailable:
+	if self.keyHistoryState.withholdsCipher() {
 		return nil
 	}
 	if self.establishedEpoch == nil || !self.establishedEpoch.peerIdentityVerified {

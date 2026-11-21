@@ -566,11 +566,12 @@ message, a field or a frame order on the wire, and §11.5 lists all a client tha
 opts in to nothing can observe. The sidecar's side is its DESIGN.md §6: D-PROTO-8
 for the control source, D-PROTO-13 for the key.
 
-A sidecar client takes all three opt-ins: `WithSubprotocolControlSource()` on its
-one registration, `ClientSettings.P2pPeerSourceOnly` and
-`EncryptionSettings.ExposeVerifiedPeerClientKey`. The first and last fail closed
-if forgotten: pushes are dropped, or the identity check finds no key. The second
-does not, so a client must set it before it takes any P2P route.
+A sidecar client uses `WithSubprotocolControlSource()` on its
+one registration, `ClientSettings.P2pPeerSourceOnly`,
+`EncryptionSettings.ExposeVerifiedPeerClientKey` and
+`EncryptionSettings.GateReceiveOnSignedIdentity`. A missing registration drops pushes, and a missing
+key leaves the identity check with nothing to verify. A client must set
+`P2pPeerSourceOnly` before it takes a P2P route.
 
 ### 11.1 Known ids
 
@@ -668,6 +669,13 @@ nothing about a peer in general:
   key to a client id; the sidecar closes that gap with its own binding and pin.
 
 Off by default it reports nothing, and the key plays no part in forming a batch.
+
+`EncryptionSettings.GateReceiveOnSignedIdentity` also gates receive ciphers for
+clients using signed key history. While the local lookup is pending, rejected
+or unavailable, wrapped frames from the affected session produce neither a
+transfer acknowledgement nor an unknown-wrap response. When the lookup clears,
+the sender’s ordinary retry can deliver and acknowledge the same send. Clients
+leaving this setting off retain their existing receive behavior.
 
 ### 11.5 What a client that opts in to nothing sees
 
