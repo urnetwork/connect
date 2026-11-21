@@ -2305,7 +2305,7 @@ func (self *PlatformTransport) dialH3(
 		attemptQuicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
 	}
 	if self.settings.h3RetainedByteAccounting {
-		installQuicSendFlight(attemptQuicConfig)
+		installQuicSendFlightWithLimits(attemptQuicConfig, self.settings.h3SendFlightLimits())
 	}
 	var conn *quic.Conn
 	if self.settings.h3RetainedByteAccounting {

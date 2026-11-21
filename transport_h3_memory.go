@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"time"
+	"unsafe"
 )
 
 type h3StreamWriter interface {
@@ -11,17 +12,40 @@ type h3StreamWriter interface {
 	SetWriteDeadline(time.Time) error
 }
 
-// All figures describe simultaneously retained ownership, not interchangeable
-// alternatives to the receive window. DNS translation and any outer extender
-// add to the carrier's atomic claim against the same child and process root.
+// The charges the H3 ledger is built from (platformH3Ledger). All figures
+// describe simultaneously retained ownership, not interchangeable alternatives
+// to the receive window. DNS translation and any outer extender add to the
+// carrier's atomic claim against the same child and process root.
 const (
-	platformH3SocketByteCount        ByteCount = 64 * 1024
-	platformH3DatagramQueueBytes     ByteCount = 352 * 1024
-	platformH3ReassemblyBytes        ByteCount = 96 * 1024
-	platformH3ControlBytes           ByteCount = 512 * 1024
-	platformH3ApplicationQueueBytes  ByteCount = 256 * 1024
-	platformH3MemoryQueueCount                 = 4
-	platformH3DialTransientByteCount ByteCount = 1408 * 1024
+	// One retained packet: a quic-go packet buffer, a DATAGRAM payload copy or
+	// a STREAM root. quic-go v0.61's 1452-byte buffers round to the 1536-byte
+	// allocation class; with their descriptors each is charged 2 KiB.
+	platformH3RootByteCount ByteCount = 2 * 1024
+	// frame and slice descriptors of one DATAGRAM queue slot
+	platformH3DatagramSlotMetaByteCount ByteCount = 192
+	// quic-go's sent-packet record for one unacknowledged packet
+	platformH3SentPacketRecordByteCount ByteCount = 192
+	// packets in flight carrying no root: ACKs, PINGs and other control
+	platformH3ControlPacketCount = 16
+	// TLS and QUIC connection, stream and worker state besides queued packets
+	platformH3ConnectionStateByteCount ByteCount = 128 * 1024
+	// the reassembler's replay window of retired message ids
+	platformH3ReplayWindowByteCount ByteCount = 16 * 1024
+	// the descriptor of one message pending reassembly
+	platformH3ReassemblyDescriptorByteCount ByteCount = 512
+	// the stream writer's 4-KiB chunk scratch and one buffered frame
+	platformH3SendScratchByteCount ByteCount = 8 * 1024
+	// channel slots and pool headers of the application routes
+	platformH3ApplicationDescriptorByteCount ByteCount = 4 * 1024
+	// the depth of each H3 route under retained accounting
+	platformH3MemoryQueueCount = 4
+	// quic-go's own queue lengths, which a setting of zero keeps
+	platformH3DefaultUnprocessedPacketCount    = 256
+	platformH3DefaultDatagramReceiveQueueCount = 128
+	// quic-go raises a smaller unprocessed-packet limit to this, so a
+	// server's buffered 0-RTT packets always fit (third_party/quic-go
+	// URNETWORK.md)
+	platformH3MinUnprocessedPacketCount = 32
 )
 
 // Nested owners spend capacity already reserved with their inner carrier.
@@ -77,25 +101,106 @@ func (self *PlatformTransport) h3NestedMemoryByteCount() ByteCount {
 	return byteCount
 }
 
-func platformH3FixedMemoryByteCount() ByteCount {
-	return 2*platformH3SocketByteCount + extenderQuicSendMemoryByteCount +
-		platformH3DatagramQueueBytes + platformH3ReassemblyBytes +
-		platformH3ControlBytes + platformH3ApplicationQueueBytes
+// platformH3Ledger is one H3 graph's fixed retained ownership, row by row,
+// besides its receive credit. Each row is what the settings' configured queue
+// and buffer sizes bound, so smaller sizes charge less and no row charges
+// capacity its queues cannot hold. The rows are not unused receive permission:
+// receive credit is charged on top of them.
+type platformH3Ledger struct {
+	// the UDP read and write socket buffers
+	sockets ByteCount
+	// unacknowledged STREAM roots (H3SendFlightFrameCount)
+	sendRoots ByteCount
+	// quic-go's sent-packet records for every root and control packet in
+	// flight, the retained-send controller's tables, and its write scratch
+	sendState ByteCount
+	// quic-go's DATAGRAM send and receive queues, one payload copy a slot,
+	// plus the frame being parsed. Already-sent DATAGRAM roots stay in
+	// quic-go's ACK history until ACK or loss, and the retained-send
+	// controller admits as many roots across queued and sent state as the
+	// send queue holds, not that many of each. DATAGRAMs are not retransmitted.
+	datagrams ByteCount
+	// the application reassembler's peer payload cap, its replay window and
+	// the descriptors of the messages pending reassembly
+	reassembly ByteCount
+	// quic-go's received packets not yet processed, and the connection state
+	control ByteCount
+	// the routes, which hold the route depth of messages in each direction,
+	// five dispatcher, read and pending holds, the hybrid stream queue and the
+	// stream write batch, with their channel slots and pool headers
+	application ByteCount
 }
 
-// quic-go v0.61 has 32 send and 128 receive DATAGRAM slots. Already-sent
-// DATAGRAM roots stay in its ACK history until ACK/loss, so the send controller
-// admits at most 32 roots across queued AND sent state, not 32 of each. Each
-// packet is at most 1452 bytes; charge a 2-KiB allocation class for 160 slots
-// plus one incoming producer, and 30 KiB for frame/slice metadata. DATAGRAMs
-// are not retransmitted. The application reassembler has a separate 64-KiB peer
-// payload cap, with 32 KiB for its bounded fragment/replay maps and descriptors.
-// Application routes hold at most four 8-KiB messages in each direction, the
-// hybrid stream queue holds 64 KiB, and the batch writer holds 64 KiB. The rest
-// of the 256-KiB row covers producer/reader holds, pool headers, and descriptors.
-//
-// The fixed rows sum to 1600 KiB; they are not unused receive permission, and
-// receive credit is charged on top of them (ApplyMobilePlatformTransportMemoryPolicy).
+func (self platformH3Ledger) total() ByteCount {
+	return self.sockets + self.sendRoots + self.sendState + self.datagrams +
+		self.reassembly + self.control + self.application
+}
+
+// h3SendFlightLimits are the retained-send controller's limits on one H3
+// connection, as the flight normalizes them: its STREAM roots, and its
+// DATAGRAM roots, which match quic-go's DATAGRAM send queue.
+func (self *PlatformTransportSettings) h3SendFlightLimits() quicSendFlightLimits {
+	return quicSendFlightLimits{
+		frames:    self.H3SendFlightFrameCount,
+		datagrams: self.H3DatagramSendQueueCount,
+	}.normalized()
+}
+
+// h3Ledger charges what these settings' sizes bound (platformH3Ledger).
+func (self *PlatformTransportSettings) h3Ledger() platformH3Ledger {
+	transport := &PlatformTransport{settings: self}
+	limits := self.h3SendFlightLimits()
+	unprocessed := platformH3DefaultUnprocessedPacketCount
+	if 0 < self.H3MaxUnprocessedPacketCount {
+		unprocessed = max(self.H3MaxUnprocessedPacketCount, platformH3MinUnprocessedPacketCount)
+	}
+	datagramReceive := platformH3DefaultDatagramReceiveQueueCount
+	if 0 < self.H3DatagramReceiveQueueCount {
+		datagramReceive = self.H3DatagramReceiveQueueCount
+	}
+	datagrams := self.H3DatagramSettings
+	if datagrams == nil {
+		datagrams = DefaultH3DatagramSettings()
+	}
+	flightTables := ByteCount(limits.frames+limits.datagrams)*ByteCount(unsafe.Sizeof(quicSendFlightFrame{})) +
+		quicSendFlightPackets*ByteCount(unsafe.Sizeof(quicSendFlightPacket{})) +
+		quicSendFlightStreams*ByteCount(unsafe.Sizeof((*quicSendFlightWriter)(nil)))
+	return platformH3Ledger{
+		sockets:   transport.h3SocketReadBufferByteCount() + transport.h3SocketWriteBufferByteCount(),
+		sendRoots: ByteCount(limits.frames) * platformH3RootByteCount,
+		sendState: ByteCount(limits.frames+limits.datagrams+platformH3ControlPacketCount)*platformH3SentPacketRecordByteCount +
+			flightTables + platformH3SendScratchByteCount,
+		datagrams: ByteCount(limits.datagrams+datagramReceive+1)*platformH3RootByteCount +
+			ByteCount(limits.datagrams+datagramReceive)*platformH3DatagramSlotMetaByteCount,
+		reassembly: ByteCount(datagrams.MaxReassemblyByteCount) + platformH3ReplayWindowByteCount +
+			ByteCount(datagrams.MaxReassemblyMessageCount)*platformH3ReassemblyDescriptorByteCount,
+		control: ByteCount(unprocessed)*platformH3RootByteCount + platformH3ConnectionStateByteCount,
+		application: ByteCount(2*transport.h3TransportBufferSize()+5)*retainedMessageCapacity(ByteCount(datagrams.MaxMessageByteCount)) +
+			ByteCount(datagrams.HybridStreamQueueByteCount()) +
+			ByteCount(max(0, self.H3StreamWriteBatchMaxByteCount)) +
+			platformH3ApplicationDescriptorByteCount,
+	}
+}
+
+// h3FixedMemoryByteCount is the H3 claim besides its receive credit.
+func (self *PlatformTransportSettings) h3FixedMemoryByteCount() ByteCount {
+	return self.h3Ledger().total()
+}
+
+// h3DialTransientByteCount is what one speculative dial candidate of a race
+// holds before authentication: its initial connection credit, its sockets,
+// quic-go's queues and connection state, the reassembler and the send state,
+// but no STREAM roots or application routes yet.
+func (self *PlatformTransportSettings) h3DialTransientByteCount() ByteCount {
+	ledger := self.h3Ledger()
+	initialConnection := min(
+		max(0, self.H3InitialConnectionReceiveWindowByteCount),
+		max(0, self.H3MaxConnectionReceiveWindowByteCount),
+	)
+	return initialConnection + ledger.sockets + ledger.control + ledger.datagrams +
+		ledger.reassembly + ledger.sendState
+}
+
 // Targets through 32 MiB take the mobile policy on every surface; larger and
 // server targets retain their existing window policy unless their embedder
 // selects the mobile one, and unbudgeted defaults are unchanged.
@@ -108,83 +213,110 @@ func applyPlatformH3MemoryPolicy(settings *PlatformTransportSettings, target Byt
 	ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 }
 
-// The parameters of the mobile H3 claim (mobilePlatformH3ClaimByteCount).
-// They are the policy ApplyMobilePlatformTransportMemoryPolicy installs into
-// the settings it is given, not settings of their own.
+// The phone sizes ApplyMobilePlatformTransportMemoryPolicy installs (server
+// LBALTOPT2 R20). A phone has six to ten peers, each with an H3 carrier of
+// its own, beside its provider's control paths, so each carrier's queues and
+// buffers are sized for a share of the budget rather than for one carrier's
+// peak: with them every claim is about 0.88 MiB, nine fit the 8 MiB budget of
+// iOS's 32-MiB target and eighteen the 16 MiB of Android's 64. They are the
+// policy's values for the settings it is given, not settings of their own; an
+// embedder's smaller values stand.
 const (
-	// A phone's carrier budget is sized to hold this many complete H3 graphs
-	// at once: its provider's three control paths (the v4 and v6 pins and
-	// the standby) and two consumer window transports (server LBALTOPT2 R20).
-	mobilePlatformH3ClaimsPerBudget = 5
-	// The least connection receive credit a mobile H3 claim keeps where a
-	// fifth of the budget cannot cover it on top of the fixed rows. 448 KiB
-	// makes the claim 2 MiB: two fit the 5-MiB budget of a 20-MiB target with
-	// room left for an h1 fallback, three fit 24 MiB and four fit 32 MiB. It
-	// bounds a transport's reliable stream to about 28 Mbit/s at 100 ms RTT
-	// (37 for the connection), near the 38-52 Mbit/s MEMSTEADY measured on
-	// the mobile h1 path a transport falls back to. DATAGRAMs are not flow
-	// controlled and are not bounded by it.
-	mobilePlatformH3MinConnectionReceiveWindowByteCount ByteCount = 448 * 1024
+	// Connection receive credit, three quarters of it stream credit: about
+	// 21 Mbit/s of connection and 16 of stream data a carrier at 100 ms RTT.
+	// DATAGRAMs are not flow controlled and are not bounded by it.
+	mobilePlatformH3ConnectionReceiveWindowByteCount ByteCount = 256 * 1024
+	mobilePlatformH3SocketReadBufferByteCount        ByteCount = 32 * 1024
+	mobilePlatformH3SocketWriteBufferByteCount       ByteCount = 16 * 1024
+	// quic-go's queues: 32 unprocessed packets, the least it keeps room for
+	// a server's 0-RTT packets, and 8 and 32 DATAGRAM slots
+	mobilePlatformH3UnprocessedPacketCount    = 32
+	mobilePlatformH3DatagramSendQueueCount    = 8
+	mobilePlatformH3DatagramReceiveQueueCount = 32
+	// Unacknowledged STREAM roots. Writers hold at most half of them, the
+	// rest absorbing retransmission splits, so about 2.6 Mbit/s of stream
+	// upload a carrier at 100 ms RTT, besides about 0.9 on the 8 DATAGRAM
+	// roots.
+	mobilePlatformH3SendFlightFrameCount = 48
+	// The reassembler's peer payload cap holds two whole 8-KiB messages.
+	mobilePlatformH3ReassemblyByteCount    = 16 * 1024
+	mobilePlatformH3ReassemblyMessageCount = 8
+	// The hybrid stream queue holds as many messages as a route, and two of
+	// the 16-KiB framer maximum, so no message the stream lane carries is
+	// refused as oversize.
+	mobilePlatformH3HybridStreamQueueMessageCount     = platformH3MemoryQueueCount
+	mobilePlatformH3HybridStreamQueuePayloadByteCount = 32 * 1024
+	mobilePlatformH3StreamWriteBatchByteCount         = 16 * 1024
 )
 
-// mobilePlatformH3ClaimByteCount is the complete inner H3 claim the mobile
-// policy gives a transport of an owner with this memory target: a fifth of
-// the owner's carrier budget, so its provider's three control paths and two
-// consumer transports fit at once, but never less than the fixed rows plus
-// the least receive credit. The fixed rows are charged in full either way;
-// only the receive credit shrinks. A fifth of the budget covers the fixed
-// rows plus the least credit from a 40-MiB target up, so smaller targets fit
-// fewer complete graphs, and a transport the budget cannot admit carries on
-// h1 instead (transport_h3_budget_fallback.go).
-func mobilePlatformH3ClaimByteCount(target ByteCount) ByteCount {
-	return max(
-		platformH3FixedMemoryByteCount()+mobilePlatformH3MinConnectionReceiveWindowByteCount,
-		platformTransportBudgetByteCountForMemoryTarget(target)/mobilePlatformH3ClaimsPerBudget,
-	)
-}
-
 // ApplyMobilePlatformTransportMemoryPolicy keeps mobile carrier ownership
-// accounted at every positive target and sizes each H3 claim so several fit
-// the owner's carrier budget (mobilePlatformH3ClaimByteCount). The claim is
-// exactly the connection receive credit plus the fixed rows: the credit is
-// what remains of the claim after the fixed rows, never more than the base
-// window, and the stream credit stays three quarters of it. A larger mobile
-// allowance never lowers the receive window or the claim, and it must not
-// turn off retained-send, speculative-dial, socket, or application-queue
+// accounted at every positive target and installs the phone sizes of an H3
+// carrier's queues, buffers and receive credit (the mobilePlatformH3*
+// values), keeping an embedder's smaller ones. The claim is then exactly the
+// connection receive credit plus what the configured sizes bound
+// (platformH3Ledger), the same at every target, so a phone's budget holds as
+// many carriers as its bytes allow. A transport the budget cannot admit
+// carries on h1 meanwhile (transport_h3_budget_fallback.go). It must not turn
+// off retained-send, speculative-dial, socket, or application-queue
 // accounting. Call after target sizing and before starting transports.
-// Applying it twice changes nothing. Desktop/server constructors retain
-// their existing policy unless their embedder explicitly selects this one.
+// Applying it twice changes nothing. Desktop/server constructors retain their
+// existing policy unless their embedder explicitly selects this one.
 func ApplyMobilePlatformTransportMemoryPolicy(settings *PlatformTransportSettings, target ByteCount) {
 	if settings == nil || target <= 0 {
 		return
 	}
+	// a nonpositive value resolves to a default outside the claim, so it
+	// takes the phone's size instead
+	phone := func(value ByteCount, size ByteCount) ByteCount {
+		if value <= 0 {
+			return size
+		}
+		return min(value, size)
+	}
+	phoneCount := func(value int, count int) int {
+		if value <= 0 {
+			return count
+		}
+		return min(value, count)
+	}
 	settings.h3RetainedByteAccounting = true
 	settings.h1RetainedByteAccounting = true
-	settings.H3SocketReadBufferByteCount = min(settings.H3SocketReadBufferByteCount, platformH3SocketByteCount)
-	settings.H3SocketWriteBufferByteCount = min(settings.H3SocketWriteBufferByteCount, platformH3SocketByteCount)
-	fixed := platformH3FixedMemoryByteCount()
-	connection := mobilePlatformH3ClaimByteCount(target) - fixed
-	// A non-positive window would resolve to the unbounded default in the
-	// QUIC config, outside the claim; it takes the policy's credit instead.
-	if 0 < settings.H3MaxConnectionReceiveWindowByteCount {
-		connection = min(connection, settings.H3MaxConnectionReceiveWindowByteCount)
+	settings.H3SocketReadBufferByteCount = phone(settings.H3SocketReadBufferByteCount, mobilePlatformH3SocketReadBufferByteCount)
+	settings.H3SocketWriteBufferByteCount = phone(settings.H3SocketWriteBufferByteCount, mobilePlatformH3SocketWriteBufferByteCount)
+	settings.H3MaxUnprocessedPacketCount = phoneCount(settings.H3MaxUnprocessedPacketCount, mobilePlatformH3UnprocessedPacketCount)
+	settings.H3DatagramSendQueueCount = phoneCount(settings.H3DatagramSendQueueCount, mobilePlatformH3DatagramSendQueueCount)
+	settings.H3DatagramReceiveQueueCount = phoneCount(settings.H3DatagramReceiveQueueCount, mobilePlatformH3DatagramReceiveQueueCount)
+	settings.H3SendFlightFrameCount = phoneCount(settings.H3SendFlightFrameCount, mobilePlatformH3SendFlightFrameCount)
+	if 0 < settings.H3StreamWriteBatchMaxByteCount {
+		settings.H3StreamWriteBatchMaxByteCount = min(settings.H3StreamWriteBatchMaxByteCount, mobilePlatformH3StreamWriteBatchByteCount)
 	}
+	if settings.H3DatagramSettings == nil {
+		settings.H3DatagramSettings = DefaultH3DatagramSettings()
+	}
+	datagrams := settings.H3DatagramSettings
+	// The admitted policy uses the existing single-fragment production
+	// limits. Multiple live generations share this bound as well.
+	datagrams.MaxReassemblyByteCount = max(datagrams.MaxMessageByteCount,
+		min(datagrams.MaxReassemblyByteCount, mobilePlatformH3ReassemblyByteCount))
+	datagrams.MaxReassemblyMessageCount = min(datagrams.MaxReassemblyMessageCount, mobilePlatformH3ReassemblyMessageCount)
+	datagrams.ProcessReassemblyByteCount = int64(datagrams.MaxReassemblyByteCount)
+	datagrams.HybridStreamQueueMessageCount = min(datagrams.HybridStreamQueueMessageCount, mobilePlatformH3HybridStreamQueueMessageCount)
+	datagrams.HybridStreamQueuePayloadByteCount = min(datagrams.HybridStreamQueuePayloadByteCount, mobilePlatformH3HybridStreamQueuePayloadByteCount)
+	connection := phone(settings.H3MaxConnectionReceiveWindowByteCount, mobilePlatformH3ConnectionReceiveWindowByteCount)
 	stream := connection * 3 / 4
 	if 0 < settings.H3MaxStreamReceiveWindowByteCount {
 		stream = min(stream, settings.H3MaxStreamReceiveWindowByteCount)
 	}
 	settings.H3MaxConnectionReceiveWindowByteCount = connection
 	settings.H3MaxStreamReceiveWindowByteCount = stream
-	settings.H3BudgetByteCount = connection + fixed
-	settings.H3InitialStreamReceiveWindowByteCount = min(settings.H3InitialStreamReceiveWindowByteCount,
-		settings.H3MaxStreamReceiveWindowByteCount, kib(128))
-	settings.H3InitialConnectionReceiveWindowByteCount = min(settings.H3InitialConnectionReceiveWindowByteCount,
-		settings.H3MaxConnectionReceiveWindowByteCount, kib(256))
-	if datagrams := settings.H3DatagramSettings; datagrams != nil {
-		// The admitted policy uses the existing single-fragment production
-		// limits. Multiple live generations share this bound as well.
-		datagrams.ProcessReassemblyByteCount = int64(datagrams.MaxReassemblyByteCount)
-	}
+	// An unset initial window would take 256 or 512 KiB in the QUIC config,
+	// above the credit charged, so it takes the phone's 128 or 256 KiB too.
+	settings.H3InitialStreamReceiveWindowByteCount = min(
+		phone(settings.H3InitialStreamReceiveWindowByteCount, kib(128)), stream)
+	settings.H3InitialConnectionReceiveWindowByteCount = min(
+		phone(settings.H3InitialConnectionReceiveWindowByteCount, kib(256)), connection)
+	// last, from every size above
+	settings.H3BudgetByteCount = connection + settings.h3FixedMemoryByteCount()
 }
 
 func (self *PlatformTransport) h3TransportBufferSize() int {

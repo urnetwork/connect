@@ -61,6 +61,31 @@ func NewPlatformTransportBudgetForMemoryTarget(
 	return newDefaultPlatformTransportBudget(memoryTargetByteCount)
 }
 
+// A phone's carrier budget has a carrier slot for each this many of its bytes
+// (NewMobilePlatformTransportBudgetForMemoryTarget).
+const mobilePlatformTransportBudgetSlotByteCount ByteCount = 512 * 1024
+
+// NewMobilePlatformTransportBudgetForMemoryTarget is the carrier limit of a
+// phone owner: the bytes NewPlatformTransportBudgetForMemoryTarget gives the
+// target, and a carrier slot for each 512 KiB of them, never fewer than its
+// 16. The mobile policy's carriers claim under a MiB each
+// (ApplyMobilePlatformTransportMemoryPolicy), so 16 slots would bind before
+// the bytes on a large target: the 16 MiB of a 64-MiB phone holds 18 H3
+// carriers and 32 slots. A nonpositive target uses the unscaled default.
+func NewMobilePlatformTransportBudgetForMemoryTarget(
+	memoryTargetByteCount ByteCount,
+) *PlatformTransportBudget {
+	if memoryTargetByteCount <= 0 {
+		return DefaultPlatformTransportBudget()
+	}
+	byteCount := platformTransportBudgetByteCountForMemoryTarget(memoryTargetByteCount)
+	return newPlatformTransportBudget(
+		byteCount,
+		max(16, int(byteCount/mobilePlatformTransportBudgetSlotByteCount)),
+		nil,
+	)
+}
+
 // SetMemoryBudget sets only the process-wide default sizing target. It never
 // creates or changes a shared admission budget. Zero disables scaling.
 func SetMemoryBudget(budgetByteCount ByteCount) {

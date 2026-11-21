@@ -153,7 +153,7 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 		budgetSettings := testingDefaultPlatformTransportSettings()
 		budgetStream, budgetConnection := resolved(budgetSettings)
 		if budgetSettings.h3RetainedByteAccounting {
-			if budgetSettings.H3BudgetByteCount < budgetConnection+platformH3FixedMemoryByteCount() {
+			if budgetSettings.H3BudgetByteCount < budgetConnection+budgetSettings.h3FixedMemoryByteCount() {
 				t.Fatalf("mobile receive window escaped composed claim at %d", budget)
 			}
 			continue
@@ -214,18 +214,18 @@ func TestTheH3ReceiveWindowsAreADrawOnTheBudget(t *testing.T) {
 	// they have always been.
 	//
 	// These budgets are all at or below 32 MiB, so the mobile policy composes
-	// them (applyPlatformH3MemoryPolicy), and since R20 its claim must leave
-	// room for several carriers in the budget: the windows are the policy's
-	// least credit, 336 and 448 KiB, below both the draw and its floors. They
-	// still inherit nothing from the reservation's floor.
+	// them (applyPlatformH3MemoryPolicy), and since R20 it sizes a carrier for
+	// a share of a phone's budget: the windows are its 192 and 256 KiB, below
+	// both the draw and its floors. They still inherit nothing from the
+	// reservation's floor.
 	for _, floor := range []struct {
 		budget     ByteCount
 		stream     ByteCount
 		connection ByteCount
 	}{
-		{mib(8), kib(336), kib(448)},
-		{mib(4), kib(336), kib(448)},
-		{mib(1), kib(336), kib(448)},
+		{mib(8), kib(192), kib(256)},
+		{mib(4), kib(192), kib(256)},
+		{mib(1), kib(192), kib(256)},
 	} {
 		SetMemoryBudget(floor.budget)
 		floorSettings := testingDefaultPlatformTransportSettings()

@@ -616,13 +616,33 @@ type PlatformTransportSettings struct {
 	H3MaxStreamReceiveWindowByteCount         ByteCount
 	H3InitialConnectionReceiveWindowByteCount ByteCount
 	H3MaxConnectionReceiveWindowByteCount     ByteCount
+	// H3MaxUnprocessedPacketCount, H3DatagramSendQueueCount and
+	// H3DatagramReceiveQueueCount bound quic-go's queues on each H3
+	// connection (third_party/quic-go/URNETWORK.md): the received packets its
+	// run loop has not processed yet, each in a 1452-byte packet buffer, and
+	// the DATAGRAM frames queued to send or received and unread, each a copy
+	// of its payload. The send count also bounds the retained-send
+	// controller's DATAGRAM roots, queued or sent until acknowledged or lost.
+	// Non-positive keeps quic-go's 256, 32 and 128. The mobile policy sets
+	// phone sizes and charges what they bound
+	// (ApplyMobilePlatformTransportMemoryPolicy).
+	H3MaxUnprocessedPacketCount int
+	H3DatagramSendQueueCount    int
+	H3DatagramReceiveQueueCount int
+	// H3SendFlightFrameCount bounds the STREAM frames the retained-send
+	// controller lets one H3 connection hold until they are acknowledged,
+	// each in a 1452-byte buffer. Writers hold at most half of them, about a
+	// packet of stream data each, and the rest absorb retransmission splits,
+	// so it bounds the connection's unacknowledged stream upload. It applies
+	// with retained accounting. Non-positive keeps 96, and less than 3 is
+	// raised to 3, the least that admits a writer.
+	H3SendFlightFrameCount int
 	// H3StreamWriteBatchMaxMessageCount and H3StreamWriteBatchMaxByteCount
 	// bound one write on the H3 reliable stream: the writer drains up to this
 	// many ready messages, framed, into one buffer of the byte bound, which it
 	// allocates once the stream carries data. The mobile memory ledger charges
-	// that buffer inside its application row (platformH3ApplicationQueueBytes),
-	// so a larger bound needs a larger row. Non-positive writes one message at
-	// a time.
+	// that buffer in its application row (platformH3Ledger). Non-positive
+	// writes one message at a time.
 	H3StreamWriteBatchMaxMessageCount int
 	H3StreamWriteBatchMaxByteCount    int
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
@@ -1048,9 +1068,9 @@ func DefaultPlatformTransportSettingsWithMemoryTarget(
 // that connection credit must equal the entire reservation did not account
 // for concurrently retained non-receive owners. MEMSTEADY supersedes that
 // assertion on the constrained mobile surface, where the claim is the
-// connection credit plus 1600 KiB of fixed owners and is sized so five
-// carriers fit the owner's budget: at a 20 MiB owner target a 2 MiB claim
-// covers 448 KiB of connection credit and 336 KiB of stream credit
+// connection credit plus what the carrier's configured queues and buffers
+// bound, sized so a phone holds a carrier per peer: a 256-KiB connection and
+// 192-KiB stream credit in a claim of about 0.88 MiB
 // (ApplyMobilePlatformTransportMemoryPolicy). Larger/server targets keep the
 // base formula.
 //
@@ -1368,6 +1388,10 @@ func newPlatformQuicConfig(
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
 		EnableDatagrams:                settings.EnableH3Datagrams,
+		// zero keeps quic-go's own lengths
+		MaxUnprocessedPackets:      settings.H3MaxUnprocessedPacketCount,
+		MaxDatagramSendQueueLen:    settings.H3DatagramSendQueueCount,
+		MaxDatagramReceiveQueueLen: settings.H3DatagramReceiveQueueCount,
 		// version 2 first, so the Initial is not the one the filters decrypt
 		// for its sni (A13)
 		Versions: settings.QuicVersionPolicy.Versions(),
@@ -3787,7 +3811,7 @@ func (self *PlatformTransport) runH3(
 				if budget == nil {
 					budget = DefaultPlatformTransportBudget()
 				}
-				extraByteCount := platformH3DialTransientByteCount
+				extraByteCount := self.settings.h3DialTransientByteCount()
 				if !self.settings.h3RetainedByteAccounting {
 					extraByteCount = self.h3BudgetByteCount()
 				}

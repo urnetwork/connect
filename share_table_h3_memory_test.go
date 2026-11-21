@@ -6,9 +6,13 @@ import (
 )
 
 // Independent ledger oracle: intentionally pin the byte total instead of
-// calling applyPlatformH3MemoryPolicy or its fixed-size helper. A production
-// envelope change must update both the retained-owner evidence and this table.
-const shareTableH3FixedByteCount ByteCount = 1600 * 1024
+// calling applyPlatformH3MemoryPolicy or its ledger. A production envelope
+// change must update both the retained-owner evidence and this table. Since
+// R20 the rows are what the phone sizes bound: 48 KiB of sockets, 96 KiB of
+// STREAM roots and 28,864 bytes of send state, 91,648 of DATAGRAM queues,
+// 36 KiB of reassembly, 192 KiB of unprocessed packets and connection state,
+// and 159,948 bytes of application routes and queues.
+const shareTableH3FixedByteCount ByteCount = 661388
 
 type shareTableH3Ledger struct {
 	reservation, stream, connection, fixed ByteCount
@@ -22,13 +26,10 @@ func shareTableH3LedgerForTarget(target ByteCount) shareTableH3Ledger {
 		connection:  max(kib(512), draw),
 	}
 	if 0 < target && target <= mib(32) {
-		// R20: the claim is a fifth of the owner's carrier budget, never less
-		// than the fixed rows plus 448 KiB of connection credit, and it is
-		// exactly that credit plus the fixed rows
+		// R20: the phone sizes at every target, 256 KiB of connection credit
+		// on top of the rows they bound
 		ledger.fixed = shareTableH3FixedByteCount
-		budget := min(target, max(mib(3), target/4))
-		claim := max(ledger.fixed+kib(448), budget/5)
-		ledger.connection = min(ledger.connection, claim-ledger.fixed)
+		ledger.connection = min(ledger.connection, kib(256))
 		ledger.stream = min(ledger.stream, ledger.connection*3/4)
 		ledger.reservation = ledger.connection + ledger.fixed
 	}
@@ -38,25 +39,25 @@ func shareTableH3LedgerForTarget(target ByteCount) shareTableH3Ledger {
 func TestTheShareTableH3RetainedPolicyBoundaries(t *testing.T) {
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
-	if got := platformH3FixedMemoryByteCount(); got != shareTableH3FixedByteCount {
+	phoneSettings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	if got := phoneSettings.h3FixedMemoryByteCount(); got != shareTableH3FixedByteCount {
 		t.Fatalf("H3 fixed ownership changed: %d, ledger %d", got, shareTableH3FixedByteCount)
 	}
 	for _, row := range []struct {
 		target, reservation, connection, stream ByteCount
 		retained                                bool
 	}{
-		// every retained target through 32 MiB takes the 2-MiB floor claim:
-		// a fifth of its budget is less than the fixed rows plus the least
-		// credit, so the old 24-MiB step and its draw boundary are gone
-		{mib(8), kib(2048), kib(448), kib(336), true},
-		{kib(11776) - 8, kib(2048), kib(448), kib(336), true},
-		{kib(11776), kib(2048), kib(448), kib(336), true},
-		{mib(16), kib(2048), kib(448), kib(336), true},
-		{mib(20), kib(2048), kib(448), kib(336), true},
-		{mib(24), kib(2048), kib(448), kib(336), true},
-		{mib(24) + 8, kib(2048), kib(448), kib(336), true},
-		{mib(28), kib(2048), kib(448), kib(336), true},
-		{mib(32), kib(2048), kib(448), kib(336), true},
+		// every retained target through 32 MiB takes the phone sizes: the
+		// old 24-MiB step and its draw boundary are gone
+		{mib(8), kib(256) + 661388, kib(256), kib(192), true},
+		{kib(11776) - 8, kib(256) + 661388, kib(256), kib(192), true},
+		{kib(11776), kib(256) + 661388, kib(256), kib(192), true},
+		{mib(16), kib(256) + 661388, kib(256), kib(192), true},
+		{mib(20), kib(256) + 661388, kib(256), kib(192), true},
+		{mib(24), kib(256) + 661388, kib(256), kib(192), true},
+		{mib(24) + 8, kib(256) + 661388, kib(256), kib(192), true},
+		{mib(28), kib(256) + 661388, kib(256), kib(192), true},
+		{mib(32), kib(256) + 661388, kib(256), kib(192), true},
 		{mib(32) + 8, kib(4096) + 1, kib(4096) + 1, kib(3072), false},
 		{mib(48), kib(6144), kib(6144), kib(4608), false},
 		{mib(128), kib(16384), kib(16384), kib(12288), false},

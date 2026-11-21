@@ -8,27 +8,26 @@ import (
 	quic "github.com/urnetwork/quic-go"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
+	"unsafe"
 )
 
+// The phone sizes and what each ledger row charges for them, row by row, from
+// the configured sizes alone (server LBALTOPT2 R20). Before R20 the rows were
+// fixed at 1600 KiB, and the 20-MiB claim was 3 MiB with 1472/1104 KiB of
+// connection/stream credit; 28 MiB's was 5184 KiB.
 func TestPlatformH3MobileComposedLedger(t *testing.T) {
-	if got := platformH3FixedMemoryByteCount(); got != kib(1600) {
-		t.Fatalf("fixed H3 ledger = %d, want 1600 KiB", got)
-	}
-	if actual := kib(256) + platformH3ControlBytes + 2*platformH3SocketByteCount + platformH3DatagramQueueBytes; platformH3DialTransientByteCount-actual != kib(160) {
-		t.Fatal("pre-auth receive, DATAGRAM, socket, and control state escaped the transient lease")
-	}
-	// R20: through a 40-MiB target the claim is the fixed rows plus the least
-	// receive credit, 2 MiB, so two fit the 5-MiB child of a 20-MiB target
-	// and three the 7-MiB child of 28 MiB; before R20 one 3-MiB claim fit at
-	// 20 MiB and one 5184-KiB claim at 28 MiB. raceSlack is what the child
-	// keeps beside one claim, two DNS candidates, the transient dial and a
-	// pending H1.
+	const (
+		claim     = ByteCount(923532)
+		fixed     = claim - 256*1024
+		transient = ByteCount(665280)
+	)
 	for _, c := range []struct {
-		target, process, claim, stream, connection, total, raceSlack ByteCount
+		target, process, total ByteCount
 	}{
-		{mib(20), mib(32), kib(2048), kib(336), kib(448), mib(5), kib(1120)},
-		{mib(28), mib(40), kib(2048), kib(336), kib(448), mib(7), kib(3168)},
+		{mib(20), mib(32), mib(5)},
+		{mib(28), mib(40), mib(7)},
 	} {
 		t.Run(fmt.Sprint(c.target), func(t *testing.T) {
 			old := MemoryBudget()
@@ -39,78 +38,158 @@ func TestPlatformH3MobileComposedLedger(t *testing.T) {
 			if config.Allow0RTT {
 				t.Fatal("mobile retained-send policy permits untracked early data")
 			}
-			if config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) {
-				t.Fatal("speculative dial can grow beyond the transient receive envelope before an application read")
+			if config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) ||
+				config.MaxStreamReceiveWindow != uint64(kib(192)) || config.MaxConnectionReceiveWindow != uint64(kib(256)) {
+				t.Fatalf("receive credit escaped the phone sizes: %+v", config)
 			}
-			if settings.H3BudgetByteCount != c.claim || config.MaxStreamReceiveWindow != uint64(c.stream) ||
-				config.MaxConnectionReceiveWindow != uint64(c.connection) || c.connection+platformH3FixedMemoryByteCount() != c.claim {
-				t.Fatalf("composed H3 claim=%d stream=%d conn=%d", settings.H3BudgetByteCount, config.MaxStreamReceiveWindow, config.MaxConnectionReceiveWindow)
+			if config.MaxUnprocessedPackets != 32 || config.MaxDatagramSendQueueLen != 8 || config.MaxDatagramReceiveQueueLen != 32 {
+				t.Fatalf("quic-go's queues escaped the phone sizes: unprocessed=%d datagram send=%d receive=%d",
+					config.MaxUnprocessedPackets, config.MaxDatagramSendQueueLen, config.MaxDatagramReceiveQueueLen)
 			}
-			if settings.PlatformTransportBudget.Stats().TotalByteCount != c.total ||
-				settings.H3SocketReadBufferByteCount != kib(64) || settings.H3SocketWriteBufferByteCount != kib(64) {
-				t.Fatal("child/socket policy escaped the profile")
-			}
-			if c.total-(c.claim+2*kib(144)+platformH3DialTransientByteCount+settings.H1BudgetByteCount) != c.raceSlack {
-				t.Fatal("two DNS candidates plus pending H1 do not fit the exact profile")
+			if settings.H3SocketReadBufferByteCount != kib(32) || settings.H3SocketWriteBufferByteCount != kib(16) ||
+				settings.H3SendFlightFrameCount != 48 || settings.H3StreamWriteBatchMaxByteCount != 16*1024 ||
+				settings.PlatformTransportBudget.Stats().TotalByteCount != c.total {
+				t.Fatal("socket, send or child policy escaped the phone sizes")
 			}
 			if transport := (&PlatformTransport{settings: settings}); transport.h3TransportBufferSize() != 4 || settings.TransportBufferSize != 32 {
 				t.Fatal("H3 route depth must be four without reducing H1's depth")
 			}
 			datagrams := settings.H3DatagramSettings
-			if datagrams.MaxMessageByteCount != 8192 || datagrams.MaxFragmentCount != 1 || datagrams.MaxReassemblyMessageCount != 32 ||
-				datagrams.MaxReassemblyByteCount != 64*1024 || datagrams.ProcessReassemblyByteCount != 64*1024 {
-				t.Fatalf("DATAGRAM ownership escaped its ledger: %+v", datagrams)
+			if datagrams.MaxMessageByteCount != 8192 || datagrams.MaxFragmentCount != 1 || datagrams.MaxReassemblyMessageCount != 8 ||
+				datagrams.MaxReassemblyByteCount != 16*1024 || datagrams.ProcessReassemblyByteCount != 16*1024 ||
+				datagrams.HybridStreamQueueMessageCount != 4 || datagrams.HybridStreamQueuePayloadByteCount != 32*1024 {
+				t.Fatalf("DATAGRAM ownership escaped the phone sizes: %+v", datagrams)
 			}
-			if want := ByteCount((32 + 128 + 1) * 2048); platformH3DatagramQueueBytes < want+kib(30) {
-				t.Fatal("quic-go's send/receive DATAGRAM roots and descriptors are not fully charged")
+			// the stream lane's largest message, the framer's 16 KiB, is never
+			// refused as larger than the whole hybrid stream queue
+			if ByteCount(datagrams.HybridStreamQueueByteCount()) < retainedMessageCapacity(kib(16)) {
+				t.Fatal("the hybrid stream queue refuses the stream lane's largest message")
 			}
-			// Route ownership (both directions), dispatcher/read/pending holds,
-			// hybrid retained queue, and batch scratch fit the separate row.
-			root := retainedMessageCapacity(8192)
-			app := ByteCount(2*platformH3MemoryQueueCount+5)*root +
-				ByteCount(settings.H3DatagramSettings.HybridStreamQueueByteCount()) +
-				ByteCount(settings.H3StreamWriteBatchMaxByteCount)
-			if platformH3ApplicationQueueBytes < app {
-				t.Fatalf("application ownership=%d escaped row=%d", app, platformH3ApplicationQueueBytes)
+
+			// each row, from the sizes alone
+			ledger := settings.h3Ledger()
+			flightTables := ByteCount(48+8)*ByteCount(unsafe.Sizeof(quicSendFlightFrame{})) +
+				256*ByteCount(unsafe.Sizeof(quicSendFlightPacket{})) + 8*ByteCount(unsafe.Sizeof(uintptr(0)))
+			for _, row := range []struct {
+				name      string
+				got, want ByteCount
+			}{
+				{"sockets", ledger.sockets, kib(32) + kib(16)},
+				{"STREAM roots", ledger.sendRoots, 48 * kib(2)},
+				{"send state", ledger.sendState, (48+8+16)*192 + flightTables + kib(8)},
+				{"DATAGRAM queues", ledger.datagrams, (8+32+1)*kib(2) + (8+32)*192},
+				{"reassembly", ledger.reassembly, kib(16) + kib(16) + 8*512},
+				{"unprocessed packets and connection state", ledger.control, 32*kib(2) + kib(128)},
+				{"application", ledger.application, 13*(8192+12) + (32*1024 + 4*12) + kib(16) + kib(4)},
+			} {
+				if row.got != row.want {
+					t.Errorf("%s row %d, want %d", row.name, row.got, row.want)
+				}
+			}
+			if ledger.total() != fixed || settings.H3BudgetByteCount != claim ||
+				settings.H3MemoryReservationByteCount(TransportModeH3, nil) != claim {
+				t.Fatalf("claim %d (fixed %d), want %d (fixed %d)", settings.H3BudgetByteCount, ledger.total(), claim, fixed)
+			}
+			// a racing candidate holds its initial credit, sockets, quic-go's
+			// queues and state, the reassembler and the send state, but no
+			// STREAM roots or routes
+			if got := settings.h3DialTransientByteCount(); got != transient ||
+				got != kib(256)+ledger.sockets+ledger.control+ledger.datagrams+ledger.reassembly+ledger.sendState {
+				t.Fatalf("dial transient %d, want %d", got, transient)
+			}
+			if c.total < claim+2*kib(144)+transient+settings.H1BudgetByteCount {
+				t.Fatal("one claim, two DNS candidates, the transient dial and a pending H1 do not fit the profile")
 			}
 		})
 	}
 }
 
-// A larger mobile target still grows the window, as a fifth of its budget
-// less the fixed rows, never above the desktop window. Before R20 the mobile
-// window above 24 MiB was the desktop window itself, so one claim filled more
-// than half the budget at every target.
-func TestPlatformExplicitMobilePolicyScalesBeyondHistoricalTarget(t *testing.T) {
+// The retained-send controller of a platform H3 dial takes the settings'
+// limits: its STREAM roots, and as many DATAGRAM roots as quic-go's send
+// queue, with the frame table sized for them.
+func TestPlatformH3SendFlightTakesSettingsLimits(t *testing.T) {
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+	ApplyMobilePlatformTransportMemoryPolicy(settings, mib(20))
+	config := newPlatformQuicConfig(settings, 1)
+	installQuicSendFlightWithLimits(config, settings.h3SendFlightLimits())
+	trace, ok := config.Tracer(t.Context(), true, quic.ConnectionID{}).(*quicSendFlightTrace)
+	if !ok {
+		t.Fatal("the dial's tracer does not own a send flight")
+	}
+	flight := trace.flight
+	if flight.limits.frames != 48 || flight.limits.datagrams != 8 || len(flight.frames) != 48+8 || flight.limits.writeLimit() != 23 {
+		t.Fatalf("flight limits %+v with %d frame slots", flight.limits, len(flight.frames))
+	}
+	for i := range 8 {
+		if err := flight.trySendDatagram(func([]byte) error { return nil }, []byte{byte(i)}); err != nil {
+			t.Fatalf("DATAGRAM root %d refused: %v", i, err)
+		}
+	}
+	if err := flight.trySendDatagram(func([]byte) error { return nil }, []byte{8}); !errors.Is(err, errQuicDatagramFlightFull) {
+		t.Fatalf("a ninth DATAGRAM root was admitted: %v", err)
+	}
+
+	// unset limits keep the defaults
+	defaults := (&PlatformTransportSettings{}).h3SendFlightLimits()
+	if defaults != defaultQuicSendFlightLimits() || newQuicSendFlightWithLimits(quicSendFlightLimits{}).limits != defaultQuicSendFlightLimits() {
+		t.Fatalf("unset limits %+v, want the defaults", defaults)
+	}
+}
+
+// A frame limit of one or two would leave writers a writeLimit of zero, so
+// every write would wait forever. The flight raises it to three, a
+// writeLimit of one, and the H3 ledger charges the three roots it keeps.
+func TestPlatformH3SendFlightRaisesAFrameLimitThatWouldBlockWriters(t *testing.T) {
+	for _, frames := range []int{1, 2} {
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
+		ApplyMobilePlatformTransportMemoryPolicy(settings, mib(20))
+		settings.H3SendFlightFrameCount = frames
+		limits := settings.h3SendFlightLimits()
+		flight := newQuicSendFlightWithLimits(limits)
+		if limits != (quicSendFlightLimits{frames: 3, datagrams: 8}) || flight.limits != limits ||
+			flight.limits.writeLimit() != 1 || len(flight.frames) != 3+8 {
+			t.Fatalf("a frame limit of %d: ledger %+v, flight %+v with %d frame slots",
+				frames, limits, flight.limits, len(flight.frames))
+		}
+		if roots := settings.h3Ledger().sendRoots; roots != 3*platformH3RootByteCount {
+			t.Fatalf("a frame limit of %d charges %d bytes of STREAM roots, want three roots", frames, roots)
+		}
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			if err := flight.wait(ctx, false, nil); err != nil {
+				t.Fatalf("a frame limit of %d blocks the first write: %v", frames, err)
+			}
+		})
+	}
+}
+
+// The phone sizes hold at every mobile target: a larger target keeps the
+// window and the claim, so the budget holds more carriers rather than larger
+// ones, and nothing exceeds the desktop window. Before R20 the window above
+// 24 MiB was the desktop window, so one claim filled more than half the budget.
+func TestPlatformExplicitMobilePolicyKeepsPhoneSizesAtLargerTargets(t *testing.T) {
 	old := MemoryBudget()
 	defer SetMemoryBudget(old)
-	previousWindow := ByteCount(0)
-	for _, c := range []struct {
-		target, window ByteCount
-	}{
-		{mib(32), kib(448)},
-		{mib(64), mib(16)/5 - kib(1600)},
-		{mib(128), mib(32)/5 - kib(1600)},
-	} {
-		t.Run(fmt.Sprint(c.target), func(t *testing.T) {
-			SetMemoryBudget(c.target)
-			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+	for _, target := range []ByteCount{mib(32), mib(64), mib(128)} {
+		t.Run(fmt.Sprint(target), func(t *testing.T) {
+			SetMemoryBudget(target)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 			desktopWindow := settings.H3MaxConnectionReceiveWindowByteCount
-			if c.target > mib(32) && settings.h3RetainedByteAccounting {
+			if target > mib(32) && settings.h3RetainedByteAccounting {
 				t.Fatal("an ordinary desktop target was reclassified as mobile")
 			}
-			ApplyMobilePlatformTransportMemoryPolicy(settings, c.target)
+			ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 			config := newPlatformQuicConfig(settings, 1)
 			if config.Allow0RTT || !settings.h3RetainedByteAccounting {
 				t.Fatal("explicit mobile profile lost retained-send accounting")
 			}
-			if config.MaxConnectionReceiveWindow != uint64(c.window) || desktopWindow < c.window ||
-				c.window <= previousWindow ||
-				settings.H3BudgetByteCount != c.window+platformH3FixedMemoryByteCount() {
-				t.Fatalf("larger mobile window did not grow within the desktop window, or its claim omitted ownership: window=%d claim=%d desktop=%d",
+			if config.MaxConnectionReceiveWindow != uint64(kib(256)) || desktopWindow < kib(256) ||
+				settings.H3BudgetByteCount != kib(256)+settings.h3FixedMemoryByteCount() ||
+				settings.H3BudgetByteCount != ByteCount(923532) {
+				t.Fatalf("mobile window %d or claim %d left the phone sizes (desktop window %d)",
 					config.MaxConnectionReceiveWindow, settings.H3BudgetByteCount, desktopWindow)
 			}
-			previousWindow = c.window
 			if (&PlatformTransport{settings: settings}).h3TransportBufferSize() != platformH3MemoryQueueCount ||
 				config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) {
 				t.Fatal("mobile application/dial ownership escaped its fixed rows")
@@ -119,7 +198,7 @@ func TestPlatformExplicitMobilePolicyScalesBeyondHistoricalTarget(t *testing.T) 
 			// must not add the fixed rows twice or replace an existing owner.
 			claim, budget := settings.H3BudgetByteCount, settings.PlatformTransportBudget
 			window, stream := settings.H3MaxConnectionReceiveWindowByteCount, settings.H3MaxStreamReceiveWindowByteCount
-			ApplyMobilePlatformTransportMemoryPolicy(settings, c.target)
+			ApplyMobilePlatformTransportMemoryPolicy(settings, target)
 			if settings.H3BudgetByteCount != claim || settings.PlatformTransportBudget != budget ||
 				settings.H3MaxConnectionReceiveWindowByteCount != window || settings.H3MaxStreamReceiveWindowByteCount != stream {
 				t.Fatal("mobile policy was not idempotent")
@@ -128,24 +207,54 @@ func TestPlatformExplicitMobilePolicyScalesBeyondHistoricalTarget(t *testing.T) 
 	}
 }
 
-// R20's arithmetic at the phone memory targets, by real admission on the
-// owner's budget: the SDK default (20 MiB), the steady target (24), iOS (32),
-// 48, and Android (64). Each row pins how many complete h3 graphs the budget
-// admitted before R20 and admits now, and a phone that provides on h3: its
-// two pinned control paths acquired and its standby held, then its
-// consumer's window transports. Every claim still charges the full fixed
-// rows, 1600 KiB, so where a fifth of the budget cannot also cover the least
-// receive credit the budget holds fewer than the provider's three paths and
-// two consumers, and a consumer it cannot admit carries on h1.
+// An embedder's unset sizes resolve to defaults outside the claim: quic-go's
+// 256, 32 and 128 queue lengths, 256- and 512-KiB initial windows and the
+// desktop's receive windows. The mobile policy gives each the phone's size,
+// so the claim still bounds every queue and window the connection may fill.
+func TestPlatformMobilePolicyChargesWhatUnsetSizesResolveTo(t *testing.T) {
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(64))
+	settings.H3SocketReadBufferByteCount = 0
+	settings.H3SocketWriteBufferByteCount = 0
+	settings.H3MaxUnprocessedPacketCount = 0
+	settings.H3DatagramSendQueueCount = 0
+	settings.H3DatagramReceiveQueueCount = 0
+	settings.H3SendFlightFrameCount = 0
+	settings.H3DatagramSettings = nil
+	settings.H3InitialStreamReceiveWindowByteCount = 0
+	settings.H3InitialConnectionReceiveWindowByteCount = 0
+	settings.H3MaxStreamReceiveWindowByteCount = 0
+	settings.H3MaxConnectionReceiveWindowByteCount = 0
+	ApplyMobilePlatformTransportMemoryPolicy(settings, mib(64))
+	config := newPlatformQuicConfig(settings, 1)
+	if config.MaxUnprocessedPackets != 32 || config.MaxDatagramSendQueueLen != 8 || config.MaxDatagramReceiveQueueLen != 32 ||
+		config.InitialStreamReceiveWindow != uint64(kib(128)) || config.MaxStreamReceiveWindow != uint64(kib(192)) ||
+		config.InitialConnectionReceiveWindow != uint64(kib(256)) || config.MaxConnectionReceiveWindow != uint64(kib(256)) {
+		t.Fatalf("unset sizes resolved outside the phone's: %+v", config)
+	}
+	if settings.H3SocketReadBufferByteCount != kib(32) || settings.H3SocketWriteBufferByteCount != kib(16) ||
+		settings.h3SendFlightLimits() != (quicSendFlightLimits{frames: 48, datagrams: 8}) ||
+		settings.H3DatagramSettings == nil || settings.H3DatagramSettings.MaxReassemblyByteCount != 16*1024 ||
+		settings.H3BudgetByteCount != ByteCount(923532) {
+		t.Fatalf("unset sizes charged %d, not the phone's claim: %+v", settings.H3BudgetByteCount, settings)
+	}
+}
+
+// R20's arithmetic at the phone memory targets, by real admission on a
+// phone's carrier budget: the SDK default (20 MiB), the steady target (24),
+// iOS (32), 48, and Android (64). Each row pins how many complete h3 graphs
+// the budget admitted before R20 and admits now, and a phone that provides on
+// h3: its two pinned control paths acquired and its standby held, then its
+// consumer's window transports. Every claim charges what its configured
+// queues and buffers bound, about 0.88 MiB, so a phone holds an h3 carrier
+// for each of six to ten peers, and its provider's three control paths and
+// two consumers fit at every target.
 func TestMobileH3ClaimsFitMoreCarriersThanBefore(t *testing.T) {
 	old := MemoryBudget()
 	defer SetMemoryBudget(old)
 	SetMemoryBudget(0)
-	fixed := platformH3FixedMemoryByteCount()
-	previousConnection := ByteCount(0)
+	const claim = ByteCount(923532)
 	for _, c := range []struct {
-		target     ByteCount
-		connection ByteCount
+		target ByteCount
 		// complete h3 graphs an empty budget admits, before R20 and now
 		before, fits int
 		// consumer h3 graphs admitted beside the two pins and the held standby
@@ -153,33 +262,29 @@ func TestMobileH3ClaimsFitMoreCarriersThanBefore(t *testing.T) {
 		// whether a consumer's h1 fallback still fits beside the pins and
 		// those consumers
 		h1BesidePins bool
-		// whether the three control paths and two consumers fit at once
-		threePlusTwo bool
 	}{
-		{mib(20), kib(448), 1, 2, 0, true, false},
-		{mib(24), kib(448), 2, 3, 1, false, false},
-		{mib(32), kib(448), 1, 4, 2, false, false},
-		{mib(48), mib(12)/5 - fixed, 1, 5, 3, false, true},
-		{mib(64), mib(16)/5 - fixed, 1, 5, 3, false, true},
+		{mib(20), 1, 5, 3, false},
+		{mib(24), 2, 6, 4, true},
+		{mib(32), 1, 9, 7, false},
+		{mib(48), 1, 13, 11, false},
+		{mib(64), 1, 18, 16, false},
 	} {
 		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(c.target)
+		settings.PlatformTransportBudget = NewMobilePlatformTransportBudgetForMemoryTarget(c.target)
 		ApplyMobilePlatformTransportMemoryPolicy(settings, c.target)
 		// the sdk's ack lane, which its h1 claim carries on a phone
 		settings.H1AckPriorityBufferSize = 8
 		budget := settings.PlatformTransportBudget
-		claim := settings.H3MemoryReservationByteCount(TransportModeH3, nil)
 		h1Claim := settings.H1MemoryReservationByteCount()
 		config := newPlatformQuicConfig(settings, 1)
-		if ByteCount(config.MaxConnectionReceiveWindow) != c.connection ||
-			ByteCount(config.MaxStreamReceiveWindow) != c.connection*3/4 ||
-			claim != c.connection+fixed || claim != settings.H3BudgetByteCount {
-			t.Fatalf("target %d: claim %d, connection %d, stream %d; want the fixed rows plus %d of credit",
-				c.target, claim, config.MaxConnectionReceiveWindow, config.MaxStreamReceiveWindow, c.connection)
+		if got := settings.H3MemoryReservationByteCount(TransportModeH3, nil); got != claim ||
+			config.MaxConnectionReceiveWindow != uint64(kib(256)) || config.MaxStreamReceiveWindow != uint64(kib(192)) {
+			t.Fatalf("target %d: claim %d, connection %d, stream %d; want %d with 256/192 KiB of credit",
+				c.target, got, config.MaxConnectionReceiveWindow, config.MaxStreamReceiveWindow, claim)
 		}
-		if c.connection < previousConnection {
-			t.Fatalf("target %d lowered the window to %d from %d", c.target, c.connection, previousConnection)
+		if stats := budget.Stats(); stats.MaxTransportCount < c.fits+3 {
+			t.Fatalf("target %d: %d carrier slots bind before the bytes", c.target, stats.MaxTransportCount)
 		}
-		previousConnection = c.connection
 
 		claims := []*platformTransportBudgetReservation{}
 		admit := func(class platformTransportBudgetClass, byteCount ByteCount) bool {
@@ -228,17 +333,15 @@ func TestMobileH3ClaimsFitMoreCarriersThanBefore(t *testing.T) {
 		standby.Release()
 		releaseAll()
 
-		threePlusTwo := true
-		for range 5 {
-			threePlusTwo = threePlusTwo && admit(platformTransportBudgetH3Explicit, claim)
+		// the provider's three control paths and two consumers, at once
+		for i := range 5 {
+			if !admit(platformTransportBudgetH3Explicit, claim) {
+				t.Fatalf("target %d: graph %d of three control paths and two consumers did not fit", c.target, i+1)
+			}
 		}
 		releaseAll()
-		if threePlusTwo != c.threePlusTwo {
-			t.Fatalf("target %d: three control paths and two consumers fit %t, want %t", c.target, threePlusTwo, c.threePlusTwo)
-		}
-		t.Logf("target %d: budget %d, claim %d, connection %d, stream %d, h3 graphs %d (before %d), h1 %d",
-			c.target, budget.Stats().TotalByteCount, claim, config.MaxConnectionReceiveWindow,
-			config.MaxStreamReceiveWindow, fits, c.before, h1Claim)
+		t.Logf("target %d: budget %d, slots %d, claim %d, h3 graphs %d (before %d), h1 %d",
+			c.target, budget.Stats().TotalByteCount, budget.Stats().MaxTransportCount, claim, fits, c.before, h1Claim)
 	}
 }
 
@@ -276,12 +379,16 @@ func TestPlatformMobileNestedCarrierAdmissionMatrix(t *testing.T) {
 	old := MemoryBudget()
 	defer SetMemoryBudget(old)
 	// The slack beside the inner claim, a sibling H1, the inner translation
-	// and the outer DNS extender's graph. R20's smaller inner claims (2 MiB
-	// through 40 MiB, a fifth of the budget above) leave more of it; at
-	// 64 MiB a fifth of 16 MiB is not KiB-aligned.
+	// and the outer DNS extender's graph: R20's phone-sized inner claim of
+	// 923,532 bytes, and an outer graph of a 256-KiB window, 512 KiB of
+	// control, 256 KiB of send roots, 48 KiB of sockets and 144 KiB of
+	// translation. The sibling H1 is 256 KiB through 32 MiB and 512 at 64.
+	outer := kib(256 + 512 + 256 + 48 + 144)
 	for _, profile := range []struct{ target, process, nestedDnsSlack ByteCount }{
-		{mib(20), mib(32), kib(1184)}, {mib(28), mib(40), kib(3232)},
-		{mib(32), mib(32), kib(4256)}, {mib(64), mib(64), mib(16) - (mib(16)/5 + kib(512) + kib(144) + kib(1552))},
+		{mib(20), mib(32), mib(5) - (923532 + kib(256) + kib(144) + outer)},
+		{mib(28), mib(40), mib(7) - (923532 + kib(256) + kib(144) + outer)},
+		{mib(32), mib(32), mib(8) - (923532 + kib(256) + kib(144) + outer)},
+		{mib(64), mib(64), mib(16) - (923532 + kib(512) + kib(144) + outer)},
 	} {
 		for _, mode := range []TransportMode{TransportModeH1, TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
 			for _, carrier := range []string{"direct", ExtenderCarrierTcp, ExtenderCarrierQuic, ExtenderCarrierDns} {

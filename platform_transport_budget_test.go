@@ -769,8 +769,8 @@ func TestPlatformTransportBudgetAutoModesFollowMemoryTarget(t *testing.T) {
 		// R20's 2-MiB mobile claim fits beside H1 in the 8-MiB legacy
 		// target's 3-MiB budget, where the 3-MiB claim before it did not
 		{name: "legacy low target keeps full Auto", memoryTarget: mib(8), wantH3Acquire: true},
-		// a 2-MiB budget holds the claim or H1, not both
-		{name: "target below claim and H1 runs H1 only", memoryTarget: mib(2), wantH3Acquire: false},
+		// a 1-MiB budget holds the claim or H1, not both
+		{name: "target below claim and H1 runs H1 only", memoryTarget: mib(1), wantH3Acquire: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
