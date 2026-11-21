@@ -12236,6 +12236,50 @@ paths:
         "503":
           description: The outcome cannot be recorded now; the prober tries again at its next pass.
 
+  /internal/gate/sidecar-identity-clients:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: The named sidecars' current clients, for a host's hints
+      description: |
+        How a host that keeps Postgres off the hint path (gkm, mxedge's
+        router) turns the sidecar ids its hints name into the clients the
+        hints land on. For each named sidecar api holds an active identity
+        of, the client of its newest binding generation and that
+        generation, in the request's order; an unknown or revoked sidecar is
+        omitted, alike. At most 1,000 ids a request. The `gkm` and `mxedge`
+        bearers only, never a client's token. api logs no per-target
+        record. A host keeps each answer at most 5 minutes and passes over
+        a failed call, whose hints its clients' hourly resync covers.
+      operationId: internalGateSidecarIdentityClients
+      security:
+        - InternalGateAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalGateSidecarIdentityClientsArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateSidecarIdentityClientsResult"
+        "400":
+          description: |
+            The body does not parse, holds a field beyond the format's, a
+            second value after the request, no id, a zero id or more than
+            1,000 ids.
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or it is not the `gkm` or `mxedge`
+            service's. The body is the plain text "Forbidden.".
+        "503":
+          description: The lookup cannot run now (no identity tables in this binary, or the store did not answer); the host's hints wait for its clients' resync.
+
   /sidecar/push-token:
     post:
       x-internal: true
@@ -32743,6 +32787,41 @@ components:
         recorded:
           description: The row stood and the outcome is recorded; false is a row gone, with nothing written.
           type: boolean
+    InternalGateSidecarIdentityClientsArgs:
+      type: object
+      additionalProperties: false
+      required: [sidecar_ids]
+      properties:
+        sidecar_ids:
+          description: The sidecars whose current clients the host wants, 1 to 1,000.
+          type: array
+          items:
+            type: string
+            format: uuid
+    InternalGateSidecarIdentityClientsResult:
+      type: object
+      required: [clients]
+      properties:
+        clients:
+          description: Each named sidecar api holds an active identity of, in the request's order; the rest are omitted.
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalGateSidecarIdentityClient"
+    InternalGateSidecarIdentityClient:
+      type: object
+      required: [sidecar_id, client_id, generation]
+      properties:
+        sidecar_id:
+          type: string
+          format: uuid
+        client_id:
+          description: The client of the sidecar's newest binding generation.
+          type: string
+          format: uuid
+        generation:
+          description: That binding's generation.
+          type: integer
+          format: int64
     SidecarIdentityResult:
       type: object
       required:
