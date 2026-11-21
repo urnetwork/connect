@@ -129,9 +129,11 @@ func TestTheH3WindowsAtTheShippedDeviceTargets(t *testing.T) {
 		stream     ByteCount
 		connection ByteCount
 	}{
-		{"the 20 MiB iOS device target", mib(20), kib(1104), kib(1472)},
-		{"the historical 24 MiB device target", mib(24), kib(1104), kib(1472)},
-		{"the 28 MiB Android device target", mib(28), kib(2688), kib(3584)},
+		// R20 sizes a phone's carriers so one budget holds a carrier per
+		// peer: 256 KiB of connection credit at every mobile target
+		{"the 20 MiB iOS device target", mib(20), kib(192), kib(256)},
+		{"the historical 24 MiB device target", mib(24), kib(192), kib(256)},
+		{"the 28 MiB Android device target", mib(28), kib(192), kib(256)},
 	} {
 		// the process budget must not reach the per-device surface: read the
 		// same target under a small and a large process budget

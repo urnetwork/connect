@@ -59,15 +59,17 @@ func TestPlatformPacketConnClampsQuicRequestToDeviceMemoryTarget(t *testing.T) {
 	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(
 		deviceMemoryTargetByteCount,
 	)
-	wantBufferByteCount := kib(64)
-	if settings.H3SocketReadBufferByteCount != wantBufferByteCount ||
-		settings.H3SocketWriteBufferByteCount != wantBufferByteCount {
+	// the phone sizes since R20: a carrier per peer, each with small sockets
+	wantReadBufferByteCount := kib(32)
+	wantWriteBufferByteCount := kib(16)
+	if settings.H3SocketReadBufferByteCount != wantReadBufferByteCount ||
+		settings.H3SocketWriteBufferByteCount != wantWriteBufferByteCount {
 		t.Fatalf(
 			"device-target socket caps = (%d, %d), want (%d, %d)",
 			settings.H3SocketReadBufferByteCount,
 			settings.H3SocketWriteBufferByteCount,
-			wantBufferByteCount,
-			wantBufferByteCount,
+			wantReadBufferByteCount,
+			wantWriteBufferByteCount,
 		)
 	}
 
@@ -85,14 +87,14 @@ func TestPlatformPacketConnClampsQuicRequestToDeviceMemoryTarget(t *testing.T) {
 	if err := writeSetter.SetWriteBuffer(quicSocketBufferRequestByteCount); err != nil {
 		t.Fatal(err)
 	}
-	if spy.readBufferByteCount != int(wantBufferByteCount) ||
-		spy.writeBufferByteCount != int(wantBufferByteCount) {
+	if spy.readBufferByteCount != int(wantReadBufferByteCount) ||
+		spy.writeBufferByteCount != int(wantWriteBufferByteCount) {
 		t.Fatalf(
 			"quic-go socket requests resolved to (%d, %d), want capped (%d, %d)",
 			spy.readBufferByteCount,
 			spy.writeBufferByteCount,
-			wantBufferByteCount,
-			wantBufferByteCount,
+			wantReadBufferByteCount,
+			wantWriteBufferByteCount,
 		)
 	}
 }

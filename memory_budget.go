@@ -31,14 +31,21 @@ func newDefaultPlatformTransportBudgetWithParent(
 	parent *PlatformTransportBudget,
 ) *PlatformTransportBudget {
 	return newPlatformTransportBudget(
-		// Keep the normal share at one quarter, but leave room for one H3
-		// carrier at the supported low-memory floor. Without this matching
-		// floor, an explicit H3 selection on the 8 MiB legacy host target
-		// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim.
-		min(budgetByteCount, max(mib(3), budgetByteCount/4)),
+		platformTransportBudgetByteCountForMemoryTarget(budgetByteCount),
 		16,
 		parent,
 	)
+}
+
+// platformTransportBudgetByteCountForMemoryTarget is the carrier budget one
+// owner's memory target gets. Keep the normal share at one quarter, but leave
+// room for one H3 carrier at the supported low-memory floor. Without this
+// matching floor, an explicit H3 selection on the 8 MiB legacy host target
+// would wait forever on a 2 MiB aggregate budget for a 3 MiB claim. The mobile
+// H3 policy sizes its claims from this same total
+// (ApplyMobilePlatformTransportMemoryPolicy).
+func platformTransportBudgetByteCountForMemoryTarget(budgetByteCount ByteCount) ByteCount {
+	return min(budgetByteCount, max(mib(3), budgetByteCount/4))
 }
 
 // NewPlatformTransportBudgetForMemoryTarget creates an independent carrier
@@ -52,6 +59,31 @@ func NewPlatformTransportBudgetForMemoryTarget(
 		return DefaultPlatformTransportBudget()
 	}
 	return newDefaultPlatformTransportBudget(memoryTargetByteCount)
+}
+
+// A phone's carrier budget has a carrier slot for each this many of its bytes
+// (NewMobilePlatformTransportBudgetForMemoryTarget).
+const mobilePlatformTransportBudgetSlotByteCount ByteCount = 512 * 1024
+
+// NewMobilePlatformTransportBudgetForMemoryTarget is the carrier limit of a
+// phone owner: the bytes NewPlatformTransportBudgetForMemoryTarget gives the
+// target, and a carrier slot for each 512 KiB of them, never fewer than its
+// 16. The mobile policy's carriers claim under a MiB each
+// (ApplyMobilePlatformTransportMemoryPolicy), so 16 slots would bind before
+// the bytes on a large target: the 16 MiB of a 64-MiB phone holds 18 H3
+// carriers and 32 slots. A nonpositive target uses the unscaled default.
+func NewMobilePlatformTransportBudgetForMemoryTarget(
+	memoryTargetByteCount ByteCount,
+) *PlatformTransportBudget {
+	if memoryTargetByteCount <= 0 {
+		return DefaultPlatformTransportBudget()
+	}
+	byteCount := platformTransportBudgetByteCountForMemoryTarget(memoryTargetByteCount)
+	return newPlatformTransportBudget(
+		byteCount,
+		max(16, int(byteCount/mobilePlatformTransportBudgetSlotByteCount)),
+		nil,
+	)
 }
 
 // SetMemoryBudget sets only the process-wide default sizing target. It never

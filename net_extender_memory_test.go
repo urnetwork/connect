@@ -55,12 +55,18 @@ func TestExtenderQuicPolicyBoundsAllRetainedAreas(t *testing.T) {
 	ctx := (&PlatformTransport{settings: settings}).dialContext(context.Background())
 	policy := newExtenderQuicMemoryPolicy(ctx, DefaultConnectSettings())
 	config := policy.quicConfig
-	if config.MaxStreamReceiveWindow != uint64(kib(256)) ||
-		config.MaxConnectionReceiveWindow != uint64(kib(512)) ||
+	// The outer windows and sockets are the platform's below their caps of
+	// 256 and 512 KiB and 64 KiB: since R20 the phone's 192 and 256 KiB
+	// windows and 32 and 16 KiB sockets. Its queues are quic-go's own, which
+	// its 512-KiB control envelope charges, whatever the phone's.
+	if config.MaxStreamReceiveWindow != uint64(kib(192)) ||
+		config.MaxConnectionReceiveWindow != uint64(kib(256)) ||
+		config.MaxUnprocessedPackets != 0 || config.MaxDatagramSendQueueLen != 0 ||
+		config.MaxDatagramReceiveQueueLen != 0 ||
 		config.MaxIncomingStreams != 8 || config.MaxIncomingUniStreams != 8 || config.EnableDatagrams {
 		t.Fatalf("outer QUIC policy = %+v", config)
 	}
-	wantClaim := kib(512) + kib(512) + extenderQuicSendMemoryByteCount + 2*kib(64)
+	wantClaim := kib(256) + kib(512) + extenderQuicSendMemoryByteCount + kib(32) + kib(16)
 	if policy.byteCount != wantClaim {
 		t.Fatalf("outer claim = %d, want runtime + both socket buffers = %d", policy.byteCount, wantClaim)
 	}
@@ -183,7 +189,8 @@ func TestAltQuicCapsSocketAndKeepsClaimThroughFailureCleanup(t *testing.T) {
 	wrap := func(_ context.Context, conn net.PacketConn) (net.PacketConn, error) {
 		conn.(interface{ SetReadBuffer(int) error }).SetReadBuffer(7 * 1024 * 1024)
 		conn.(interface{ SetWriteBuffer(int) error }).SetWriteBuffer(7 * 1024 * 1024)
-		if socket.readBufferByteCount != int(kib(64)) || socket.writeBufferByteCount != int(kib(64)) {
+		// the phone's socket sizes since R20, not quic-go's 7-MiB request
+		if socket.readBufferByteCount != int(kib(32)) || socket.writeBufferByteCount != int(kib(16)) {
 			t.Fatalf("socket caps = %d, %d", socket.readBufferByteCount, socket.writeBufferByteCount)
 		}
 		return nil, marker

@@ -376,7 +376,7 @@ func TestPlatformTransportBudgetHierarchyUnresolvableH1DoesNotPreempt(t *testing
 			requirePlatformHierarchyAcquire(t, auto)
 			blockedH1 := child.register(platformTransportBudgetH1, 1, true)
 			root.mutex.Lock()
-			blockedH1.requestPreemptionLocked()
+			blockedH1.requestPreemptionLocked(false)
 			root.mutex.Unlock()
 			select {
 			case <-auto.PreemptNotify():

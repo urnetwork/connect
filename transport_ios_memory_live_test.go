@@ -56,18 +56,21 @@ func assertIosMemoryLiveSettings(t *testing.T, settings *PlatformTransportSettin
 		t.Fatalf("current iOS carrier profile=%+v", stats)
 	}
 	config := newPlatformQuicConfig(settings, 1)
-	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != kib(5696) ||
-		settings.H3SocketReadBufferByteCount != kib(64) || settings.H3SocketWriteBufferByteCount != kib(64) ||
+	// R20: the phone sizes, a claim of 923,532 bytes with 256 KiB of
+	// connection credit, so nine fit
+	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != ByteCount(923532) ||
+		settings.H3SocketReadBufferByteCount != kib(32) || settings.H3SocketWriteBufferByteCount != kib(16) ||
 		config.InitialStreamReceiveWindow != uint64(kib(128)) || config.InitialConnectionReceiveWindow != uint64(kib(256)) ||
-		config.MaxStreamReceiveWindow != uint64(kib(3072)) || config.MaxConnectionReceiveWindow != uint64(mib(4)) ||
+		config.MaxStreamReceiveWindow != uint64(kib(192)) || config.MaxConnectionReceiveWindow != uint64(kib(256)) ||
+		config.MaxUnprocessedPackets != 32 || config.MaxDatagramSendQueueLen != 8 || config.MaxDatagramReceiveQueueLen != 32 ||
 		config.Allow0RTT || !settings.h3RetainedByteAccounting ||
 		(&PlatformTransport{settings: settings}).h3TransportBufferSize() != 4 {
 		t.Fatalf("current iOS carrier windows/claims drifted: settings=%+v config=%+v", settings, config)
 	}
 	datagrams := settings.H3DatagramSettings
 	if datagrams == nil || datagrams.MaxMessageByteCount != 8192 || datagrams.MaxFragmentCount != 1 ||
-		datagrams.MaxReassemblyMessageCount != 32 || datagrams.MaxReassemblyByteCount != 64*1024 ||
-		datagrams.ProcessReassemblyByteCount != 64*1024 {
+		datagrams.MaxReassemblyMessageCount != 8 || datagrams.MaxReassemblyByteCount != 16*1024 ||
+		datagrams.ProcessReassemblyByteCount != 16*1024 {
 		t.Fatalf("current iOS datagram ownership escaped its profile: %+v", datagrams)
 	}
 }
@@ -438,14 +441,17 @@ func testIosMemoryLiveAlt(t *testing.T, whodis bool) {
 		strategySettings.ExpandExtenderProfileCount = 0
 		strategySettings.DnsTlds = [][]byte{[]byte(testAltDnsTld)}
 		policy := newExtenderQuicMemoryPolicy(requestCtx, &strategySettings.ConnectSettings)
-		want := kib(1664)
+		// R20: the outer window and sockets are the phone's 256, 32 and
+		// 16 KiB, so the claim is 1328 KiB where it was 1664
+		want := kib(1328)
 		if whodis {
 			policy.packetTranslationSettings()
 			want += kib(144)
 		}
 		if policy.budget != apiBudget || policy.byteCount != want || !policy.usesSlot || policy.unbudgeted ||
-			policy.quicConfig.MaxConnectionReceiveWindow != uint64(kib(512)) ||
-			policy.quicConfig.MaxStreamReceiveWindow != uint64(kib(256)) || policy.quicConfig.Allow0RTT {
+			policy.quicConfig.MaxConnectionReceiveWindow != uint64(kib(256)) ||
+			policy.quicConfig.MaxStreamReceiveWindow != uint64(kib(192)) || policy.quicConfig.Allow0RTT ||
+			policy.quicConfig.MaxUnprocessedPackets != 0 || policy.quicConfig.MaxDatagramSendQueueLen != 0 {
 			t.Fatalf("standalone current-profile API policy=%+v", policy)
 		}
 		peer, beginPeerShutdown, closePeer := newIosMemoryAltEcho(t, whodis)

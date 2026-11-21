@@ -141,6 +141,12 @@ type platformTransportBudgetReservation struct {
 	closed           bool
 	preempt          chan struct{}
 	preemptRequested bool
+	// A deferred claim is one its owner is not contending for right now: a
+	// held transport's, or one whose transport carries on its h1 fallback
+	// (transport_h3_budget_fallback.go). It can still be admitted, but it
+	// takes no precedence over other claims while it waits, so a claim that
+	// cannot be admitted does not hold back the claims that can.
+	deferred bool
 	// A policy replacement may pair with the claim it will replace when one side
 	// is H1. The pair remains linked after admission until either transport
 	// releases; that is the accounting proof that the temporary overage is
@@ -402,12 +408,27 @@ func (self *PlatformTransportBudget) registerWithPriority(
 	usesSlot bool,
 	priority int,
 ) *platformTransportBudgetReservation {
+	return self.registerWithPriorityDeferred(class, byteCount, usesSlot, priority, false)
+}
+
+// registerWithPriorityDeferred registers a claim that starts deferred when
+// its owner will not contend for it until its runner says so (SetDeferred).
+// A transport registers its explicit h3 claim this way, so the claim of one
+// that starts held, or that will carry on its h1 fallback, never takes
+// precedence it does not use.
+func (self *PlatformTransportBudget) registerWithPriorityDeferred(
+	class platformTransportBudgetClass,
+	byteCount ByteCount,
+	usesSlot bool,
+	priority int,
+	deferred bool,
+) *platformTransportBudgetReservation {
 	if self == nil {
 		return nil
 	}
 	self.root.mutex.Lock()
 	defer self.root.mutex.Unlock()
-	reservation := self.registerLocked(class, byteCount, usesSlot, priority, nil)
+	reservation := self.registerLocked(class, byteCount, usesSlot, priority, deferred, nil)
 	self.notifyChangedLocked()
 	return reservation
 }
@@ -417,6 +438,7 @@ func (self *PlatformTransportBudget) registerLocked(
 	byteCount ByteCount,
 	usesSlot bool,
 	priority int,
+	deferred bool,
 	owner *platformTransportBudgetReservation,
 ) *platformTransportBudgetReservation {
 	self.nextSequence += 1
@@ -428,6 +450,7 @@ func (self *PlatformTransportBudget) registerLocked(
 		priority:  priority,
 		sequence:  self.nextSequence,
 		pending:   true,
+		deferred:  deferred,
 	}
 	if owner == nil {
 		owner = reservation
@@ -436,7 +459,7 @@ func (self *PlatformTransportBudget) registerLocked(
 	reservation.owner = owner
 	reservation.preempt = owner.preempt
 	if self.parent != nil {
-		reservation.parent = self.parent.registerLocked(class, byteCount, usesSlot, priority, owner)
+		reservation.parent = self.parent.registerLocked(class, byteCount, usesSlot, priority, deferred, owner)
 	}
 	self.reservations[reservation] = true
 	if class == platformTransportBudgetH1 {
@@ -451,7 +474,10 @@ func (self *PlatformTransportBudget) registerLocked(
 func (self *platformTransportBudgetReservation) higherPriorityPendingH3Locked() *platformTransportBudgetReservation {
 	var best *platformTransportBudgetReservation
 	for candidate := range self.budget.reservations {
-		if candidate == self || candidate.closed || candidate.acquired || !candidate.pending {
+		// A deferred claim's owner is not contending for it, so reserving
+		// its bytes would only hold back a claimant that can run.
+		if candidate == self || candidate.closed || candidate.acquired || !candidate.pending ||
+			candidate.deferred {
 			continue
 		}
 		precedes := candidate.class == platformTransportBudgetH3Explicit &&
@@ -714,16 +740,23 @@ func (self *platformTransportBudgetReservation) canPreemptLocked(
 // requestPreemptionLocked revokes only as many lower-precedence optional H3
 // leases as can satisfy this claim's current byte/slot deficit. The lease
 // owner tears down its H3 sockets before yielding the accounting reservation.
-func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
+// It reports whether the revocations, with those already requested, cover
+// the deficit at every level. requireSufficient revokes nothing unless they
+// do, as a required H1 claim always does.
+func (self *platformTransportBudgetReservation) requestPreemptionLocked(requireSufficient bool) bool {
 	planned := map[*platformTransportBudgetReservation]bool{}
+	allSufficient := true
 	for claim := self; claim != nil; claim = claim.parent {
 		victims, sufficient := claim.preemptionPlanLocked(planned)
 		// A required H1 path must be possible at every level before tearing
 		// down any optional carrier. Otherwise a resolvable child byte limit
 		// could trigger preemption despite an unresolvable root carrier-slot cap,
 		// or root pressure could revoke a sibling for a locally blocked H1.
-		if self.class == platformTransportBudgetH1 && !sufficient {
-			return
+		if !sufficient {
+			allSufficient = false
+			if self.class == platformTransportBudgetH1 || requireSufficient {
+				return false
+			}
 		}
 		for _, victim := range victims {
 			planned[victim.owner] = true
@@ -739,6 +772,7 @@ func (self *platformTransportBudgetReservation) requestPreemptionLocked() {
 		}
 		close(victim.preempt)
 	}
+	return allSufficient
 }
 
 func (self *platformTransportBudgetReservation) preemptionPlanLocked(
@@ -852,7 +886,7 @@ func (self *platformTransportBudgetReservation) Acquire(ctx context.Context) boo
 			budget.root.mutex.Unlock()
 			return true
 		}
-		self.requestPreemptionLocked()
+		self.requestPreemptionLocked(false)
 		notify := budget.root.notify
 		budget.root.mutex.Unlock()
 
@@ -893,6 +927,92 @@ func (self *platformTransportBudgetReservation) TryAcquire() bool {
 	}
 	budget.notifyChangedLocked()
 	return true
+}
+
+// TryAcquireOrPreempt is one pass of Acquire that never waits: it admits the
+// claim when it fits, and otherwise requests the preemption of optional
+// Auto-H3 leases as Acquire does. It returns whether the claim is acquired,
+// whether the revocations requested, with those already under way, cover its
+// deficit at every level, and the change notification read under the same
+// lock as the decision, so a caller that waits on it misses no release. A
+// failed pass changes no claim's capacity and notifies nobody unless it
+// defers the claim, so an owner may retry on each notification without
+// waking itself; revoked leases notify once they yield.
+//
+// fallback is an owner that carries its client on a fallback meanwhile. Its
+// pass revokes nothing unless that alone admits the claim, and the claim is
+// then deferred: it takes no precedence while preemption cannot admit it,
+// but keeps it while a sufficient preemption runs, so the capacity a revoked
+// lease returns is the claim's own. A deferred claim that preempted would
+// let the lease take back what it yielded, and preempt it again, forever.
+func (self *platformTransportBudgetReservation) TryAcquireOrPreempt(fallback bool) (
+	acquired bool,
+	preempting bool,
+	notify <-chan struct{},
+) {
+	if self == nil {
+		return true, false, nil
+	}
+	budget := self.budget
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
+	if self.closed {
+		return false, false, budget.root.notify
+	}
+	if self.acquired {
+		return true, false, budget.root.notify
+	}
+	if self.canAcquireHierarchyLocked() {
+		for claim := self; claim != nil; claim = claim.parent {
+			_, usesHandoff := claim.admissionLocked()
+			claim.acquireLocked(usesHandoff)
+		}
+		budget.notifyChangedLocked()
+		return true, false, budget.root.notify
+	}
+	preempting = self.requestPreemptionLocked(fallback)
+	if deferred := fallback && !preempting; self.deferred != deferred {
+		for claim := self; claim != nil; claim = claim.parent {
+			claim.deferred = deferred
+		}
+		// a claim that stops taking precedence can let another be admitted;
+		// one that resumes it admits nobody new
+		if deferred {
+			budget.notifyChangedLocked()
+		}
+	}
+	return false, preempting, budget.root.notify
+}
+
+// SetDeferred marks a pending claim as one its owner is or is not contending
+// for (see the deferred field). It leaves this claim's own admission as it
+// was, and notifies the hierarchy only when the mark changes, since a claim
+// that stops taking precedence can let another be admitted.
+func (self *platformTransportBudgetReservation) SetDeferred(deferred bool) {
+	if self == nil {
+		return
+	}
+	budget := self.budget
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
+	if self.closed || self.deferred == deferred {
+		return
+	}
+	for claim := self; claim != nil; claim = claim.parent {
+		claim.deferred = deferred
+	}
+	budget.notifyChangedLocked()
+}
+
+// IsAcquired reports whether the claim currently holds its capacity.
+func (self *platformTransportBudgetReservation) IsAcquired() bool {
+	if self == nil {
+		return false
+	}
+	budget := self.budget
+	budget.root.mutex.Lock()
+	defer budget.root.mutex.Unlock()
+	return self.acquired && !self.closed
 }
 
 func (self *platformTransportBudgetReservation) acquireLocked(usesHandoff bool) {
