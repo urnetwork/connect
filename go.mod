@@ -98,6 +98,11 @@ retract v0.2.0 // retract self
 
 replace github.com/urnetwork/glog => ../glog
 
+// URnetwork's quic-go, its own module (../quic-go/URNETWORK.md).
+// Go ignores a dependency's replacements, so each main module that builds
+// connect selects the sibling checkout, as it does glog.
+replace github.com/urnetwork/quic-go => ../quic-go
+
 replace github.com/pion/sctp => ./sctp
 
 replace gvisor.dev/gvisor => ../gvisor
