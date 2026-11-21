@@ -31468,7 +31468,7 @@ components:
           format: int64
     MailStatus:
       type: object
-      required: [enabled, storage_full, spent, direct_mx]
+      required: [enabled, storage_full, spent, direct_mx, strict_domains]
       properties:
         enabled:
           description: Mail is on for the network.
@@ -31482,6 +31482,21 @@ components:
         direct_mx:
           description: The network names a direct MX.
           type: boolean
+        strict_domains:
+          description: Verified domains with an active strict MX, used for the outbound bounce domain.
+          type: array
+          items:
+            type: string
+        verified_domains:
+          description: Customer domains verified for this network, accepted for inbound signed mailbox lookup.
+          type: array
+          items:
+            type: string
+        direct_mx_addresses:
+          description: Public addresses assigned to this authenticated receiver, including assignments awaiting their first probe.
+          type: array
+          items:
+            type: string
     MailDirectMxArgs:
       type: object
       required: [receivers]
