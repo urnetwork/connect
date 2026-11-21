@@ -19,11 +19,11 @@ import (
 	"time"
 
 	"github.com/quic-go/qpack"
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	h3qlog "github.com/quic-go/quic-go/http3/qlog"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/http3"
+	h3qlog "github.com/urnetwork/quic-go/http3/qlog"
+	"github.com/urnetwork/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlogwriter"
 )
 
 func newAltMemoryFixture(t *testing.T, handler http.Handler) (*http.Client, *atomic.Int32) {

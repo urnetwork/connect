@@ -3,7 +3,7 @@ package connect
 import (
 	"testing"
 
-	"github.com/quic-go/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlog"
 )
 
 // Retransmission adds roots the writer never admitted. quic-go requeues a lost

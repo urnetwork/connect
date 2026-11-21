@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go/http3"
+	"github.com/urnetwork/quic-go/http3"
 )
 
 // Connection adapters shared by the three carriers.

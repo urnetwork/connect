@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Retry-After in seconds or as a date, at most a minute, and nothing for a

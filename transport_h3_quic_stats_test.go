@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	h3qlog "github.com/quic-go/quic-go/http3/qlog"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/http3"
+	h3qlog "github.com/urnetwork/quic-go/http3/qlog"
+	"github.com/urnetwork/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlogwriter"
 )
 
 func TestH3QuicPacketStatsReduceFrameBoundaries(t *testing.T) {

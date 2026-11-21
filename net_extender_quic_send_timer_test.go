@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/quic-go/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlog"
 )
 
 // A writer that waits for send-flight credit is woken by every ACK that frees

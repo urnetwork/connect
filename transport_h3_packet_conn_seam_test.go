@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // closeObservedPacketConn exposes ownership without changing socket behavior.

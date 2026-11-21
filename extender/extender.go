@@ -24,8 +24,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/idna"
 
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/http3"
 
 	"google.golang.org/protobuf/proto"
 

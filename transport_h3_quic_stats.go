@@ -12,9 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlogwriter"
 )
 
 // H3QuicPacketStatsSnapshot is a lifetime view of QUIC packet events. DATAGRAM

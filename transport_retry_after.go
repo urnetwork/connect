@@ -36,7 +36,7 @@ import (
 	"reflect"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // The longest wait a refusal's Retry-After holds a dial for: the front never

@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Each peer owns its shutdown announcement and sticky error queue. Recording

@@ -6,7 +6,7 @@ import (
 	"net"
 	"sync"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Extender carriers may run below either H1 or H3. Carry the actual owner's

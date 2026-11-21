@@ -61,7 +61,7 @@ import (
 	"syscall"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // pinnedIpFamilyContextKey carries a pinned transport's family through the

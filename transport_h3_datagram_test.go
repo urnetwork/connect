@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
 	"github.com/urnetwork/connect/protocol"
+	quic "github.com/urnetwork/quic-go"
 )
 
 func TestH3HybridStreamSendBudgetBoundsRetainedBytesAndWakes(t *testing.T) {
