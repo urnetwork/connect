@@ -11437,6 +11437,17 @@ paths:
           schema:
             type: integer
             format: int64
+        - name: browser_admission
+          in: query
+          description: |
+            Verify that the current signed binding belongs to another marked
+            top-level client of the caller's active member in this network.
+            Use `page` for a durable client or `burner` for an ephemeral one.
+            This lookup returns the current binding only. A mismatch, an
+            ineligible caller or a request for history receives 404.
+          schema:
+            type: string
+            enum: [page, burner]
       responses:
         "200":
           description: OK.
@@ -32716,6 +32727,13 @@ components:
         - identity_alg
         - status
       properties:
+        browser_admission:
+          description: |
+            Present only when the requested member and device checks succeeded.
+            The approving device requires the exact requested value before
+            presenting the independently computed safety number to its owner.
+          type: string
+          enum: [page, burner]
         sidecar_id:
           type: string
         identity_public_key:
