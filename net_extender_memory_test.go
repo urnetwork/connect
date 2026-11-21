@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // The outer carrier must acquire against the same owner as the already-live

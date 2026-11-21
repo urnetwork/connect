@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/qlog"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/qlog"
 )
 
 type flightResetTestStream struct {

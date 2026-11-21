@@ -17,8 +17,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/testutils/simnet"
+	"github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/testutils/simnet"
 )
 
 // Every extender QUIC carrier sends a QUIC PING one ping timeout after the

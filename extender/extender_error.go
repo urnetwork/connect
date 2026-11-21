@@ -14,7 +14,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/quic-go/quic-go"
+	"github.com/urnetwork/quic-go"
 
 	"github.com/urnetwork/connect"
 )
