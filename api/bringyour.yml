@@ -12092,11 +12092,12 @@ paths:
         of a block on a host hold apart, so each holds its own clients. The
         `edge` bearer only. api answers only for a block its environment's
         `edge.yml` lists, a host among that block's hosts, a slot below the
-        slot count (2) and an index below the block's client count, and 403
-        otherwise. The token ends at `expire_time_millis` with no grace, and
-        the block asks again before then. 503 while api has no `edge.yml`,
-        its `sidecar.yml` names no urnetwork-edge network, or the client
-        cannot be minted.
+        configured slot count (4 by default) and an index below the block's
+        client count, and 403 otherwise. The client token ends at
+        `expire_time_millis`. A separate service token for sockets ends at
+        `sockets_token_expire_time_millis`. The block refreshes both before
+        either expires. 503 while api has no `edge.yml`, its `sidecar.yml`
+        names no urnetwork-edge network, or either token cannot be minted.
       operationId: internalGateEdgeClient
       security:
         - InternalGateAuth: []
@@ -32631,16 +32632,15 @@ components:
           type: string
         slot:
           description: |
-            The process's deploy slot, from 0 and below the slot count (2):
-            warp's `WARP_SLOT`, which alternates per deploy of the block on
-            the host. A request without it is slot 0's.
+            The process's `WARP_SLOT`, from 0 and below the configured slot
+            count (4 by default). An omitted slot selects 0.
           type: integer
         index:
           description: Which of the block's clients, from 0.
           type: integer
     InternalGateEdgeClientResult:
       type: object
-      required: [client_id, by_client_jwt, expire_time_millis, platform_url]
+      required: [client_id, by_client_jwt, expire_time_millis, platform_url, sockets_token, sockets_token_expire_time_millis]
       properties:
         client_id:
           type: string
@@ -32658,6 +32658,13 @@ components:
         platform_url:
           description: Where the client connects.
           type: string
+        sockets_token:
+          description: The service token for sockets, issued to this client in the urnetwork-edge network.
+          type: string
+        sockets_token_expire_time_millis:
+          description: When the sockets token expires, in Unix milliseconds.
+          type: integer
+          format: int64
     InternalGateAbuseNoticeArgs:
       type: object
       additionalProperties: false
