@@ -102,19 +102,23 @@ func TestIcmpFlowBudgetModelCoversAllocations(t *testing.T) {
 	queueByteCount := ByteCount(settings.SequenceBufferSize) * 8
 	// a live flow keeps one packet-class pool buffer in circulation
 	poolByteCount := ByteCount(packetPoolSize)
+	// the sequence numbers awaiting replies, where the backend chose the
+	// echo identifier (darwin)
+	inFlightByteCount := icmpEchoesInFlightByteCount(settings)
 	// the sequence and egress structs, the address copies, and the cached
 	// ip path
 	fixedByteCount := ByteCount(1024)
 
-	modeledByteCount := bufferByteCount + queueByteCount + poolByteCount + fixedByteCount
+	modeledByteCount := bufferByteCount + queueByteCount + poolByteCount + inFlightByteCount + fixedByteCount
 	if providerIcmpFlowByteCount < modeledByteCount {
 		t.Errorf(
-			"per-flow allocations model %s exceeds the budget item %s: buffers %s, queue %s, pool %s, fixed %s",
+			"per-flow allocations model %s exceeds the budget item %s: buffers %s, queue %s, pool %s, in flight %s, fixed %s",
 			kibStr(int64(modeledByteCount)),
 			kibStr(providerIcmpFlowByteCount),
 			kibStr(int64(bufferByteCount)),
 			kibStr(int64(queueByteCount)),
 			kibStr(int64(poolByteCount)),
+			kibStr(int64(inFlightByteCount)),
 			kibStr(int64(fixedByteCount)),
 		)
 	}

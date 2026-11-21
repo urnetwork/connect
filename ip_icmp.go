@@ -97,7 +97,9 @@ func parseIcmpPacket(ipVersion int, sourceIp net.IP, destinationIp net.IP, trans
 // the platform backend for one flow's echo transactions. WriteEcho sends one
 // echo request toward the flow destination; ReadEcho blocks until a matching
 // echo reply, the deadline, or an error. Implementations own reply matching
-// (socket identifier and peer address) and deliver only this flow's replies.
+// (socket identifier and peer address, and where the backend chose the
+// identifier itself, the sequence numbers it sent and has not yet seen
+// answered) and deliver only this flow's replies.
 // The returned payload aliases an internal buffer and is valid only until the
 // next ReadEcho call. WriteEcho and ReadEcho may be called from one writer and
 // one reader goroutine concurrently.
@@ -134,6 +136,15 @@ type IcmpBufferSettings struct {
 	// transactions per flow; requests over the cap drop, which ping
 	// tolerates
 	OutstandingLimit int
+	// socket backends that choose their own echo identifier (darwin, where
+	// every datagram icmp socket on the host receives every echo reply): the
+	// most echoes per flow that await a reply. A reply is kept only for a
+	// sequence number the flow sent and has not yet seen answered (QD-1159);
+	// past the limit the oldest awaited echo is forgotten, so a reply to it
+	// drops. Each costs the flow two bytes of its reservation. A ping at its
+	// default interval awaits one or two; 64 covers a fast interval or a
+	// burst of probes over a slow path. Non-positive awaits one.
+	InFlightEchoLimit int
 
 	// Tests replace the platform echo backend. Nil is a production no-op.
 	newEgressForTest func(ctx context.Context, ipVersion int, destinationIp net.IP, settings *IcmpBufferSettings) (icmpEgress, error)
@@ -145,10 +156,8 @@ type IcmpBufferSettings struct {
 	beforeSequenceSendForTest func(*IcmpSequence)
 }
 
-const defaultIcmpFlowBufferSize = 64
-
 func DefaultIcmpBufferSettings() *IcmpBufferSettings {
-	return DefaultIcmpBufferSettingsWithBufferSize(MemoryScaledCount(defaultIcmpFlowBufferSize, 16))
+	return DefaultIcmpBufferSettingsWithBufferSize(MemoryScaledCount(64, 16))
 }
 
 func DefaultIcmpBufferSettingsWithBufferSize(bufferSize int) *IcmpBufferSettings {
@@ -171,7 +180,15 @@ func DefaultIcmpBufferSettingsWithBufferSize(bufferSize int) *IcmpBufferSettings
 		UserLimit:           0,
 		GlobalLimit:         globalLimit,
 		OutstandingLimit:    4,
+		InFlightEchoLimit:   64,
 	}
+}
+
+// the ring of awaited sequence numbers a backend that chose its own echo
+// identifier keeps for a flow, two bytes a sequence number (see
+// InFlightEchoLimit)
+func icmpEchoesInFlightByteCount(settings *IcmpBufferSettings) ByteCount {
+	return ByteCount(max(1, settings.InFlightEchoLimit)) * 2
 }
 
 type Icmp4Buffer struct {
@@ -642,7 +659,10 @@ func newIcmpSequenceWithTransferKey(
 	destinationIp net.IP,
 	icmpBufferSettings *IcmpBufferSettings,
 ) *IcmpSequence {
-	memory, admitted := reserveNatMemory(icmpBufferSettings.MemoryBudget, natIcmpFlowMemoryByteCount(icmpBufferSettings))
+	memory, admitted := reserveNatMemory(
+		icmpBufferSettings.MemoryBudget,
+		natIcmpFlowMemoryByteCount(icmpBufferSettings)+icmpEchoesInFlightByteCount(icmpBufferSettings),
+	)
 	if !admitted {
 		return nil
 	}

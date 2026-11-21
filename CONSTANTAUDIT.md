@@ -81,13 +81,16 @@ constructor like most settings do, so the default lives in exactly one place.
 
 `defaultTransferBufferSize` (transfer.go), `defaultIpBufferSize`,
 `defaultUdpFlowBufferSize`, `defaultTcpFlowBufferSize`,
-`defaultUdpReceiveShardCount` (ip.go), `defaultIcmpFlowBufferSize`
-(ip_icmp.go), `defaultMaxPairPartnersPerActivity`,
+`defaultUdpReceiveShardCount` (ip.go), `defaultMaxPairPartnersPerActivity`,
 `defaultMaxComponentNodeCount` (ip_assoc.go), `defaultMaxInflightDnsQueries`,
 `defaultReverseMaxEntries` (ip_mux_upgrade.go), `defaultProbeTimeout`
 (ip_remote_multi_client_probe.go), `defaultHeartbeatInterval`
 (ip_remote_multi_client_observability.go), `DefaultDnsUpgradeMaskAddress`
 (net_http_doh.go — exported deployment default).
+
+Inlined 2026-11-21, with darwin's echo identifier draw (QD-1159):
+`defaultIcmpFlowBufferSize` (ip_icmp.go), now the literal in
+`DefaultIcmpBufferSettings()`.
 
 ## E. Tunables to migrate into settings — the backlog
 
