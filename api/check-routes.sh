@@ -1,8 +1,12 @@
 #!/usr/bin/env zsh
 #
-# Pin bringyour.yml to the server's route table.
+# Pin bringyour.yml to the API, EVS, GKM and sockets route tables.
 #
 #   ./check-routes.sh /path/to/urnetwork/server
+#
+# The default checks the serving registries and runs the OpenAPI schema tests.
+# Use --source-only in a checkout without the Go toolchain or the sibling
+# modules. That path checks literal registrations only.
 #
 # Extracts every router.NewRoute("METHOD", "/path", ...) and
 # router.NewStreamingRoute("METHOD", "/path", ...) registration the api
@@ -64,8 +68,13 @@ setopt no_nomatch pipe_fail
 script_dir=${0:A:h}
 spec=$script_dir/bringyour.yml
 
+source_only=0
+if [[ ${1:-} == --source-only ]]; then
+    source_only=1
+    shift
+fi
 if [[ $# -ne 1 ]]; then
-    print -u2 "usage: ${0:t} <path to the urnetwork server checkout>"
+    print -u2 "usage: ${0:t} [--source-only] <path to the urnetwork server checkout>"
     exit 2
 fi
 
@@ -89,6 +98,21 @@ fi
 # . and .. as written; :A would follow the link.
 competition_spec=${server_dir:a:h}/sn/api/competition.yml
 gkm_routes=${server_dir:a:h}/sidecar/gkmservice/routes.go
+if (( ! source_only )); then
+    export URNETWORK_CONNECT_OPENAPI_SPEC="$spec"
+    export URNETWORK_COMPETITION_OPENAPI_SPEC="$competition_spec"
+    export GOWORK=off
+    "${PYTHON:-python3}" -B "$script_dir/test_spec.py" || exit $?
+    (
+        cd "$server_dir" && go test -count=1 ./api ./evshost \
+            -run '^Test(Spec|CompetitionSpec|EngineRoutesAreBringyourYmlsEvsOperations)'
+    ) || exit $?
+    (
+        cd "${server_dir:a:h}/sidecar" && go test -count=1 ./gkmservice ./socketsservice \
+            -run '^Test(Gkm|Sockets)RoutesMatchOpenApi$'
+    )
+    exit $?
+fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

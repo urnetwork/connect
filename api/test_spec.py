@@ -11,10 +11,17 @@ from urllib.parse import urlparse
 import yaml
 
 
+def load_spec():
+    return yaml.load(
+        Path(__file__).with_name("bringyour.yml").read_text(),
+        Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader),
+    )
+
+
 class SpecTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.spec = yaml.safe_load(Path(__file__).with_name("bringyour.yml").read_text())
+        cls.spec = load_spec()
 
     def test_sn_top_replica_score_distinguishes_unavailable_evidence(self):
         fleet = self.spec["components"]["schemas"]["SnTopFleet"]
@@ -93,28 +100,8 @@ class SpecTest(unittest.TestCase):
         )
 
     # the routes of sidecar DESIGN.md §7, §8 and §11 a service serves, out of the
-    # planned list: api the authorization log's and §8.9's acks, and evs's host
-    # its engine's routes (EVS1-M2-21). Each route's own task adds it here when it
-    # lifts the planned mark
-    served = {
-        ("/network/config/projection", "get"),
-        ("/network/config/projection", "post"),
-        ("/network/config/delta", "post"),
-        ("/acl/ack", "post"),
-        ("/evs/v1/repos/{repo_id}", "put"),
-        ("/evs/v1/repos/{repo_id}/segments/{segment_id}", "put"),
-        ("/evs/v1/repos/{repo_id}/reseed", "post"),
-        ("/evs/v1/repos/{repo_id}/push/{push_id}/{part}", "post"),
-        ("/evs/v1/repos/{repo_id}/push/{push_id}/lease", "post"),
-        ("/evs/v1/repos/{repo_id}/read", "post"),
-        ("/evs/v1/repos/{repo_id}/refs", "get"),
-        ("/evs/v1/repos/{repo_id}/log", "get"),
-    }
-
-    def test_sidecar_routes_are_documented_and_planned(self):
-        # the routes of sidecar DESIGN.md §7, §8 and §11. Each stays planned and
-        # out of the public api until a service serves it; the owner of a route
-        # moves it to served when it does.
+    def test_sidecar_routes_are_documented_and_internal(self):
+        # The Go route tests check each operation's implementation status.
         expected = {
             "/network/enroll": {"post"},
             "/network/config/projection": {"get", "post"},
@@ -153,10 +140,6 @@ class SpecTest(unittest.TestCase):
                 for method in want:
                     operation = item[method]
                     self.assertTrue(operation["x-internal"])
-                    if (path, method) in self.served:
-                        self.assertNotIn("x-status", operation)
-                    else:
-                        self.assertEqual("planned", operation["x-status"])
                 if path.startswith("/evs/"):
                     evs_hosts.add(item["servers"][0]["url"])
                     for method in want:
@@ -166,24 +149,25 @@ class SpecTest(unittest.TestCase):
         # evs is one host of its own, so no path falls back to api's
         self.assertEqual(1, len(evs_hosts))
         self.assertFalse(evs_hosts & {server["url"] for server in self.spec["servers"]})
-        self.assertLessEqual({path for path, _ in self.served}, set(expected))
         enroll = paths["/network/enroll"]["post"]
         self.assertEqual([], enroll["security"])
         args = self.spec["components"]["schemas"]["NetworkEnrollArgs"]
         self.assertNotIn("bundle", args["properties"])
 
-    def test_tls_routes_are_documented_and_planned(self):
-        # sidecar DESIGN.md §13.15's certificate routes, each with its class: the
-        # order and its status take a service token for audience certs, the rest
-        # a bearer. Each stays planned and out of the public api until certs
-        # serves it, on api's own host. POST /tls/suspend stays a model call, so
-        # it is no path here.
+    def test_tls_routes_are_documented_with_their_credentials(self):
+        # The certificate routes of §13.15 and the delegated ACME operations
+        # of DESIGN-DETAILS §17.2 share api's host.
         expected = {
-            ("/tls/cert-order", "post"): "ServiceTokenAuth",
-            ("/tls/cert-order/{cert_id}", "get"): "ServiceTokenAuth",
-            ("/tls/cert-register", "post"): "BearerAuth",
-            ("/tls/certs", "get"): "BearerAuth",
-            ("/tls/cert-revoke", "post"): "BearerAuth",
+            ("/tls/cert-order", "post"): ["ServiceTokenAuth"],
+            ("/tls/cert-order/{cert_id}", "get"): ["ServiceTokenAuth"],
+            ("/tls/cert-register", "post"): ["ServiceTokenAuth"],
+            ("/tls/certs", "get"): ["BearerAuth", "ServiceTokenAuth"],
+            ("/tls/cert-revoke", "post"): ["BearerAuth"],
+            ("/tls/custom-claim", "post"): ["ServiceTokenAuth"],
+            ("/tls/custom-progress", "post"): ["ServiceTokenAuth"],
+            ("/tls/custom-account", "post"): ["ServiceTokenAuth"],
+            ("/tls/custom-challenge", "post"): ["ServiceTokenAuth"],
+            ("/tls/custom-challenge/{challenge_id}", "get"): ["ServiceTokenAuth"],
         }
         methods = {"get", "put", "post", "delete", "patch"}
         paths = self.spec["paths"]
@@ -191,15 +175,14 @@ class SpecTest(unittest.TestCase):
             {path for path, _ in expected},
             {path for path in paths if path.startswith("/tls/")},
         )
-        for (path, method), scheme in expected.items():
+        for (path, method), schemes in expected.items():
             with self.subTest(path=path, method=method):
                 item = paths[path]
                 self.assertEqual({method}, methods & set(item))
                 self.assertNotIn("servers", item)
                 operation = item[method]
                 self.assertTrue(operation["x-internal"])
-                self.assertEqual("planned", operation["x-status"])
-                self.assertEqual([{scheme: []}], operation["security"])
+                self.assertEqual([{scheme: []} for scheme in schemes], operation["security"])
         # the bodies' fields are sidecar tls_api.go's JSON names, which its
         # TestTlsBodiesKeepTheirWireNames pins on that side
         schemas = self.spec["components"]["schemas"]
@@ -207,33 +190,37 @@ class SpecTest(unittest.TestCase):
             "TlsCertOrderArgs": {"csr", "attestation", "replaces"},
             "TlsCertOrderResult": {"cert_id", "state", "retry_after_ms"},
             "TlsCertOrderStatus": {"state", "retry_after_ms", "chain", "ari_window_start", "ari_window_end"},
-            "TlsCertsResult": {"certs", "queued_csrs"},
-            "TlsCertRegisterArgs": {"cert_id", "attestation", "chain", "account_uri"},
+            "TlsCertsResult": {"certs", "queued_csrs", "accounts"},
+            "TlsCertRegisterArgs": {"cert_id", "claim_seq", "chain", "account_uri", "ari_window_start", "ari_window_end"},
             "TlsCertRevokeArgs": {"cert_id", "key_compromise"},
             "TlsCertRecord": {
                 "cert_id", "network_id", "client_id", "sidecar_id", "identifier_set_sha256",
                 "spki_sha256", "attestation", "csr", "ca", "account_uri", "profile", "serial",
                 "not_before", "not_after", "ari_window_start", "ari_window_end", "state",
-                "successor_cert_id", "chain",
+                "state_time", "successor_cert_id", "chain", "revocation_reason",
+                "custom_host", "custom_domain", "custom_reason", "wait_ms", "host_ready", "owner",
             },
         }
         for name, want in fields.items():
             with self.subTest(schema=name):
                 self.assertEqual(want, set(schemas[name]["properties"]))
         self.assertEqual(
-            ["queued", "ordering", "waiting_dns", "issued", "failed", "revoking", "revoked", "expired"],
+            [
+                "queued", "ordering", "waiting_dns", "issued", "failed", "revoking", "revoked", "expired",
+                "custom_queued", "custom_ordering", "custom_issued", "custom_revoking",
+            ],
             schemas["TlsCertState"]["enum"],
         )
 
-    def test_socket_routes_are_documented_and_planned(self):
-        # sidecar DESIGN.md §9.15's routes, each with its class: the three
-        # Client routes take a client token, and GET /socket/keys is public.
+    def test_socket_routes_are_documented_with_their_credentials(self):
+        # sidecar DESIGN.md §9.15's routes. The three protected routes take
+        # a sockets service token. GET /socket/keys is public.
         # sockets serves them on one host of its own, never api's, so each
         # stays planned and out of the public api until it does.
         expected = {
-            ("/socket/registrations", "post"): [{"BearerAuth": []}],
-            ("/socket/find", "post"): [{"BearerAuth": []}],
-            ("/socket/list", "get"): [{"BearerAuth": []}],
+            ("/socket/registrations", "post"): [{"ServiceTokenAuth": []}],
+            ("/socket/find", "post"): [{"ServiceTokenAuth": []}],
+            ("/socket/list", "get"): [{"ServiceTokenAuth": []}],
             ("/socket/keys", "get"): [],
         }
         methods = {"get", "put", "post", "delete", "patch"}
@@ -250,7 +237,6 @@ class SpecTest(unittest.TestCase):
                 hosts.add(item["servers"][0]["url"])
                 operation = item[method]
                 self.assertTrue(operation["x-internal"])
-                self.assertEqual("planned", operation["x-status"])
                 self.assertEqual(security, operation["security"])
         # one host of its own, so no path falls back to api's
         self.assertEqual(1, len(hosts))
@@ -307,14 +293,19 @@ class SpecTest(unittest.TestCase):
         # that serves a route fixes its encoding as it lifts planned)
         paths = self.spec["paths"]
         refusal = {"$ref": "#/components/schemas/EvsRefusalReply"}
-        for path, method in sorted(self.served):
-            if not path.startswith("/evs/"):
-                continue
-            operation = paths[path][method]
+        evs_operations = (
+            (path, method, operation)
+            for path, item in paths.items()
+            if path.startswith("/evs/")
+            for method, operation in item.items()
+            if method in {"get", "post", "put", "delete", "patch", "head"}
+            and operation.get("x-status") != "planned"
+        )
+        for path, method, operation in evs_operations:
             with self.subTest(path=path, method=method):
                 self.assertEqual([{"ServiceTokenAuth": []}], operation["security"])
                 for status, response in operation["responses"].items():
-                    if status == "200":
+                    if status.startswith("2"):
                         continue
                     self.assertEqual({"application/x-protobuf": {"schema": refusal}}, response["content"], status)
         create = paths["/evs/v1/repos/{repo_id}"]["put"]
@@ -398,7 +389,7 @@ class SpecTest(unittest.TestCase):
 class GkmRoutesTest(unittest.TestCase):
     """The routes of sidecar DESIGN.md §10.14, and check-routes.sh's hold on them."""
 
-    methods = {"get", "put", "post", "delete", "patch"}
+    methods = {"get", "put", "post", "delete", "patch", "head"}
     expected = {
         "/gkm/key-packages": {"post"},
         "/gkm/key-packages/claim": {"post"},
@@ -417,17 +408,19 @@ class GkmRoutesTest(unittest.TestCase):
         "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"post"},
         "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"post"},
         "/gkm/groups/{group_id}/ladder": {"post"},
-        "/gkm/groups/{group_id}/welcome/{n}": {"post"},
+        "/gkm/groups/{group_id}/welcome/{n}": {"post", "head"},
         "/gkm/groups/{group_id}/group-info": {"get", "post"},
         "/gkm/groups/{group_id}/ack": {"post"},
         "/gkm/welcomes": {"get"},
         "/gkm/recovery/{member_id}/wraps": {"get", "post", "delete"},
+        "/gkm/delegation-keys": {"post"},
+        "/gkm/delegation-keys/{delegation_id}": {"get", "put"},
     }
 
     @classmethod
     def setUpClass(cls):
         cls.script = Path(__file__).with_name("check-routes.sh")
-        cls.spec = yaml.safe_load(Path(__file__).with_name("bringyour.yml").read_text())
+        cls.spec = load_spec()
 
     def operations(self, gkm):
         """The spec's operations on one side of the carve-out, as (method, path)."""
@@ -506,10 +499,10 @@ class GkmRoutesTest(unittest.TestCase):
             (root / "sn/api").mkdir(parents=True)
             (root / "sn/api/competition.yml").write_text(competition)
         return subprocess.run(
-            ["zsh", str(script), str(root / "server")], capture_output=True, text=True
+            ["zsh", str(script), "--source-only", str(root / "server")], capture_output=True, text=True
         )
 
-    def test_every_route_is_documented_planned_and_on_gkms_own_host(self):
+    def test_every_route_is_documented_on_gkms_own_host(self):
         paths = {path: item for path, item in self.spec["paths"].items() if path.startswith("/gkm/")}
         self.assertEqual(set(self.expected), set(paths))
         api_host = urlparse(self.spec["servers"][0]["url"]).hostname
@@ -522,7 +515,6 @@ class GkmRoutesTest(unittest.TestCase):
                 for method in want:
                     operation = item[method]
                     self.assertTrue(operation["x-internal"])
-                    self.assertEqual("planned", operation["x-status"])
                     self.assertEqual([{"ServiceTokenAuth": []}], operation["security"])
 
     def test_every_body_is_binary(self):

@@ -9734,7 +9734,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Replace the caller's ReaderKey
       description: |
@@ -9765,7 +9764,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a sidecar's ReaderKey
       description: |
@@ -9799,7 +9797,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read many sidecars' ReaderKeys
       description: |
@@ -9835,7 +9832,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Create a repo's group
       description: |
@@ -9868,7 +9864,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a group
       description: A `GkmGroupReply`. Needs `r`, `rw` or `admin`.
@@ -9895,7 +9890,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a repo's drop keys
       description: |
@@ -9934,7 +9928,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a repo's GroupForms
       description: |
@@ -9961,7 +9954,6 @@ paths:
           description: Out of scope.
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Re-form a repo's group
       description: |
@@ -10084,7 +10076,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a group's generations
       description: |
@@ -10117,7 +10108,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Claim a generation
       description: |
@@ -10160,7 +10150,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read the caller's deliveries of a generation
       description: |
@@ -10208,7 +10197,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Stage or deliver wraps
       description: |
@@ -10261,7 +10249,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Stage a rotation's recovery wraps
       description: |
@@ -10305,7 +10292,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Carry a re-formed group's ladder
       description: |
@@ -10525,7 +10511,6 @@ paths:
       - url: https://gkm.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a member's recovery wraps
       description: |
@@ -10538,19 +10523,30 @@ paths:
         - ServiceTokenAuth: []
       parameters:
         - $ref: "#/components/parameters/GkmMemberId"
+        - name: complete
+          in: query
+          description: The current recovery binding digest prefix. An admitted device of this member may check whether every eligible formed group holds a replacement wrap for its winning generation.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{16}$"
       responses:
         "200":
-          description: The wraps.
+          description: The wraps for a plain GET. With complete, an empty confirmation that the replacement wraps stand.
           content:
             application/octet-stream:
               schema:
                 type: string
                 format: binary
+        "400":
+          description: The complete parameter is malformed.
         "403":
-          description: Another member's, or out of scope.
+          description: Another member's, out of scope, or a recovery-scoped token trying to check completion.
+        "409":
+          description: The binding is no longer current or replacement coverage is incomplete.
+        "503":
+          description: The verified state or object store is unavailable.
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Re-wrap after a rebind
       description: |
@@ -10580,7 +10576,6 @@ paths:
           description: Queued out by the write budget.
     delete:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Delete a retired binding's recovery wraps
       description: |
@@ -10610,7 +10605,6 @@ paths:
       - url: https://gkm.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read many forwarding Delegations' reader keys
       description: |
@@ -10652,7 +10646,6 @@ paths:
       - url: https://gkm.bringyour.com
     put:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Store a forwarding Delegation's reader key
       description: |
@@ -10693,7 +10686,6 @@ paths:
           description: Queued out by the write budget.
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read a forwarding Delegation's reader key
       description: |
@@ -15275,8 +15267,16 @@ paths:
             `NOTHING_TO_ERASE`, `INDEX_EPOCH`, `SHREDDING`, `DROPPED`, `DROP_KIND`,
             `DROP_PATH`, `DROP_CONSENT`, `DROP_BOUNDARY`, `DROP_LIST`, `DROP_STATE`,
             or non-fast-forward, each with the push id.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "412":
           description: One of `GATE_CLOSED`, `PATH_EPOCH`, `PATH_EPOCH_DUE` or `EPOCH_SOURCES_FULL`, with the push id.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "429":
           description: |
             One of `BUSY`, `FOLD_BEHIND`, the budget's `RESOURCE_EXHAUSTED`,
@@ -15284,10 +15284,22 @@ paths:
             the network's daily limit, a refusal that meets 8 live refusal records
             or a refusal fence under 1 second old, or a lease or fence wait, with
             `retry_after_ms`.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "503":
           description: "`{push_id, outcome: unknown}`, or evs's clock is unsure before it read anything. The client retries."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
         "507":
           description: "`CLUSTER_FULL` with `Retry-After`, once the head records it."
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/push/{push_id}/{part}:
     servers:
@@ -15931,15 +15943,22 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream:
+          application/x-protobuf:
             schema:
-              type: string
-              format: binary
+              $ref: "#/components/schemas/EvsDropPreviewRequest"
       responses:
         "202":
-          description: "`{preview_id}`."
+          description: The queued preview's identifier.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsDropPreviewReply"
         "429":
           description: Past the repo's daily dry runs.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsRefusalReply"
 
   /evs/v1/repos/{repo_id}/drops/preview/{preview_id}:
     servers:
@@ -15963,7 +15982,11 @@ paths:
             type: string
       responses:
         "200":
-          description: OK.
+          description: The dry run's state and available results.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsDropPreviewReply"
 
   /evs/v1/repos/{repo_id}/drops:
     servers:
@@ -15982,7 +16005,11 @@ paths:
         - $ref: "#/components/parameters/EvsRepoId"
       responses:
         "200":
-          description: OK.
+          description: The repo's visible drop states.
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: "#/components/schemas/EvsDropsReply"
 
   /evs/v1/subscriptions:
     servers:
@@ -16317,7 +16344,6 @@ paths:
   /tls/cert-order:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Order a certificate for a device's key
       description: |
@@ -16360,7 +16386,6 @@ paths:
   /tls/cert-order/{cert_id}:
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Read an order
       description: |
@@ -16391,7 +16416,6 @@ paths:
   /tls/cert-register:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Register a custom domain's chain
       description: |
@@ -16429,7 +16453,6 @@ paths:
   /tls/custom-claim:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Take or renew a custom domain account's lock
       description: |
@@ -16488,7 +16511,6 @@ paths:
   /tls/custom-progress:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Report what the lock's holder learned at the CA
       description: |
@@ -16530,7 +16552,6 @@ paths:
   /tls/custom-account:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Create a custom domain's account row, or change its key
       description: |
@@ -16572,7 +16593,6 @@ paths:
   /tls/custom-challenge:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Write a delegated DNS-01 value
       description: |
@@ -16603,7 +16623,6 @@ paths:
   /tls/custom-challenge/{challenge_id}:
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Whether the dns edges serve a delegated DNS-01 value
       description: |
@@ -16632,7 +16651,6 @@ paths:
   /tls/certs:
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List the network's certificates
       description: |
@@ -16666,7 +16684,6 @@ paths:
   /tls/cert-revoke:
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Revoke a certificate
       description: |
@@ -16707,7 +16724,6 @@ paths:
       - url: https://sockets.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Register the caller's listeners
       description: |
@@ -16757,7 +16773,6 @@ paths:
       - url: https://sockets.bringyour.com
     post:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: Find a listener
       description: |
@@ -16801,7 +16816,6 @@ paths:
       - url: https://sockets.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List the network's registered names
       description: |
@@ -16837,7 +16851,6 @@ paths:
       - url: https://sockets.bringyour.com
     get:
       x-internal: true
-      x-status: planned
       tags: [Other]
       summary: List the ticket keys
       description: |
@@ -33539,6 +33552,21 @@ components:
       type: string
       format: binary
 
+    EvsDropPreviewRequest:
+      description: The serialized `EvsDropPreviewRequest` in sidecar protocol/evs.proto.
+      type: string
+      format: binary
+
+    EvsDropPreviewReply:
+      description: The serialized `EvsDropPreviewReply` in sidecar protocol/evs.proto.
+      type: string
+      format: binary
+
+    EvsDropsReply:
+      description: The serialized `EvsDropsReply` in sidecar protocol/evs.proto.
+      type: string
+      format: binary
+
     EvsSubscriptionRequest:
       description: |
         sidecar protocol/evs.proto's `EvsSubscriptionRequest`: the repo, a ref id or
@@ -33695,12 +33723,20 @@ components:
         successor_cert_id:
           description: udid. The row that took over from this one.
           type: string
+        state_time:
+          description: When the certificate entered its current state.
+          type: string
+          format: date-time
         chain:
           description: A custom domain's registered chain, each certificate in DER, leaf first.
           type: array
           items:
             type: string
             format: byte
+        revocation_reason:
+          description: The reason to send to the CA while revocation is pending.
+          type: string
+          enum: [keyCompromise, cessationOfOperation]
         custom_host:
           description: A custom row's one host.
           type: string
