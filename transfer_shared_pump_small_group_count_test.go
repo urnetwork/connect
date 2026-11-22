@@ -1,5 +1,5 @@
-// Real signed sparse H1 originals exercise explicitly configured finite
-// count growth with exact physical ownership and shared quota admission.
+// Real signed sparse H1 originals exercise fixed and adaptive count limits
+// with exact physical ownership, shared quota admission, and sender recovery.
 // These component regressions make no throughput or SDK policy claim.
 package connect
 
@@ -48,10 +48,67 @@ type smallGroupCountResult struct {
 	ordinaryRefusal                   bool
 }
 
-// Actual public wire ownership distinguishes optional count growth from byte permission.
-func testSharedPumpSmallGroupAdaptiveCount(t *testing.T, profile smallGroupCountProfile, paused bool, receive func(*Client, func(Peer, [][]byte, bool))) smallGroupCountResult {
+// The external consumer creates the public reverse TCP ACK and witnesses delivery.
+type smallGroupReverseSend func(from, to *Client, packet []byte, delivered func(), ack AckFunction) bool
+
+// One genuine reverse TCP ACK and its cumulative Transfer ACK cross the same
+// routes while the application callback still owns the blocked forward head.
+func assertSmallGroupReverseControl(t *testing.T, fixture *windowRoundFixture, send smallGroupReverseSend) {
 	t.Helper()
-	channelCapacity := profile.count + 1
+	var delivered, completions atomic.Int64
+	packet := ipOosTcpPacketSequence(reliableDeliveryTestPath(4), tcpFlagAck, 7000, nil)
+	if !send(fixture.receiver, fixture.sender, packet, func() { delivered.Add(1) }, func(err error) {
+		if err != nil {
+			t.Errorf("reverse TCP ACK terminal callback failed: %v", err)
+		}
+		completions.Add(1)
+	}) {
+		t.Fatal("public reverse TCP ACK was refused")
+	}
+	var messageId, sequenceId Id
+	var packets, receipts int
+	synctest.Wait()
+	for range cap(fixture.receiverOut) {
+		if len(fixture.receiverOut) == 0 && len(fixture.senderOut) == 0 {
+			break
+		}
+		// Empty signed openings can precede the first reverse application Pack.
+		if len(fixture.receiverOut) != 0 {
+			wire := fixture.take(fixture.receiverOut)
+			if wire.pack != nil && len(wire.pack.Frames) != 0 {
+				if wire.pack.Nack || wire.pack.LogicalLane != 2 || len(wire.pack.Frames) != 1 ||
+					!wire.pack.Frames[0].GetRaw() || !bytes.Equal(wire.pack.Frames[0].GetMessageBytes(), packet) {
+					t.Fatal("reverse public wire changed its reliable TCP ACK")
+				}
+				messageId = RequireIdFromBytes(wire.pack.MessageId)
+				sequenceId = RequireIdFromBytes(wire.pack.SequenceId)
+				packets++
+			}
+			fixture.forward(wire, fixture.senderIn)
+		}
+		if len(fixture.senderOut) != 0 {
+			wire := fixture.take(fixture.senderOut)
+			if wire.ack == nil {
+				t.Fatal("forward sender published another DATA Pack while reverse control was crossing")
+			}
+			if packets == 1 && !wire.ack.Selective && bytes.Equal(wire.ack.MessageId, messageId[:]) && bytes.Equal(wire.ack.SequenceId, sequenceId[:]) {
+				if delivered.Load() != 1 || completions.Load() != 0 {
+					t.Fatal("reverse delivery and sender completion escaped their wire boundaries")
+				}
+				receipts++
+			}
+			fixture.forward(wire, fixture.receiverIn)
+		}
+	}
+	if packets != 1 || receipts != 1 || delivered.Load() != 1 || completions.Load() != 1 || len(fixture.receiverOut) != 0 || len(fixture.senderOut) != 0 {
+		t.Fatalf("reverse progress while the forward queue was full: packs=%d cumulative_acks=%d deliveries=%d completions=%d", packets, receipts, delivered.Load(), completions.Load())
+	}
+	t.Logf("SMALL_H1_FIXED_COUNT_REVERSE_CONTROL reverse_packs=%d cumulative_acks=%d deliveries=%d completions=%d", packets, receipts, delivered.Load(), completions.Load())
+}
+
+// Actual public wire ownership distinguishes count and encoded-byte permission.
+func testSharedPumpSmallGroupCount(t *testing.T, profile smallGroupCountProfile, channelCapacity int, paused bool, receive func(*Client, func(Peer, [][]byte, bool)), sendReverse smallGroupReverseSend) smallGroupCountResult {
+	t.Helper()
 	GetMessagePoolAggregateStats()
 	var result smallGroupCountResult
 	synctest.Test(t, func(t *testing.T) {
@@ -106,14 +163,14 @@ func testSharedPumpSmallGroupAdaptiveCount(t *testing.T, profile smallGroupCount
 				if receiver {
 					receive := settings.ReceiveBufferSettings
 
-					// All policy is installed before NewClient; one finite count step,
-					// with no local-byte growth and no change to paid authority.
-					receive.H1SequenceBufferAdaptiveMaxSize = channelCapacity
-					receive.H1SequenceBufferAdaptiveStepSize = 1
-					receive.H1SequenceBufferAdaptiveSaturationThreshold = 1
-					receive.H1SequenceBufferAdaptiveSaturationWindow = time.Hour
-					receive.H1SequenceBufferAdaptiveMaxByteCount = 0
-					receive.H1SequenceBufferAdaptiveStepByteCount = 0
+					// The base fixture disables all growth. Only the adaptive
+					// profiles install one finite count step before NewClient.
+					if profile.count < channelCapacity {
+						receive.H1SequenceBufferAdaptiveMaxSize = channelCapacity
+						receive.H1SequenceBufferAdaptiveStepSize = 1
+						receive.H1SequenceBufferAdaptiveSaturationThreshold = 1
+						receive.H1SequenceBufferAdaptiveSaturationWindow = time.Hour
+					}
 					receive.receiveOwnerStageForTest = func(_ *ReceiveSequence, owner *decodedPackOwner, stage string) {
 						if owner == nil || (stage != "handoff_refused" && stage != "pack_released") {
 							return
@@ -292,6 +349,19 @@ func testSharedPumpSmallGroupAdaptiveCount(t *testing.T, profile smallGroupCount
 		if paused && (targetCumulative.Load() != 0 || targetSelective.Load() != 0 || overflow.acked.Load()) {
 			t.Fatal("blocked or refused small-group target received an invented ACK")
 		}
+		if sendReverse != nil {
+			if !result.refused || !result.ordinaryRefusal || len(sequence.packs) != channelCapacity ||
+				sequence.packQueueCount.Load() != int64(channelCapacity) || sequence.packQueueByteCount.Load() != result.queuedEncoded {
+				t.Fatal("reverse control did not begin at the physical count ceiling after ordinary refusal")
+			}
+			assertSmallGroupReverseControl(t, fixture, sendReverse)
+			number, retained := sender.resendQueue.ContainsMessageId(overflow.scan.messageId)
+			if !retained || number != overflow.scan.sequenceNumber || overflow.acked.Load() || targetCumulative.Load() != 0 || targetSelective.Load() != 0 ||
+				len(sequence.packs) != channelCapacity || sequence.packQueueCount.Load() != int64(channelCapacity) || sequence.packQueueByteCount.Load() != result.queuedEncoded ||
+				rx.Available() != result.rxAvailable || root.Available() != result.rootAvailable || pack.receiveQuotaAvailable(root) != result.quotaAvailable {
+				t.Fatal("reverse control released forward ownership, changed its queue, or acknowledged the refused original")
+			}
+		}
 		releasedAt := time.Now()
 		unblock()
 		synctest.Wait()
@@ -308,6 +378,9 @@ func testSharedPumpSmallGroupAdaptiveCount(t *testing.T, profile smallGroupCount
 			}
 			fixture.forward(retry, fixture.receiverIn)
 			fixture.acknowledge()
+			if sendReverse != nil && (targetEnds.Load() != 2 || !targetAccepted.Load() || targetCumulative.Load() != 1 || !overflow.acked.Load()) {
+				t.Fatal("retained sender retry did not receive exactly one successful follow-up handoff and cumulative ACK")
+			}
 		}
 		result.recovery = time.Since(releasedAt)
 		for index := 0; index < nextSlot; index++ {
@@ -355,7 +428,7 @@ func testSharedPumpSmallGroupAdaptiveCount(t *testing.T, profile smallGroupCount
 // Paused and healthy controls use the same declared finite adaptive policy.
 func assertSmallGroupAdaptiveCountBehavior(t *testing.T, profile smallGroupCountProfile, paused bool, receive func(*Client, func(Peer, [][]byte, bool))) {
 	t.Helper()
-	result := testSharedPumpSmallGroupAdaptiveCount(t, profile, paused, receive)
+	result := testSharedPumpSmallGroupCount(t, profile, profile.count+1, paused, receive, nil)
 	if t.Failed() {
 		return
 	}
@@ -398,6 +471,26 @@ func RunSmallGroupAdaptiveCountFixture(t *testing.T, memoryMiB int, paused bool,
 		t.Fatal("unsupported small-group memory profile")
 	}
 	assertSmallGroupAdaptiveCountBehavior(t, profile, paused, receive)
+}
+
+// A fixed receiver refuses one over-capacity DATA original with funded byte
+// headroom, then delivers it exactly once from the sender's natural retry.
+func RunSmallGroupFixedCountFixture(t *testing.T, receive func(*Client, func(Peer, [][]byte, bool)), sendReverse smallGroupReverseSend) {
+	t.Helper()
+	if sendReverse == nil {
+		t.Fatal("fixed H1 count fixture requires a public reverse sender")
+	}
+	profile := smallGroupCount32()
+	result := testSharedPumpSmallGroupCount(t, profile, profile.count, true, receive, sendReverse)
+	if t.Failed() {
+		return
+	}
+	if !result.refused || !result.ordinaryRefusal || result.queued != int64(profile.count) || result.channelCapacity != profile.count ||
+		result.finalLimit != int64(profile.count) || result.finalByteLimit != profile.handoffEncoded || result.growthCount != 0 || result.saturationCount != 1 ||
+		result.queuedEncoded <= profile.handoffEncoded || result.encodedFlight+result.incomingEncoded >= profile.encoded ||
+		result.rxAvailable < result.incomingPhysical || result.rootAvailable < result.incomingPhysical || result.quotaAvailable < result.incomingEncoded {
+		t.Fatalf("fixed H1 boundary receipts: %+v", result)
+	}
 }
 
 // The maintained decoder guard has no running worker. Construct a fresh

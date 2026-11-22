@@ -1354,13 +1354,10 @@ func TestLagApiUploadSpreadAccuracy(t *testing.T) {
 	}
 }
 
-// M6, amendment 14, through a stream: one 64 KiB message sent slowly, in
-// frames over about a second, as a slow uplink delivers it, is counted as its
-// reads arrive, each spread over the time since the one before -- not whole in
-// the one interval where it ended, which read as steps of 64 KiB per interval,
-// 2.1 Mbps -- and in full, but for its first 8 KiB: they opened the window,
-// and at the rate of what followed they took the time before it, so they do
-// not count (amendment 15). Exact and sampled checking count the same way.
+// Under M6, amendments 14 and 15, both verification modes spread a single
+// 64 KiB WebSocket message over the intervals in which its reads arrive.
+// Only the first read group can lose bytes before the window opens. Pacing
+// at the receiver bounds that group to the first 8 KiB part.
 func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
 	for _, exact := range []bool{true, false} {
 		fixture := newLagApiFixture(t, nil)
@@ -1374,12 +1371,7 @@ func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 8; i += 1 {
-			if _, err := writer.Write(message[i*8192 : (i+1)*8192]); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(150 * time.Millisecond)
-		}
+		testLagWritePacedUploadParts(t, phase, message, writer.Write)
 		if err := writer.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -1407,6 +1399,102 @@ func TestLagApiUploadCountsBytesWhereTheyArrive(t *testing.T) {
 		}
 		upload.close()
 	}
+}
+
+// Write a message in complete 8 KiB parts, one part per pacing interval.
+func testLagWritePacedUploadParts(t *testing.T, phase *lagApiPhase, message []byte, write func([]byte) (int, error)) {
+	t.Helper()
+	const partByteCount = 8192
+	for offset := 0; offset < len(message); offset += partByteCount {
+		if _, err := write(message[offset : offset+partByteCount]); err != nil {
+			t.Fatal(err)
+		}
+		// The first byte of this part can arrive while its last 4 KiB frame is buffered.
+		waitFor(t, func() bool { return uint64(offset) < phase.consumed() })
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// A receiver can first run after the original sender-side pace has elapsed.
+// The next write must still follow receipt of its predecessor by a full pace.
+func TestLagApiUploadPacesPartsAfterReceipt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		phase := testLagUploadPhase(time.Now(), 1, 1<<30, 0)
+		defer phase.finish(lagApiPhaseEndClosed)
+		const partCount = 3
+		sentTimes := make(chan time.Time, partCount)
+		received := make(chan struct{})
+		go func() {
+			defer close(received)
+			var receivedTime time.Time
+			part := 0
+			for sentTime := range sentTimes {
+				part++
+				if !receivedTime.IsZero() && sentTime.Sub(receivedTime) < 150*time.Millisecond {
+					t.Errorf("part %d sent %s after the previous receipt, expected at least 150ms", part, sentTime.Sub(receivedTime))
+				}
+				time.Sleep(200 * time.Millisecond)
+				receivedTime = time.Now()
+				// The WebSocket writer holds one 4 KiB frame until its next write.
+				byteCount := 8192
+				if part == 1 {
+					byteCount = 4096
+				}
+				phase.receive(0, receivedTime, byteCount)
+			}
+			if part != partCount {
+				t.Errorf("received %d parts, expected %d", part, partCount)
+			}
+		}()
+		defer func() {
+			close(sentTimes)
+			<-received
+		}()
+		testLagWritePacedUploadParts(t, phase, make([]byte, partCount*8192), func(part []byte) (int, error) {
+			sentTimes <- time.Now()
+			return len(part), nil
+		})
+	})
+}
+
+// Three buffered 4 KiB reads can arrive together after a receiver stall.
+// Their 450 ms span ends 300 µs into the window, so R2 counts 8 of the
+// first 12,288 bytes plus every later byte in both verification modes.
+func TestLagApiUploadCountsCoalescedFirstReads(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		startTime := time.Now()
+		for _, exact := range []bool{true, false} {
+			phase := testLagUploadPhase(startTime, 1, 1<<30, 0)
+			defer phase.finish(lagApiPhaseEndClosed)
+			key := [16]byte{1, 2, 3, 4}
+			stream, err := newLagApiUploadStream(phase, key, 0, exact, func() bool { return true })
+			if err != nil {
+				t.Fatal(err)
+			}
+			message := testLagUploadMessages(t, key, 0, lagApiBufferByteCount)[0]
+			reader := &testLagPartReader{message: message, partSize: 4096}
+			now := func() time.Time {
+				reads := (len(message) - len(reader.message)) / 4096
+				switch reads {
+				case 0, 1:
+					return startTime
+				case 2:
+					return startTime.Add(150 * time.Microsecond)
+				default:
+					return startTime.Add(300*time.Microsecond + time.Duration(reads-3)*150*time.Millisecond)
+				}
+			}
+			if err := stream.readMessage(websocket.BinaryMessage, reader, now); err != nil {
+				t.Fatal(err)
+			}
+			if consumed, total := phase.consumed(), phase.total(); consumed != lagApiBufferByteCount || total != lagApiBufferByteCount-3*4096+8 {
+				t.Errorf("exact %t consumed %d and counted %d, expected 65536 and 53256", exact, consumed, total)
+			}
+			if _, _, end := phase.state(); end != lagApiPhaseRunning {
+				t.Errorf("exact %t ended %d", exact, end)
+			}
+		}
+	})
 }
 
 // M6: without AES instructions one message in 16 is checked, chosen after it

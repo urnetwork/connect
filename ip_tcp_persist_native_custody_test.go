@@ -116,6 +116,9 @@ type persistNativeBridgeHooks struct {
 	beforeOffer   func(*persistNativeFixture, []byte, persistNativeHeader, bool)
 	afterReceipt  func(*persistNativeFixture, persistNativeOffer)
 	writeResponse func(*persistNativeFixture, http.ResponseWriter, *http.Request, []byte)
+	// The observer borrows the exact wire packet and identifies originals
+	// whose receipts belong to a separate witness.
+	observeWire func(*persistNativeWire, []byte, int) bool
 }
 
 // One connection, one held receipt, one queued ACK, one paused native reader.
@@ -301,9 +304,10 @@ func newPersistNativeFixtureWithBridge(t *testing.T, holdZero bool, configureCli
 						}
 						continue
 					}
-					// One accepted native offer is outstanding. Negotiated lane
-					// activation may move later packets away from the initial SYN.
-					f.sourceWire.Store(wire)
+					if bridgeHooks == nil || bridgeHooks.observeWire == nil || !bridgeHooks.observeWire(wire, packet, len(pack.Frames)) {
+						// Negotiated lanes may move direct offers away from the initial SYN.
+						f.sourceWire.Store(wire)
+					}
 					if zero := f.zero.Load(); zero != nil && header == *zero {
 						f.zeroWire.CompareAndSwap(nil, wire)
 					}
@@ -569,6 +573,11 @@ func (self *persistNativeFixture) runBridge() {
 		if hooks := self.nativeBridgeHooks; hooks != nil && hooks.beforeOffer != nil {
 			hooks.beforeOffer(self, packet, header, firstZero)
 		}
+		var previousWire *persistNativeWire
+		separateSerialReceipt := self.nativeBridgeHooks != nil && self.nativeBridgeHooks.observeWire != nil
+		if separateSerialReceipt {
+			previousWire = self.sourceWire.Load()
+		}
 		result := self.offer(packet, firstZero || self.nativeBridgeHooks != nil && header.pureAck())
 		if firstZero {
 			self.zeroOffered <- result
@@ -580,10 +589,20 @@ func (self *persistNativeFixture) runBridge() {
 			continue
 		}
 		if result.accepted {
-			if !self.waitSerialAck() {
-				return
+			if separateSerialReceipt {
+				result.wire, err = self.takeSerialAck(previousWire, result.header)
+				if err != nil {
+					if self.ctx.Err() == nil {
+						self.t.Error(err)
+					}
+					return
+				}
+			} else {
+				if !self.waitSerialAck() {
+					return
+				}
+				result.wire = self.sourceWire.Load()
 			}
-			result.wire = self.sourceWire.Load()
 			if hooks := self.nativeBridgeHooks; hooks != nil && hooks.afterReceipt != nil {
 				hooks.afterReceipt(self, result)
 			}
@@ -623,6 +642,8 @@ func (self *persistNativeFixture) waitCapacity() bool {
 	}
 }
 
+var errPersistNativeSerialReceipt = errors.New("serialized native offer retired a different source generation")
+
 func (self *persistNativeFixture) waitSerialAck() bool {
 	select {
 	case receipt := <-self.serialAcks:
@@ -633,6 +654,33 @@ func (self *persistNativeFixture) waitSerialAck() bool {
 		return true
 	case <-self.ctx.Done():
 		return false
+	}
+}
+
+func (self *persistNativeFixture) takeSerialAck(previous *persistNativeWire, header persistNativeHeader) (*persistNativeWire, error) {
+	select {
+	case receipt := <-self.serialAcks:
+		wire := self.sourceWire.Load()
+		if wire == nil || receipt != *wire || (previous != nil && receipt == *previous) ||
+			receipt.header != header {
+			return nil, errPersistNativeSerialReceipt
+		}
+		return wire, nil
+	case <-self.ctx.Done():
+		return nil, self.ctx.Err()
+	}
+}
+
+// A terminal cannot satisfy a later native offer before its wire is published,
+// even when both native packets have the same TCP header.
+func TestTcpNativeSerialAckRejectsPreviousWire(t *testing.T) {
+	fixture := &persistNativeFixture{ctx: t.Context(), serialAcks: make(chan persistNativeWire, 1)}
+	previous := persistNativeWire{owner: sendSequenceId{Destination: NewId()}, generation: NewId(), message: NewId(), number: 1,
+		header: persistNativeHeader{seq: 100, ack: 200, window: 1024, ackFlag: true}}
+	fixture.sourceWire.Store(&previous)
+	fixture.serialAcks <- previous
+	if wire, err := fixture.takeSerialAck(&previous, previous.header); wire != nil || !errors.Is(err, errPersistNativeSerialReceipt) {
+		t.Fatalf("a previous terminal satisfied a new same-header offer: wire=%+v err=%v", wire, err)
 	}
 }
 

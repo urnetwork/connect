@@ -12,8 +12,8 @@ import (
 
 var errNativeAckRetrySuperseded = errors.New("native TCP feedback superseded before serialization")
 
-// Only newer native TCP preparation on the same live owners can produce this
-// pre-ordinal replay disposition. Other vetoes retain the same text and cause.
+// A later native TCP offer on the same live owners can supersede a detached
+// replay. A local FIN also needs independent peer-acknowledged DATA coverage.
 var errSendPackNativeAckRetrySuperseded = &sendPackUnwrittenError{cause: errNativeAckRetrySuperseded}
 
 // Reports an unwritten local pure ACK replay superseded by a later native TCP
@@ -25,13 +25,30 @@ func IsSendPackNativeAckRetrySuperseded(err error) bool {
 // The original synchronous attempt records only an actual raw-count refusal.
 // A retry copies this immutable flow/source stamp, never the pending owner.
 type tcpNativeAckRetryAttempt struct {
-	update    *multiClientChannelUpdate
-	selection *multiClientAffinitySelection
-	epoch     uint64
-	serial    uint64
-	source    *SendSequence
-	gate      *resendCapacityGate
-	replay    bool
+	update        *multiClientChannelUpdate
+	selection     *multiClientAffinitySelection
+	epoch         uint64
+	serial        uint64
+	source        *SendSequence
+	gate          *resendCapacityGate
+	refusalOrder  uint64
+	sequence, ack uint32
+	replay        bool
+}
+
+// A real reliable DATA terminal can show that the same source has already
+// delivered a greater inner ACK. This scalar receipt owns no packet bytes.
+type nativeAckPeerDataReceipt struct {
+	sourceId      Id
+	epoch, order  uint64
+	sequence, ack uint32
+}
+
+// Only flows with an actual observed retained ACK allocate this proof.
+type nativeAckReplayEvidence struct {
+	lastHardInvalidation uint64
+	localFinOrder        uint64
+	peerData             nativeAckPeerDataReceipt
 }
 
 // The parent index owns this node until a finite reaper visit returns it. The
@@ -100,6 +117,10 @@ func (self *parsedPacketGroup) prepareNativeAckRetryWithLock(update *multiClient
 // Lifecycle controls, resets and teardown invalidate independently of native preparation.
 func (self *multiClientChannelUpdate) invalidateNativeAckRetryWithLock() {
 	self.advanceNativeAckRetryWithLock(false)
+	if evidence := self.nativeAckReplayEvidence; evidence != nil {
+		evidence.lastHardInvalidation = self.nativeAckSerial
+		evidence.peerData = nativeAckPeerDataReceipt{}
+	}
 }
 
 // Preserve which serials advanced solely on native TCP offers. Overflow permanently
@@ -110,6 +131,9 @@ func (self *multiClientChannelUpdate) advanceNativeAckRetryWithLock(nativeOffer 
 	}
 	if !nativeOffer {
 		self.nativeAckLastUnrelatedSerial = self.nativeAckSerial
+		if evidence := self.nativeAckReplayEvidence; evidence != nil {
+			evidence.localFinOrder = 0
+		}
 	}
 	if self.nativeAckRetry != nil && self.sequenceParent != nil {
 		self.sequenceParent.notifyFlowReaper()
@@ -152,12 +176,35 @@ func (self *tcpNativeAckRetryAttempt) replayDispositionWithLock(source *SendSequ
 		if update.nativeAckSerial == self.serial {
 			return nil
 		}
-		if self.replay && source != nil && self.serial != 0 && update.nativeAckLastUnrelatedSerial <= self.serial &&
-			self.serial < update.nativeAckSerial && update.nativeAckSerial != ^uint64(0) {
+		if self.replay && source != nil && self.serial != 0 && self.serial < update.nativeAckSerial &&
+			update.nativeAckSerial != ^uint64(0) && (update.nativeAckLastUnrelatedSerial <= self.serial ||
+			self.peerDataCoversLocalFinWithLock(source)) {
 			return errSendPackNativeAckRetrySuperseded
 		}
 	}
 	return newUnwrittenSendPackError(errNativeAckRetrySuperseded)
+}
+
+// The last unrelated change must be the ordered local FIN on this exact source.
+// It supplies cause only. The independently completed DATA supplies coverage.
+func (self *tcpNativeAckRetryAttempt) peerDataCoversLocalFinWithLock(source *SendSequence) bool {
+	update := self.update
+	evidence := update.nativeAckReplayEvidence
+	if evidence == nil {
+		return false
+	}
+	proof := evidence.peerData
+	return evidence.lastHardInvalidation <= self.serial &&
+		self.serial < update.nativeAckLastUnrelatedSerial && update.nativeAckLastUnrelatedSerial == update.nativeAckSerial &&
+		update.egressFinSeen && !update.ingressFinSeen && evidence.localFinOrder != 0 &&
+		evidence.localFinOrder == update.sequenceControlOrder && update.sequenceSourceId == source.sequenceId &&
+		proof.sourceId != (Id{}) && proof.sourceId == source.sequenceId && proof.epoch == self.epoch &&
+		self.refusalOrder < proof.order && proof.order < evidence.localFinOrder &&
+		tcpSequenceAtOrAfter(proof.sequence, self.sequence) && int32(proof.ack-self.ack) > 0
+}
+
+func (self tcpControlObservation) ordinaryLocalFin() bool {
+	return self.ack && self.fin && !self.syn && !self.rst && self.payloadByteCount == 0
 }
 
 func (self *tcpNativeAckRetryAttempt) current() bool {
@@ -177,9 +224,14 @@ func (self *parsedPacketGroup) noteNativeAckCapacityRefusal(source *SendSequence
 		if self.nativeAckRetrySerial == 0 || self.nativeAckRetrySelection == nil || self.collapseAdmission.update == nil {
 			return
 		}
-		attempt = &tcpNativeAckRetryAttempt{update: self.collapseAdmission.update,
+		update := self.collapseAdmission.update
+		update.stateLock.Lock()
+		refusalOrder := update.sequenceControlOrder
+		update.stateLock.Unlock()
+		attempt = &tcpNativeAckRetryAttempt{update: update,
 			selection: self.nativeAckRetrySelection, epoch: self.collapseAdmission.epoch,
-			serial: self.nativeAckRetrySerial}
+			serial: self.nativeAckRetrySerial, refusalOrder: refusalOrder,
+			sequence: self.ipPath.SequenceNumber, ack: self.ipPath.AckSequenceNumber}
 		self.nativeAckRetry = attempt
 	}
 	if !attempt.replay || attempt.source == source {
@@ -230,6 +282,10 @@ func (self *RemoteUserNatMultiClient) retainNativeAckRetry(group *parsedPacketGr
 		owner.attempt.gate.abandonWatch(&owner.waiter, owner.installation)
 		previous = owner.packet
 		previousCredit = owner.credit
+	}
+	if observations := group.admissionObservations; observations != nil && observations.nativeReadyPureTcpAck &&
+		update.nativeAckReplayEvidence == nil {
+		update.nativeAckReplayEvidence = &nativeAckReplayEvidence{lastHardInvalidation: update.nativeAckLastUnrelatedSerial}
 	}
 	owner.credit, owner.memoryByteCount = credit, envelope
 	owner.attempt = *attempt
@@ -336,7 +392,11 @@ func (self *RemoteUserNatMultiClient) processNativeAckRetry(owner *tcpNativeAckR
 			admission := ipPacketGroupAdmission{expectedUpdate: update, expectedEpoch: retry.epoch}
 			if retry.current() && group.prepareCollapseAdmissionWithRefusal(update, &admission, self) {
 				group.completionSelection = retry.selection
+				group.prepareAdmissionObservations(retry.selection.client, true)
 				accepted, err = retry.selection.client.SendGroupDetailed(group, 0)
+				if group.admissionObservations != nil {
+					group.admissionObservations.complete(accepted && err == nil)
+				}
 				if !accepted || err != nil {
 					group.collapseAdmission.releaseTcpRecovery()
 				} else {

@@ -1118,8 +1118,12 @@ type Ack struct {
 	// This is not independent ACK authority: the sender verifies the exact
 	// identity against its live original or known terminal-delivery range.
 	ImmediateSequenceNumber *uint64 `protobuf:"varint,14,opt,name=immediate_sequence_number,json=immediateSequenceNumber,proto3,oneof" json:"immediate_sequence_number,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Versioned endpoint public key and commitment to the grant introduction.
+	// Only a delivery ACK carried by a verified physical platform receive
+	// lane can complete enrollment.
+	StreamForwardingAcceptance []byte `protobuf:"bytes,15,opt,name=stream_forwarding_acceptance,json=streamForwardingAcceptance,proto3,oneof" json:"stream_forwarding_acceptance,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
@@ -1248,6 +1252,13 @@ func (x *Ack) GetImmediateSequenceNumber() uint64 {
 		return *x.ImmediateSequenceNumber
 	}
 	return 0
+}
+
+func (x *Ack) GetStreamForwardingAcceptance() []byte {
+	if x != nil {
+		return x.StreamForwardingAcceptance
+	}
+	return nil
 }
 
 type Tag struct {
@@ -1580,6 +1591,9 @@ type StreamOpen struct {
 	AuthorizationGeneration         []byte                 `protobuf:"bytes,4,opt,name=authorization_generation,json=authorizationGeneration,proto3" json:"authorization_generation,omitempty"`
 	AuthorizationLeaseMillis        uint32                 `protobuf:"varint,5,opt,name=authorization_lease_millis,json=authorizationLeaseMillis,proto3" json:"authorization_lease_millis,omitempty"`
 	AuthorizationDeadlineUnixMillis int64                  `protobuf:"varint,6,opt,name=authorization_deadline_unix_millis,json=authorizationDeadlineUnixMillis,proto3" json:"authorization_deadline_unix_millis,omitempty"`
+	// Set only by the platform's existing authenticated stream grant. Absent
+	// keeps legacy adjacent-only eligibility.
+	PathHasIntermediaries *bool `protobuf:"varint,7,opt,name=path_has_intermediaries,json=pathHasIntermediaries,proto3,oneof" json:"path_has_intermediaries,omitempty"`
 	// ulid
 	SourceId []byte `protobuf:"bytes,2,opt,name=source_id,json=sourceId,proto3,oneof" json:"source_id,omitempty"`
 	// ulid
@@ -1639,6 +1653,13 @@ func (x *StreamOpen) GetAuthorizationDeadlineUnixMillis() int64 {
 		return x.AuthorizationDeadlineUnixMillis
 	}
 	return 0
+}
+
+func (x *StreamOpen) GetPathHasIntermediaries() bool {
+	if x != nil && x.PathHasIntermediaries != nil {
+		return *x.PathHasIntermediaries
+	}
+	return false
 }
 
 func (x *StreamOpen) GetSourceId() []byte {
@@ -2482,8 +2503,12 @@ type Contract struct {
 	// Authoritative copy lives in `StoredContract`; this is a
 	// convenience copy.
 	DestinationClientKeySignedTlsCertificate []byte `protobuf:"bytes,6,opt,name=destination_client_key_signed_tls_certificate,json=destinationClientKeySignedTlsCertificate,proto3" json:"destination_client_key_signed_tls_certificate,omitempty"`
-	unknownFields                            protoimpl.UnknownFields
-	sizeCache                                protoimpl.SizeCache
+	// Versioned ephemeral endpoint public key. Only the reliable introduction
+	// received on a verified physical platform lane may supply this offer.
+	// StoredContract's signed bytes stay unchanged.
+	StreamForwardingOffer []byte `protobuf:"bytes,15,opt,name=stream_forwarding_offer,json=streamForwardingOffer,proto3,oneof" json:"stream_forwarding_offer,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *Contract) Reset() {
@@ -2554,6 +2579,13 @@ func (x *Contract) GetDestinationClientPublicKey() []byte {
 func (x *Contract) GetDestinationClientKeySignedTlsCertificate() []byte {
 	if x != nil {
 		return x.DestinationClientKeySignedTlsCertificate
+	}
+	return nil
+}
+
+func (x *Contract) GetStreamForwardingOffer() []byte {
+	if x != nil {
+		return x.StreamForwardingOffer
 	}
 	return nil
 }
@@ -3729,7 +3761,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\xe2\x06\n" +
+	"\x0f_contract_frame\"\xca\a\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3747,13 +3779,15 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0econtract_ahead\x18\n" +
 	" \x01(\bR\rcontractAhead\x123\n" +
 	"\x15delivered_immediately\x18\r \x01(\bR\x14deliveredImmediately\x12?\n" +
-	"\x19immediate_sequence_number\x18\x0e \x01(\x04H\x05R\x17immediateSequenceNumber\x88\x01\x01B\x06\n" +
+	"\x19immediate_sequence_number\x18\x0e \x01(\x04H\x05R\x17immediateSequenceNumber\x88\x01\x01\x12E\n" +
+	"\x1cstream_forwarding_acceptance\x18\x0f \x01(\fH\x06R\x1astreamForwardingAcceptance\x88\x01\x01B\x06\n" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_idB\x1c\n" +
 	"\x1a_receive_window_byte_countB\x1e\n" +
 	"\x1c_ack_compress_timeout_microsB\x1c\n" +
 	"\x1a_receiver_ack_delay_microsB\x1c\n" +
-	"\x1a_immediate_sequence_number\"\"\n" +
+	"\x1a_immediate_sequence_numberB\x1f\n" +
+	"\x1d_stream_forwarding_acceptance\"\"\n" +
 	"\x03Tag\x12\x1b\n" +
 	"\tsend_time\x18\x01 \x01(\x04R\bsendTime\"\x9c\x04\n" +
 	"\x04Auth\x12\x15\n" +
@@ -3779,15 +3813,17 @@ const file_transfer_proto_rawDesc = "" +
 	"\n" +
 	"ProvideKey\x12*\n" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.bringyour.ProvideModeR\x04mode\x12,\n" +
-	"\x12provide_secret_key\x18\x02 \x01(\fR\x10provideSecretKey\"\xde\x02\n" +
+	"\x12provide_secret_key\x18\x02 \x01(\fR\x10provideSecretKey\"\xb7\x03\n" +
 	"\n" +
 	"StreamOpen\x129\n" +
 	"\x18authorization_generation\x18\x04 \x01(\fR\x17authorizationGeneration\x12<\n" +
 	"\x1aauthorization_lease_millis\x18\x05 \x01(\rR\x18authorizationLeaseMillis\x12K\n" +
-	"\"authorization_deadline_unix_millis\x18\x06 \x01(\x03R\x1fauthorizationDeadlineUnixMillis\x12 \n" +
-	"\tsource_id\x18\x02 \x01(\fH\x00R\bsourceId\x88\x01\x01\x12*\n" +
-	"\x0edestination_id\x18\x01 \x01(\fH\x01R\rdestinationId\x88\x01\x01\x12\x1b\n" +
-	"\tstream_id\x18\x03 \x01(\fR\bstreamIdB\f\n" +
+	"\"authorization_deadline_unix_millis\x18\x06 \x01(\x03R\x1fauthorizationDeadlineUnixMillis\x12;\n" +
+	"\x17path_has_intermediaries\x18\a \x01(\bH\x00R\x15pathHasIntermediaries\x88\x01\x01\x12 \n" +
+	"\tsource_id\x18\x02 \x01(\fH\x01R\bsourceId\x88\x01\x01\x12*\n" +
+	"\x0edestination_id\x18\x01 \x01(\fH\x02R\rdestinationId\x88\x01\x01\x12\x1b\n" +
+	"\tstream_id\x18\x03 \x01(\fR\bstreamIdB\x1a\n" +
+	"\x18_path_has_intermediariesB\f\n" +
 	"\n" +
 	"_source_idB\x11\n" +
 	"\x0f_destination_id\"e\n" +
@@ -3851,14 +3887,16 @@ const file_transfer_proto_rawDesc = "" +
 	"\x0fcreate_contract\x18\x03 \x01(\v2\x19.bringyour.CreateContractH\x02R\x0ecreateContract\x88\x01\x01B\b\n" +
 	"\x06_errorB\v\n" +
 	"\t_contractB\x12\n" +
-	"\x10_create_contract\"\x87\x03\n" +
+	"\x10_create_contract\"\xe0\x03\n" +
 	"\bContract\x122\n" +
 	"\x15stored_contract_bytes\x18\x01 \x01(\fR\x13storedContractBytes\x120\n" +
 	"\x14stored_contract_hmac\x18\x02 \x01(\fR\x12storedContractHmac\x129\n" +
 	"\fprovide_mode\x18\x03 \x01(\x0e2\x16.bringyour.ProvideModeR\vprovideMode\x126\n" +
 	"\x17provide_tls_certificate\x18\x04 \x03(\fR\x15provideTlsCertificate\x12A\n" +
 	"\x1ddestination_client_public_key\x18\x05 \x01(\fR\x1adestinationClientPublicKey\x12_\n" +
-	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\"\x9f\x05\n" +
+	"-destination_client_key_signed_tls_certificate\x18\x06 \x01(\fR(destinationClientKeySignedTlsCertificate\x12;\n" +
+	"\x17stream_forwarding_offer\x18\x0f \x01(\fH\x00R\x15streamForwardingOffer\x88\x01\x01B\x1a\n" +
+	"\x18_stream_forwarding_offer\"\x9f\x05\n" +
 	"\x0eStoredContract\x12\x1f\n" +
 	"\vcontract_id\x18\x01 \x01(\fR\n" +
 	"contractId\x12.\n" +
@@ -4125,6 +4163,7 @@ func file_transfer_proto_init() {
 	file_transfer_proto_msgTypes[20].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[21].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[22].OneofWrappers = []any{}
+	file_transfer_proto_msgTypes[23].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[24].OneofWrappers = []any{}
 	file_transfer_proto_msgTypes[31].OneofWrappers = []any{}
 	type x struct{}

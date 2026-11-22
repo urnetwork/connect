@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"sync"
@@ -27,7 +28,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		certPem, keyPem, err := selfSign(
 			[]string{testLoopbackIp(ipVersion)},
 			testLoopbackIp(ipVersion),
-			24*time.Hour,
+			time.Minute,
 			24*time.Hour,
 		)
 		if err != nil {
@@ -37,6 +38,12 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(certPem) {
+			t.Fatal("could not pin the fixture H3 certificate")
+		}
+		clientId := NewId()
+		testJwt := lateLocalJwt(t, clientId)
 		const nextProto = "urnetwork-h3-datagram-test"
 		listener, err := quic.ListenAddrEarly(
 			testLoopbackHostPort(ipVersion, 0),
@@ -125,8 +132,8 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 				return
 			}
 			auth, ok := decoded.(*protocol.Auth)
-			if !ok {
-				serverErrors <- fmt.Errorf("auth type=%T", decoded)
+			if !ok || auth.ByJwt != testJwt {
+				serverErrors <- fmt.Errorf("unexpected synthetic login type or value: %T", decoded)
 				return
 			}
 			connectionState := connection.ConnectionState()
@@ -220,8 +227,8 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		settings.H3Port = listener.Addr().(*net.UDPAddr).Port
 		settings.resolveH3AddrsForTest = testingH3LoopbackResolver(ipVersion, settings.H3Port)
 		settings.QuicTlsConfig = &tls.Config{
-			InsecureSkipVerify: true, // test-only self-signed endpoint
-			NextProtos:         []string{nextProto},
+			RootCAs:    roots,
+			NextProtos: []string{nextProto},
 		}
 		settings.FramerSettings = framerSettings
 		settings.EnableH3Datagrams = true
@@ -265,13 +272,11 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 			default:
 			}
 		}
-		clientReceivedMessages := make(chan []byte, 2)
-		settings.afterH3ReceiveEnqueueForTest = func(message []byte) {
-			select {
-			case clientReceivedMessages <- bytes.Clone(message):
-			default:
-			}
+		type receivedMessage struct {
+			message     []byte
+			disposition transferReceiveDisposition
 		}
+		clientReceivedMessages := make(chan receivedMessage, 2)
 
 		routeManager := NewRouteManager(testCtx, "h3-datagram-round-trip")
 		// Production always has the Client receive pump attached. Hybrid reliable
@@ -283,10 +288,15 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		go func() {
 			defer close(readerDone)
 			for {
-				message, readErr := reader.Read(testCtx, time.Second)
+				message, disposition, readErr := reader.(transferCarrierMultiRouteReader).readWithCarrier(testCtx, time.Second)
 				if message != nil {
+					select {
+					case clientReceivedMessages <- receivedMessage{bytes.Clone(message), disposition}:
+					case <-testCtx.Done():
+					}
 					MessagePoolReturn(message)
 				}
+				disposition.h1Credit.release()
 				if readErr != nil {
 					return
 				}
@@ -301,7 +311,7 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 			NewClientStrategyWithDefaults(testCtx),
 			routeManager,
 			"https://"+testLoopbackHost(ipVersion),
-			&ClientAuth{ByJwt: "testing", InstanceId: NewId(), AppVersion: "testing"},
+			&ClientAuth{ByJwt: testJwt, InstanceId: NewId(), AppVersion: "testing"},
 			TransportModeH3,
 			settings,
 		)
@@ -379,19 +389,29 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 			close(releaseStreamWrite)
 		})
 
-		clientReceived := map[string]bool{}
+		clientReceived := map[string]transferReceiveDisposition{}
 		for range 2 {
 			select {
 			case received := <-clientReceivedMessages:
-				clientReceived[string(received)] = true
+				clientReceived[string(received.message)] = received.disposition
 			case serverErr := <-serverErrors:
 				t.Fatal(serverErr)
 			case <-testCtx.Done():
 				t.Fatalf("wait for client hybrid messages: %v", testCtx.Err())
 			}
 		}
-		if !clientReceived[string(serverMessage)] || !clientReceived[string(clientMessage)] {
+		stream, streamOk := clientReceived[string(clientMessage)]
+		datagram, datagramOk := clientReceived[string(serverMessage)]
+		if !streamOk || !datagramOk {
 			t.Fatalf("client did not receive both hybrid lanes: %d messages", len(clientReceived))
+		}
+		if stream.reliability != CarrierReliabilityReliable || datagram.reliability != CarrierReliabilityUnreliable ||
+			!stream.platformReceive.withLiveOwner(clientId, func() {}) || !datagram.platformReceive.withLiveOwner(clientId, func() {}) {
+			t.Fatal("verified H3 receive missing its live platform owner on one or both lanes")
+		}
+		if stream.platformReceive.lane != platformReceiveH3Stream || datagram.platformReceive.lane != platformReceiveH3Datagram ||
+			stream.platformReceive.owner != datagram.platformReceive.owner {
+			t.Fatal("H3 receipts did not identify separate lanes on the same connection")
 		}
 		close(serverCanClose)
 		serverReceived := map[string]bool{}
@@ -410,8 +430,8 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 		}
 		select {
 		case <-serverSentMessages:
-		default:
-			t.Fatal("server receive completed before its fragmented send was recorded")
+		case <-testCtx.Done():
+			t.Fatal("server stream send did not complete")
 		}
 
 		stats := transport.DatagramStats()
@@ -424,6 +444,12 @@ func TestPlatformTransportH3DatagramRoundTrip(t *testing.T) {
 			uint64(DefaultH3DatagramSettings().HybridStreamQueueByteCount()) < stats.HybridStreamQueueMaximumByteCount ||
 			stats.HybridStreamQueueOversizeCount != 0 {
 			t.Fatalf("client hybrid stats=%+v", stats)
+		}
+		if err := transport.CloseAndWait(testCtx); err != nil {
+			t.Fatal(err)
+		}
+		if stream.platformReceive.withLiveOwner(clientId, func() {}) || datagram.platformReceive.withLiveOwner(clientId, func() {}) {
+			t.Fatal("closed H3 connection admitted a retained lane receipt")
 		}
 	})
 }

@@ -1214,6 +1214,7 @@ func TestReceiveSequenceH1HandoffUsesCarrierSpecificCountLimit(t *testing.T) {
 	if stats.PackHandoffMaxCount != 4 || stats.PackHandoffMaxByteCount != 160 {
 		t.Fatalf("H1 handoff high water = (%d, %d), want (4, 160)", stats.PackHandoffMaxCount, stats.PackHandoffMaxByteCount)
 	}
+	assertH1PackRefusalCounts(t, client, 1, 0)
 }
 
 // The H1 byte reserve follows the same carrier discriminator as the count
@@ -1382,6 +1383,7 @@ func TestReceiveSequenceH1HandoffDeepensAfterContinuousSaturation(t *testing.T) 
 		stats.PackHandoffAdaptiveMaxByteCount != 2048 {
 		t.Fatalf("adaptive handoff stats = %+v", stats)
 	}
+	assertH1PackRefusalCounts(t, client, 2, 0)
 	for len(queued) > 0 {
 		drainOne()
 	}
@@ -1438,6 +1440,7 @@ func TestReceiveSequenceH1HandoffDeepensWhenLogicalBytesSaturateFirst(t *testing
 		stats.PackHandoffAdaptiveMaxByteCount != 160 {
 		t.Fatalf("byte-saturated adaptive stats = %+v", stats)
 	}
+	assertH1PackRefusalCounts(t, client, 0, 0)
 	for range 4 {
 		pack := <-sequence.packs
 		sequence.releasePackQueue(pack)
@@ -1868,6 +1871,7 @@ func TestReceiveSequenceH1HandoffWaitRescuesFullQueue(t *testing.T) {
 	if got := client.ReceiveStats().PackHandoffWaitSuccess; got != 1 {
 		t.Fatalf("H1 rescued wait count = %d, want 1", got)
 	}
+	assertH1PackRefusalCounts(t, client, 0, 0)
 	dequeued = <-sequence.packs
 	sequence.releasePackQueue(dequeued)
 	dequeued.messagePoolReturn()

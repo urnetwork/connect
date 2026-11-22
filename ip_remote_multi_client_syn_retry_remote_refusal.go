@@ -70,19 +70,44 @@ func (self *tcpSynRetry) pendingGenerationChangeWithLock(update *multiClientChan
 }
 
 // The flow lock protects the paid owner and its exact current source sequence.
-func (self *multiClientChannelUpdate) synRetryHasRemoteRefusalWithLock() bool {
+func (self *multiClientChannelUpdate) synRetryRemoteRefusalOwnerWithLock() *tcpSynRetry {
 	owner := self.synRetry
-	return owner != nil && owner.openingSerial == 0 && owner.validWithLock(self) && self.dialFailedSynSeen &&
-		owner.sequence == self.dialFailedSyn && len(owner.refusedRemoteIds) != 0
+	if owner == nil || owner.openingSerial != 0 || !owner.validWithLock(self) ||
+		!self.dialFailedSynSeen || owner.sequence != self.dialFailedSyn {
+		return nil
+	}
+	return owner
+}
+
+// A publication needs a standing remote refusal before it may wake work.
+func (self *multiClientChannelUpdate) synRetryHasRemoteRefusalWithLock() bool {
+	owner := self.synRetryRemoteRefusalOwnerWithLock()
+	return owner != nil && len(owner.refusedRemoteIds) != 0
 }
 
 // Overflow is unknown freshness and therefore refuses automatic continuation.
 // A later ordinary native source offer retains its existing routing policy.
+func (self *tcpSynRetry) remoteTailRefusedWithLock(client *multiClientChannel) bool {
+	return self != nil && client != nil && client.args != nil &&
+		(self.remoteRefusalOverflow || slices.Contains(self.refusedRemoteIds, client.Destination().Tail()))
+}
+
+// Publication and final admission use the same paid generation's remote proof.
 func (self *multiClientChannelUpdate) synRetryRemoteTailRefusedWithLock(client *multiClientChannel) bool {
-	owner := self.synRetry
-	if client == nil || client.args == nil || owner == nil || owner.openingSerial != 0 || !owner.validWithLock(self) ||
-		!self.dialFailedSynSeen || owner.sequence != self.dialFailedSyn {
-		return false
+	return self.synRetryRemoteRefusalOwnerWithLock().remoteTailRefusedWithLock(client)
+}
+
+// The publication that woke this retry is only a wake. Check every candidate
+// in the actual selection field, including new channels to a refused provider.
+func (self *parsedPacketGroup) excludeRefusedSynRetryRemotes(update *multiClientChannelUpdate, candidates []*multiClientChannel) []*multiClientChannel {
+	if len(candidates) == 0 {
+		return candidates
 	}
-	return owner.remoteRefusalOverflow || slices.Contains(owner.refusedRemoteIds, client.Destination().Tail())
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	owner := update.synRetryRemoteRefusalOwnerWithLock()
+	if owner == nil || self.synRetry.update != update || self.synRetry.serial != owner.serial {
+		return candidates
+	}
+	return slices.DeleteFunc(candidates, owner.remoteTailRefusedWithLock)
 }

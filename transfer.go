@@ -1423,7 +1423,7 @@ const rawSendPackPoolCapacity = 8
 type ReceivePack struct {
 	// Only pre-admission waits observe the exact retired physical lane. Once
 	// Pack takes ownership, closing that lane never revokes accepted work.
-	carrierDone <-chan struct{}
+	carrier *receivePackCarrier
 	// Client-relative monotonic ingress; zero means no timing provenance.
 	receivedAtNanos    int64
 	Source             TransferPath
@@ -1847,6 +1847,15 @@ type ClientReceiveStatsSnapshot struct {
 	PackHandoffDeepenedFlows        uint64
 	PackHandoffAdaptiveMaxDepth     uint64
 	PackHandoffAdaptiveMaxByteCount uint64
+	// These two stages contribute to PackHandoffDropCount. DecodeOwner records
+	// offers that could not acquire a retained decode owner. Final records
+	// decoded Packs refused by the zero-wait receive pump.
+	PackHandoffDecodeOwnerRefusalCount uint64
+	PackHandoffFinalRefusalCount       uint64
+	// Zero-wait H1 DATA offers that ended at the count or local byte limit.
+	// The count check runs first. Successful adaptive growth has no refusal.
+	H1PackCountLimitRefusalCount     uint64
+	H1PackLocalByteLimitRefusalCount uint64
 	// ReceiveQueueDropCount and ReceiveQueueDropByteCount are arrivals the
 	// receive queue could not admit: it held ReceiveQueueMaxByteCount and
 	// the arrival sat above everything in it, so nothing could be evicted to
@@ -2248,6 +2257,8 @@ type Client struct {
 	receiveForgedSourceDropCount           atomic.Uint64
 	receivePackHandoffDropCount            atomic.Uint64
 	receivePackHandoffDropByteCount        atomic.Uint64
+	receivePackDecodeOwnerRefusalCount     atomic.Uint64
+	receivePackFinalRefusalCount           atomic.Uint64
 	receivePackHandoffWaitCount            atomic.Uint64
 	receivePackHandoffWaitSuccess          atomic.Uint64
 	receivePackHandoffMaxCount             atomic.Uint64
@@ -2257,6 +2268,8 @@ type Client struct {
 	receivePackHandoffDeepenedFlowCount    atomic.Uint64
 	receivePackHandoffAdaptiveMaxDepth     atomic.Uint64
 	receivePackHandoffAdaptiveMaxByteCount atomic.Uint64
+	h1PackCountLimitRefusalCount           atomic.Uint64
+	h1PackLocalByteLimitRefusalCount       atomic.Uint64
 	receiveQueueDropCount                  atomic.Uint64
 	receiveQueueDropByteCount              atomic.Uint64
 	receiveQueueEvictionCount              atomic.Uint64
@@ -2678,11 +2691,15 @@ func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 		ForgedSourceDropCount:                  self.receiveForgedSourceDropCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
+		PackHandoffDecodeOwnerRefusalCount:     self.receivePackDecodeOwnerRefusalCount.Load(),
+		PackHandoffFinalRefusalCount:           self.receivePackFinalRefusalCount.Load(),
 		PackHandoffWaitCount:                   self.receivePackHandoffWaitCount.Load(),
 		PackHandoffWaitSuccess:                 self.receivePackHandoffWaitSuccess.Load(),
 		PackHandoffMaxCount:                    self.receivePackHandoffMaxCount.Load(),
 		PackHandoffMaxByteCount:                self.receivePackHandoffMaxByteCount.Load(),
 		PackHandoffSaturationCount:             self.receivePackHandoffSaturationCount.Load(),
+		H1PackCountLimitRefusalCount:           self.h1PackCountLimitRefusalCount.Load(),
+		H1PackLocalByteLimitRefusalCount:       self.h1PackLocalByteLimitRefusalCount.Load(),
 		PackHandoffDepthGrowCount:              self.receivePackHandoffDepthGrowCount.Load(),
 		PackHandoffDeepenedFlows:               self.receivePackHandoffDeepenedFlowCount.Load(),
 		PackHandoffAdaptiveMaxDepth:            self.receivePackHandoffAdaptiveMaxDepth.Load(),
@@ -4745,6 +4762,10 @@ func (self *Client) run() {
 		// the only source the delivering route vouches for, zero when it
 		// binds none (TransferCarrierProperties.boundSourceId)
 		var boundSourceId Id
+		var carrier *receivePackCarrier
+		var forwardingLane *streamForwardingReceiveLane
+		var forwardingAssociation *streamForwardingAssociation
+		var forwardingClass byte
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4757,6 +4778,8 @@ func (self *Client) run() {
 				receiveWireLimit = disposition.maxMessageByteCount
 				h1ReceiveCredit = disposition.h1Credit
 				boundSourceId = disposition.boundSourceId
+				carrier = disposition.receivePackCarrier
+				forwardingLane = disposition.forwardingReceive
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
@@ -4780,6 +4803,23 @@ func (self *Client) run() {
 			continue
 		}
 
+		if transportType == TransportTypeP2p && boundSourceId != (Id{}) && forwardingLane != nil && hasStreamForwardingTrailer(transferFrameBytes) {
+			inner, association, class, verified := forwardingLane.open(transferFrameBytes, self.clientId, boundSourceId)
+			if verified {
+				transferFrameBytes = inner
+				forwardingAssociation, forwardingClass = association, class
+				boundSourceId = association.receivePath.SourceId
+			} else {
+				// A direct adjacent peer's ordinary payload can coincidentally end in
+				// the fixed marker. It retains only its original route attribution.
+				plainPath, present, valid := parseFilteredTransferPath(transferFrameBytes)
+				if !valid || !present || plainPath.SourceId != boundSourceId {
+					self.receiveForgedSourceDropCount.Add(1)
+					MessagePoolReturn(transferFrameBytes)
+					continue
+				}
+			}
+		}
 		// Capture local ingress before decode, application handoff, and ACK compression.
 		receivedAtNanos := self.feedbackTimeNanos(time.Now())
 		progressObserver := self.settings.ReceiveBufferSettings.ProgressObserver
@@ -4919,7 +4959,7 @@ func (self *Client) run() {
 					// timeout path). See EncryptedControlUnknownWrapNack. Only
 					// an authenticated source may have a session created for
 					// it; any other is nacked through a session it already has.
-					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && !errors.Is(err, errInboundKeyHistoryBlocked) {
+					if senderRole, ok := sequenceTlsRoleFromProtobuf(transferFrame.GetSessionRole()); ok && forwardingAssociation == nil && !errors.Is(err, errInboundKeyHistoryBlocked) {
 						nackCompanion := false
 						if transferFrame.SessionCompanion != nil {
 							nackCompanion = *transferFrame.SessionCompanion
@@ -4930,6 +4970,20 @@ func (self *Client) run() {
 					MessagePoolReturn(transferFrameBytes)
 					inboundDecodedTransferFrames.put(decodedFrame)
 					continue
+				}
+				if forwardingAssociation != nil && forwardingClass == streamForwardingWrap {
+					innerClass, reciprocal := forwardingAssociation.classifyFrame(
+						unwrappedTransferFrameBytes, forwardingAssociation.receivePath, nil)
+					if innerClass != streamForwardingPack && innerClass != streamForwardingAck ||
+						!forwardingAssociation.currentReciprocal(reciprocal) {
+						MessagePoolReturn(unwrappedTransferFrameBytes)
+						MessagePoolReturn(transferFrameBytes)
+						inboundDecodedTransferFrames.put(decodedFrame)
+						continue
+					}
+					if innerClass == streamForwardingPack && reciprocal != nil {
+						reciprocal.peerConfirmed.Store(true)
+					}
 				}
 				receiveRole = decryptRole
 				receiveCompanion = decryptCompanion
@@ -5074,6 +5128,7 @@ func (self *Client) run() {
 						source.SourceId,
 						receiveAck,
 						0,
+						streamForwardingIngress(path, carrier, ack)...,
 					)
 					self.recordReceiveAckHandoff(result)
 					if progressObserver != nil {
@@ -5185,6 +5240,12 @@ func (self *Client) run() {
 				}
 				messageByteCount := MessageByteCount(pack.Frames)
 				decodedOwner := decodedFrame.detachPackOwner()
+				// The ordinary V2 and paid legacy decoders already own this
+				// object. Legacy optional grants also retain their exact carrier.
+				if decodedOwner == nil && carrier != nil && carrier.provenance != nil &&
+					!pack.Nack && pack.ContractFrame != nil {
+					decodedOwner = inboundDecodedPackOwners.take()
+				}
 				c := func() bool {
 					var receivePack *ReceivePack
 					if decodedOwner != nil {
@@ -5221,7 +5282,7 @@ func (self *Client) run() {
 					*receivePack = ReceivePack{
 						receiveMemoryOwned: paid,
 						ingressSequence:    ingress, ingressNext: next, ingressLoanByteCount: loan,
-						carrierDone:              h1ReceiveCredit.done,
+						carrier:                  carrier,
 						receivedAtNanos:          receivedAtNanos,
 						sequenceQueueByteCount:   encodedByteCount,
 						Source:                   source,
@@ -5260,6 +5321,7 @@ func (self *Client) run() {
 					if !success {
 						receivePack.sequenceQueueByteCount = 0
 						if err == nil {
+							self.receivePackFinalRefusalCount.Add(1)
 							self.recordReceivePackHandoffDrop(messageByteCount)
 						}
 						if hook := self.settings.ReceiveBufferSettings.receiveOwnerStageForTest; hook != nil {
@@ -6935,6 +6997,7 @@ func (self *SendBuffer) ackMessageDetailed(
 	destinationId Id,
 	ack receiveAckMessage,
 	timeout time.Duration,
+	forwarding ...streamForwardingAckIngress,
 ) receiveAckHandoffResult {
 	self.mutex.Lock()
 	sequence := self.sendSequencesBySequenceId[ack.sequenceId]
@@ -6948,7 +7011,7 @@ func (self *SendBuffer) ackMessageDetailed(
 		}
 		return receiveAckHandoffSequenceMissing
 	}
-	result, _ := sequence.ackMessageDetailed(ack, timeout)
+	result, _ := sequence.ackMessageDetailed(ack, timeout, forwarding...)
 	return result
 }
 
@@ -7434,8 +7497,9 @@ type SendSequence struct {
 	preparedContractByteCount atomic.Int64
 	// Published by Run after each route-policy snapshot so concurrent Pack
 	// callers never read the goroutine-owned multi-route writer directly.
-	flowIsolation atomic.Bool
-	ackMutex      sync.Mutex
+	flowIsolation   atomic.Bool
+	ackMutex        sync.Mutex
+	forwardingOffer atomic.Pointer[streamForwardingOffer]
 	// Explicit legacy owners may supply a queue. Constructor-owned ACKs
 	// coalesce directly into ackWindow and leave this channel nil.
 	acks chan receiveAckMessage
@@ -8599,6 +8663,7 @@ func (self *SendSequence) ackMessage(
 func (self *SendSequence) ackMessageDetailed(
 	ack receiveAckMessage,
 	timeout time.Duration,
+	forwarding ...streamForwardingAckIngress,
 ) (receiveAckHandoffResult, error) {
 	ack.receivedAtNanos = self.client.feedbackArrivalNanos(time.Now())
 	if timeout == 0 {
@@ -8630,7 +8695,7 @@ func (self *SendSequence) ackMessageDetailed(
 	// when an ACK worker is descheduled after dequeue. Publish exactly once;
 	// retaining a second channel copy would duplicate RTT/service accounting.
 	if self.ackWindow != nil && self.resendQueue != nil {
-		self.coalesceAcceptedAck(ack)
+		self.coalesceAcceptedAck(ack, forwarding...)
 		return receiveAckHandoffAccepted, nil
 	}
 
@@ -8674,7 +8739,7 @@ func (self *SendSequence) ackMessageDetailed(
 
 // Contain a processing panic to this sequence, as the compatibility ACK worker
 // does. The existing admission lock joins this publisher during teardown.
-func (self *SendSequence) coalesceAcceptedAck(ack receiveAckMessage) {
+func (self *SendSequence) coalesceAcceptedAck(ack receiveAckMessage, forwarding ...streamForwardingAckIngress) {
 	HandleError(func() {
 		completed := false
 		defer func() {
@@ -8685,7 +8750,7 @@ func (self *SendSequence) coalesceAcceptedAck(ack receiveAckMessage) {
 				self.cancel()
 			}
 		}()
-		self.coalesceReceivedAck(self.ackWindow, ack)
+		self.coalesceReceivedAck(self.ackWindow, ack, forwarding...)
 		completed = true
 	})
 }
@@ -8715,6 +8780,7 @@ func (self *SendSequence) observeContractAheadCapability(ack receiveAckMessage) 
 func (self *SendSequence) coalesceReceivedAck(
 	ackWindow *sequenceAckWindow,
 	ack receiveAckMessage,
+	forwarding ...streamForwardingAckIngress,
 ) {
 	var progressObserver func(TransferProgressEvent)
 	var progress TransferProgressEvent
@@ -8733,6 +8799,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		sequenceNumber, ok = self.resolveImmediateAckSequenceNumber(ack)
 	}
 	if !ok {
+		self.acceptStreamForwardingAck(ack, sequenceNumber, false, forwarding)
 		self.publishEvictionFeedback(ackWindow, ack)
 		if ackLineageTraceEnabled && progressObserver != nil {
 			progress.Outcome = "message_not_retained"
@@ -8743,6 +8810,7 @@ func (self *SendSequence) coalesceReceivedAck(
 	if ack.immediateSequenceNumberSet && ack.immediateSequenceNumber != sequenceNumber {
 		return
 	}
+	self.acceptStreamForwardingAck(ack, sequenceNumber, true, forwarding)
 	if ackLineageTraceEnabled && progressObserver != nil {
 		progress.SequenceNumber = sequenceNumber
 	}
@@ -9775,7 +9843,7 @@ func (self *SendSequence) writeNoAckFastPath(
 	}
 	messagePoolMarkSmallUnordered(wireBytes)
 	shared := MessagePoolShareReadOnly(wireBytes)
-	disposition, err := writeMultiRouteWithCarrier(snapshot.writer, self.ctx, shared, 0, false)
+	disposition, err := writeMultiRouteWithCarrier(snapshot.writer, self.ctx, shared, 0, false, streamForwardingWrite{inner: transferFrameBytes, contractId: snapshot.contractId})
 	if err != nil {
 		// no route consumer took the message, so ownership stays here
 		MessagePoolReturn(shared)
@@ -12780,6 +12848,17 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 	if (setContract || aheadContract != nil || contractFrameDue ||
 		head && !compactContractHead) && frameContract != nil {
 		contractMessageBytes, _ = ProtoMarshal(frameContract.contract)
+		if ack && aheadContract == nil {
+			if offer := self.streamForwardingIntroduction(frameContract, messageId, sequenceNumber, sendTime); offer != nil {
+				if !offer.grant.reciprocal || self.reciprocalOfferFitsH1(sendFrames, len(contractMessageBytes)) {
+					withOffer := appendStreamForwardingOffer(contractMessageBytes, offer.wire[:])
+					MessagePoolReturn(contractMessageBytes)
+					contractMessageBytes = withOffer
+				} else {
+					self.forwardingOffer.CompareAndSwap(offer, nil)
+				}
+			}
+		}
 		contractFrame = &protocol.Frame{
 			MessageType:  protocol.MessageType_TransferContract,
 			MessageBytes: contractMessageBytes,
@@ -14858,6 +14937,10 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	reliableOnly = reliableOnlyRequested || self.reliableOnlyWrite(policy)
 	// Takes the share on success. A lifetime wake that received valid feedback
 	// retries the same unconsumed share within the original writer time budget.
+	forwarding := streamForwardingWrite{inner: transferFrameBytes}
+	if item != nil {
+		forwarding.contractId = item.contractId
+	}
 	writeWithLifetime := func(bytes []byte) (transferWriteDisposition, error) {
 		observed := false
 		timingStarted, timingWithdrawn := false, false
@@ -14980,7 +15063,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// afterward belongs to the original delivery, not preflight.
 			if routePolicyEnabled {
 				var success bool
-				success, disposition, writeErr = policyWriter.writeDetailedWithPolicyGeneration(self.ctx, bytes, timeout, reliableOnly, policy.generation, commitDispatch)
+				success, disposition, writeErr = policyWriter.writeDetailedWithRoutePolicyGeneration(self.ctx, bytes, timeout, TransportTypeUnknown, reliableOnly, policy.generation, true, commitDispatch, forwarding)
 				if errors.Is(writeErr, errTransferRoutePolicyChanged) {
 					// The same share, reservation and absolute timeout survive.
 					// No lifecycle outcome is published for an unconsumed policy.
@@ -15009,7 +15092,7 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 				// Opaque/custom writers retain their existing observation and
 				// pacing behavior; they cannot grant a route-aware bypass.
 				commitDispatch()
-				disposition, writeErr = writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly)
+				disposition, writeErr = writeMultiRouteWithCarrier(writer, self.ctx, bytes, timeout, reliableOnly, forwarding)
 			}
 			policyRecheck = false
 			if localWritePending {
@@ -15187,67 +15270,41 @@ func (self *SendSequence) observeTransferWireMessage(
 	)
 }
 
+// Local writers retain the native plaintext through this synchronous call.
+// Custom writers continue to receive their original wire and selection policy.
 func writeMultiRouteWithCarrier(
 	writer MultiRouteWriter,
 	ctx context.Context,
 	transferFrameBytes []byte,
 	timeout time.Duration,
 	reliableOnly bool,
+	forwarding streamForwardingWrite,
 ) (transferWriteDisposition, error) {
-	if reliableOnly {
-		if reliableWriter, ok := writer.(transferReliableOnlyMultiRouteWriter); ok {
-			success, disposition, err := reliableWriter.writeDetailedReliableOnly(
-				ctx,
-				transferFrameBytes,
-				timeout,
-			)
-			if err != nil {
-				return transferWriteDisposition{}, err
-			}
-			if !success {
-				return transferWriteDisposition{}, errTransferRouteWriteTimeout
-			}
-			if disposition.transportType == "" {
-				disposition.transportType = TransportTypeUnknown
-			}
-			return disposition, nil
-		}
+	var success bool
+	var disposition transferWriteDisposition
+	var err error
+	if selector, ok := writer.(*MultiRouteSelector); ok {
+		success, disposition, err = selector.writeDetailedWithRoutePolicyGeneration(ctx, transferFrameBytes,
+			timeout, TransportTypeUnknown, reliableOnly, 0, false, nil, forwarding)
+	} else if reliable, ok := writer.(transferReliableOnlyMultiRouteWriter); reliableOnly && ok {
+		success, disposition, err = reliable.writeDetailedReliableOnly(ctx, transferFrameBytes, timeout)
+	} else if carrier, ok := writer.(transferCarrierMultiRouteWriter); ok {
+		success, disposition, err = carrier.writeDetailedWithCarrier(ctx, transferFrameBytes, timeout)
+	} else if typed, ok := writer.(TransportMultiRouteWriter); ok {
+		success, disposition.transportType, err = typed.WriteDetailedWithTransport(ctx, transferFrameBytes, timeout)
+	} else {
+		return transferWriteDisposition{transportType: TransportTypeUnknown}, writer.Write(ctx, transferFrameBytes, timeout)
 	}
-	if carrierWriter, ok := writer.(transferCarrierMultiRouteWriter); ok {
-		success, disposition, err := carrierWriter.writeDetailedWithCarrier(
-			ctx,
-			transferFrameBytes,
-			timeout,
-		)
-		if err != nil {
-			return transferWriteDisposition{}, err
-		}
-		if !success {
-			return transferWriteDisposition{}, errTransferRouteWriteTimeout
-		}
-		if disposition.transportType == "" {
-			disposition.transportType = TransportTypeUnknown
-		}
-		return disposition, nil
+	if err != nil {
+		return transferWriteDisposition{}, err
 	}
-	if transportWriter, ok := writer.(TransportMultiRouteWriter); ok {
-		success, transportType, err := transportWriter.WriteDetailedWithTransport(
-			ctx,
-			transferFrameBytes,
-			timeout,
-		)
-		if err != nil {
-			return transferWriteDisposition{}, err
-		}
-		if !success {
-			return transferWriteDisposition{}, errTransferRouteWriteTimeout
-		}
-		if transportType == "" {
-			transportType = TransportTypeUnknown
-		}
-		return transferWriteDisposition{transportType: transportType}, nil
+	if !success {
+		return transferWriteDisposition{}, errTransferRouteWriteTimeout
 	}
-	return transferWriteDisposition{transportType: TransportTypeUnknown}, writer.Write(ctx, transferFrameBytes, timeout)
+	if disposition.transportType == "" {
+		disposition.transportType = TransportTypeUnknown
+	}
+	return disposition, nil
 }
 
 // verifyPeerCertAgainstContract checks (and caches) that the peer's TLS cert
@@ -16185,7 +16242,7 @@ func (self *ReceiveBuffer) removeReceiveSequenceWithLock(
 
 func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration) (bool, error) {
 	select {
-	case <-receivePack.carrierDone:
+	case <-receivePack.carrierDone():
 		return false, errors.New("receive carrier closed")
 	default:
 	}
@@ -16229,7 +16286,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 			// Physical cancellation is not a logical generation update. Check
 			// again under the head lock before creating or superseding work.
 			select {
-			case <-receivePack.carrierDone:
+			case <-receivePack.carrierDone():
 				self.mutex.Unlock()
 				receivePack.messagePoolReturn()
 				return nil
@@ -16291,7 +16348,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				}
 				select {
 				case <-receiveSequence.exit:
-				case <-receivePack.carrierDone:
+				case <-receivePack.carrierDone():
 					receivePack.messagePoolReturn()
 					return nil
 				}
@@ -16360,7 +16417,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				// can keep finding and creating their sequences.
 				select {
 				case <-headReceiveSequence.exit:
-				case <-receivePack.carrierDone:
+				case <-receivePack.carrierDone():
 					receivePack.messagePoolReturn()
 					return nil
 				}
@@ -16429,7 +16486,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	var err error
 	for i := 0; i < 2; i += 1 {
 		select {
-		case <-receivePack.carrierDone:
+		case <-receivePack.carrierDone():
 			return false, errors.New("receive carrier closed")
 		case <-self.ctx.Done():
 			return false, errors.New("Done.")
@@ -16679,6 +16736,7 @@ type ReceiveSequence struct {
 
 	openReceiveContracts      map[Id]*sequenceContract
 	receiveContract           *sequenceContract
+	forwardingAnswer          atomic.Pointer[streamForwardingAnswer]
 	contractWriterAlias       TransferPath
 	removeContractWriterAlias func()
 	// the owning buffer's index of open contracts by holding sequence; nil
@@ -17110,7 +17168,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	if timeout == 0 {
 		if !self.packMutex.TryLock() {
 			select {
-			case <-receivePack.carrierDone:
+			case <-receivePack.carrierDone():
 				return false, errors.New("receive carrier closed")
 			case <-self.ctx.Done():
 				return false, errors.New("Done.")
@@ -17124,7 +17182,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	defer self.packMutex.Unlock()
 
 	select {
-	case <-receivePack.carrierDone:
+	case <-receivePack.carrierDone():
 		return false, errors.New("receive carrier closed")
 	case <-self.ctx.Done():
 		return false, errors.New("Done.")
@@ -17222,6 +17280,9 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 					countLimit = self.packQueueH1Limit
 					continue
 				}
+				if timeout == 0 && receivePack.TransportType == TransportTypeH1 {
+					self.client.h1PackCountLimitRefusalCount.Add(1)
+				}
 				return false
 			}
 			if self.packQueueCount.CompareAndSwap(current, current+1) {
@@ -17252,6 +17313,9 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 					continue
 				}
 				self.packQueueCount.Add(-1)
+				if timeout == 0 && receivePack.TransportType == TransportTypeH1 {
+					self.client.h1PackLocalByteLimitRefusalCount.Add(1)
+				}
 				return false
 			}
 			if self.packQueueByteCount.CompareAndSwap(current, current+byteCount) {
@@ -17331,7 +17395,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 			packQueueSpace, budgetReady = nil, budgetWaiter.ready
 		}
 		select {
-		case <-receivePack.carrierDone:
+		case <-receivePack.carrierDone():
 			stopTimer()
 			abandonBudgetWait()
 			return false, errors.New("receive carrier closed")
@@ -17350,7 +17414,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 		}
 	}
 	select {
-	case <-receivePack.carrierDone:
+	case <-receivePack.carrierDone():
 		stopTimer()
 		release()
 		return false, errors.New("receive carrier closed")
@@ -17555,6 +17619,7 @@ func (self *ReceiveSequence) Run() {
 		}
 
 		writeAck := func(sendAck sequenceAck, evictedSequenceNumbers []uint64) error {
+			forwardingAcceptance := self.streamForwardingDeliveryAcceptance(sendAck)
 			path := sendTransferPath(self.client.ClientId(), ackDestination)
 			ackCompressMicros := uint32(min(max(0, self.receiveBufferSettings.AckCompressTimeout.Microseconds()), math.MaxUint32))
 			advertiseAckTiming := !self.receiveBufferSettings.SuppressAckTimingAdvertisement
@@ -17595,6 +17660,7 @@ func (self *ReceiveSequence) Run() {
 					receiverAckDelayMicros:     receiverDelayMicros,
 					receiverAckDelaySet:        receiverDelaySet,
 					evictedSequenceNumbers:     evictedSequenceNumbers,
+					streamForwardingAcceptance: forwardingAcceptance,
 				}
 				if sendAck.contractMissing {
 					saf.missingContractId = &sendAck.missingContractId
@@ -17602,14 +17668,15 @@ func (self *ReceiveSequence) Run() {
 				transferFrameBytes = marshalSendAckTransferFrame(&saf)
 			} else {
 				ack := &protocol.Ack{
-					MessageId:               sendAck.messageId.Bytes(),
-					SequenceId:              self.sequenceId.Bytes(),
-					Selective:               sendAck.selective,
-					DeliveredImmediately:    sendAck.deliveredImmediately,
-					Tag:                     sendAck.tag.protocol(),
-					CompactContractRecovery: sendAck.compactContractRecoverySupported,
-					ContractAhead:           self.receiveBufferSettings.AcceptContractAhead,
-					LogicalLaneVersion:      transferLogicalLaneVersion,
+					MessageId:                  sendAck.messageId.Bytes(),
+					SequenceId:                 self.sequenceId.Bytes(),
+					Selective:                  sendAck.selective,
+					DeliveredImmediately:       sendAck.deliveredImmediately,
+					Tag:                        sendAck.tag.protocol(),
+					CompactContractRecovery:    sendAck.compactContractRecoverySupported,
+					ContractAhead:              self.receiveBufferSettings.AcceptContractAhead,
+					LogicalLaneVersion:         transferLogicalLaneVersion,
+					StreamForwardingAcceptance: forwardingAcceptance,
 				}
 				if sendAck.immediateSequenceNumberSet {
 					ordinal := sendAck.immediateSequenceNumber
@@ -17675,12 +17742,14 @@ func (self *ReceiveSequence) Run() {
 						var success bool
 						if sendAck.transportType == TransportTypeUnknown {
 							// The same generic policy as Write, retaining its disposition.
-							success, disposition, writeErr = selector.writeDetailedWithCarrier(
-								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout,
+							success, disposition, writeErr = selector.writeDetailedWithRoutePolicyGeneration(
+								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout, TransportTypeUnknown,
+								false, 0, false, nil, streamForwardingWrite{inner: transferFrameBytes},
 							)
 						} else {
 							success, disposition, writeErr = selector.writeDetailedReplyWithCarrierPreference(
 								ackWriteCtx, shared, self.receiveBufferSettings.WriteTimeout, sendAck.transportType,
+								streamForwardingWrite{inner: transferFrameBytes},
 							)
 						}
 						if sendAck.transportType != TransportTypeUnknown {
@@ -19548,6 +19617,7 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		})
 		return err
 	}
+	self.noteStreamForwardingIntroduction(item, nextReceiveContract, contract.StreamForwardingOffer)
 	verifiedStreamId := receiveContractStreamId(
 		self.source,
 		self.client.ClientId(),

@@ -2,7 +2,9 @@
 package connect_test
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
@@ -24,6 +26,30 @@ func installSmallGroupCountReceiver(client *connect.Client, receive func(connect
 		}
 		receive(peer, packets, valid)
 	})
+}
+
+// Submit one reverse application TCP ACK and report each exact peer delivery.
+func sendSmallGroupReverseTcpAck(from, to *connect.Client, packet []byte, delivered func(), ack connect.AckFunction) bool {
+	to.AddReceiveCallback(func(source connect.TransferPath, frames []*protocol.Frame, peer connect.Peer) {
+		if source.SourceId == from.ClientId() && peer.TransferKey.LogicalLane == 2 {
+			for _, frame := range frames {
+				if frame.GetMessageType() == protocol.MessageType_IpIpPacketToProvider && frame.GetRaw() && bytes.Equal(frame.GetMessageBytes(), packet) {
+					delivered()
+				}
+			}
+		}
+	})
+	frame := &protocol.Frame{MessageType: protocol.MessageType_IpIpPacketToProvider, Raw: true, MessageBytes: connect.MessagePoolCopy(packet)}
+	if from.SendMultiWithTimeout([]*protocol.Frame{frame}, to.ClientId(), ack, time.Second, connect.TransferKey{LogicalLane: 2}) {
+		return true
+	}
+	connect.MessagePoolReturn(frame.MessageBytes)
+	return false
+}
+
+// A full 32 MiB H1 queue preserves reverse control and natural DATA recovery.
+func TestSharedPumpSmallH1Groups32FixedCountRefusesAndRecovers(t *testing.T) {
+	connect.RunSmallGroupFixedCountFixture(t, installSmallGroupCountReceiver, sendSmallGroupReverseTcpAck)
 }
 
 // A paused 32 MiB consumer uses its one configured finite growth step.

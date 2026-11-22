@@ -192,10 +192,11 @@ const maxRejectedStreamOpens = 32
 type rejectedStreamOpen struct {
 	sourceId      *Id
 	destinationId *Id
+	forwarding    bool
 	rejectTime    time.Time
 }
 
-func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId *Id, streamId Id) {
+func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId *Id, streamId Id, forwarding bool) {
 	self.rejectedStreamsLock.Lock()
 	defer self.rejectedStreamsLock.Unlock()
 
@@ -221,6 +222,7 @@ func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId 
 	self.rejectedStreams[streamId] = &rejectedStreamOpen{
 		sourceId:      sourceId,
 		destinationId: destinationId,
+		forwarding:    forwarding,
 		rejectTime:    time.Now(),
 	}
 }
@@ -275,10 +277,11 @@ func (self *StreamManager) reconsiderRejectedStreamOpens() {
 			)
 		}
 		self.withStreamAuthorization(p.streamId, func() {
-			if _, err := self.streamBuffer.OpenStream(
+			if _, err := self.streamBuffer.openStream(
 				p.rejected.sourceId,
 				p.rejected.destinationId,
 				p.streamId,
+				p.rejected.forwarding,
 			); err != nil {
 				self.client.log.Infof(
 					"[sm]%s reconsider s(%s) open err = %s\n",
@@ -401,7 +404,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 						// Retained so the first verified Network contract or peer
 						// update from this identity can reconsider it. The proof
 						// can legitimately arrive after the StreamOpen.
-						self.retainRejectedStreamOpen(sourceId, destinationId, streamId)
+						self.retainRejectedStreamOpen(sourceId, destinationId, streamId, v.GetPathHasIntermediaries())
 						logged := false
 						self.rejectedStreamLogOnce.Do(func() {
 							logged = true
@@ -429,7 +432,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					if self.client.log.V(1).Enabled() {
 						self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
 					}
-					_, err := self.streamBuffer.OpenStream(sourceId, destinationId, streamId)
+					_, err := self.streamBuffer.openStream(sourceId, destinationId, streamId, v.GetPathHasIntermediaries())
 					return err
 				})
 			}
@@ -551,6 +554,7 @@ type streamOpenRequest struct {
 	destinationId *Id
 	streamId      Id
 	generation    uint64
+	forwarding    bool
 }
 
 // streamLifecycleSnapshot captures one managed request or live sequence for a
@@ -589,16 +593,18 @@ type StreamBuffer struct {
 	// Lifecycle code that needs both locks takes managementStateLock before
 	// mutex. It never invokes RouteManager or another component while either
 	// state lock is held.
-	managementStateLock       sync.Mutex
-	closed                    bool
-	managedOpenRequests       map[Id]*streamOpenRequest
-	pendingOpenRequests       map[Id]*streamOpenRequest
-	openWorkers               map[Id]bool
-	openWorkerAdmission       *lifecycleAdmission
-	sequenceWorkerAdmission   *lifecycleAdmission
-	mutex                     sync.Mutex
-	streamSequences           map[streamSequenceId]*StreamSequence
-	streamSequencesByStreamId map[Id]*StreamSequence
+	managementStateLock          sync.Mutex
+	closed                       bool
+	managedOpenRequests          map[Id]*streamOpenRequest
+	pendingOpenRequests          map[Id]*streamOpenRequest
+	openWorkers                  map[Id]bool
+	openWorkerAdmission          *lifecycleAdmission
+	sequenceWorkerAdmission      *lifecycleAdmission
+	mutex                        sync.Mutex
+	streamSequences              map[streamSequenceId]*StreamSequence
+	streamSequencesByStreamId    map[Id]*StreamSequence
+	pendingForwardingEnrollments map[Id]streamForwardingEnrollment
+	pendingReciprocalEnrollments map[Id]streamForwardingEnrollment
 
 	// Tests use this hook to stall old-generation teardown before its owned
 	// join, without changing production lifecycle behavior.
@@ -705,6 +711,11 @@ func (self *StreamBuffer) ResetStreams(keep map[streamSequenceId]bool) {
 // older same-id generation to finish. One bounded worker per active stream id
 // preserves same-id order without head-of-line blocking unrelated streams.
 func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId Id) (bool, error) {
+	return self.openStream(sourceId, destinationId, streamId, false)
+}
+
+// Only an authorized StreamOpen can require forwarding readiness.
+func (self *StreamBuffer) openStream(sourceId *Id, destinationId *Id, streamId Id, forwarding bool) (bool, error) {
 	select {
 	case <-self.ctx.Done():
 		return false, errors.New("Done.")
@@ -715,6 +726,7 @@ func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId I
 		sourceId:      cloneOptionalId(sourceId),
 		destinationId: cloneOptionalId(destinationId),
 		streamId:      streamId,
+		forwarding:    forwarding && (sourceId == nil) != (destinationId == nil),
 	}
 
 	// Reject obvious saturation before allocating a RouteManager generation.
@@ -976,7 +988,8 @@ func (self *StreamBuffer) prepareOpenRequest(
 	}
 	self.mutex.Lock()
 	streamSequence = self.streamSequences[streamSequenceId]
-	if streamSequence != nil && streamSequence != skipped {
+	if streamSequence != nil && streamSequence != skipped &&
+		(streamSequence.forwarding != nil) == request.forwarding {
 		self.mutex.Unlock()
 		self.managementStateLock.Unlock()
 		return streamSequence, nil, true
@@ -1005,6 +1018,9 @@ func (self *StreamBuffer) prepareOpenRequest(
 		request.streamId,
 		self.streamBufferSettings,
 	)
+	if request.forwarding {
+		streamSequence.forwarding = &streamForwardingBinding{readiness: newP2pStreamReadiness(streamSequence.ctx)}
+	}
 	if self.configureStreamSequenceForTest != nil {
 		self.configureStreamSequenceForTest(streamSequence)
 	}
@@ -1048,6 +1064,13 @@ func (self *StreamBuffer) prepareOpenRequest(
 	}
 	self.streamSequences[streamSequenceId] = streamSequence
 	self.streamSequencesByStreamId[request.streamId] = streamSequence
+	if enrollment, ok := self.pendingForwardingEnrollments[request.streamId]; ok {
+		delete(self.pendingForwardingEnrollments, request.streamId)
+		self.bindForwardingPrimary(streamSequence, enrollment)
+	}
+	if streamSequence.forwarding == nil {
+		delete(self.pendingReciprocalEnrollments, request.streamId)
+	}
 	self.mutex.Unlock()
 	self.managementStateLock.Unlock()
 	if self.afterStreamSequencePublishForTest != nil {
@@ -1084,6 +1107,10 @@ func (self *StreamBuffer) Close() {
 	}
 	clear(self.managedOpenRequests)
 	clear(self.pendingOpenRequests)
+	self.mutex.Lock()
+	clear(self.pendingForwardingEnrollments)
+	clear(self.pendingReciprocalEnrollments)
+	self.mutex.Unlock()
 	self.managementStateLock.Unlock()
 
 	self.openWorkerAdmission.close()
@@ -1216,6 +1243,10 @@ func (self *StreamBuffer) removeStreamSequenceWithLock(streamSequence *StreamSeq
 // CloseStream orders an authoritative epoch, clears aliases, and cancels old
 // generations without joining their Run workers.
 func (self *StreamBuffer) CloseStream(streamId Id) {
+	self.mutex.Lock()
+	delete(self.pendingForwardingEnrollments, streamId)
+	delete(self.pendingReciprocalEnrollments, streamId)
+	self.mutex.Unlock()
 	closeGeneration := self.streamManager.Client().
 		RouteManager().
 		writerStreamAliasGenerationCheckpoint()
@@ -1325,6 +1356,7 @@ type StreamSequence struct {
 	streamManager *StreamManager
 
 	streamBufferSettings *StreamBufferSettings
+	forwarding           *streamForwardingBinding
 
 	sourceId      *Id
 	destinationId *Id
@@ -1520,7 +1552,7 @@ func (self *StreamSequence) Run() {
 		var endpointTransport *P2pTransport
 
 		if self.sourceId != nil {
-			endpointTransport = newP2pTransport(
+			endpointTransport = newP2pTransportWithForwarding(
 				self.ctx,
 				self.streamManager.Client(),
 				self.streamManager.WebRtcManager(),
@@ -1531,9 +1563,10 @@ func (self *StreamSequence) Run() {
 				PeerTypeSource,
 				self.streamBufferSettings.P2pTransportSettings,
 				true,
+				self.forwarding,
 			)
 		} else if self.destinationId != nil {
-			endpointTransport = newP2pTransport(
+			endpointTransport = newP2pTransportWithForwarding(
 				self.ctx,
 				self.streamManager.Client(),
 				self.streamManager.WebRtcManager(),
@@ -1544,6 +1577,7 @@ func (self *StreamSequence) Run() {
 				PeerTypeDestination,
 				self.streamBufferSettings.P2pTransportSettings,
 				true,
+				self.forwarding,
 			)
 		} else {
 			// the stream must have one of source or destination
@@ -1648,10 +1682,7 @@ func (self *StreamSequence) Run() {
 		}
 	}
 
-	select {
-	case <-self.ctx.Done():
-		return
-	}
+	self.waitForRetirement()
 }
 
 // Cancel requests teardown without waiting for transport workers. Receive

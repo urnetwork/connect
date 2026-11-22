@@ -348,6 +348,14 @@ func TestDetectBlackholeParksAfterSendsLeaveItsWindow(t *testing.T) {
 func TestDetectBlackholeJudgesUnansweredConnectPastItsWindow(t *testing.T) {
 	// the shared pools start their workers outside the bubble
 	MessagePoolReturn(MessagePoolGet(1))
+	t.Run("admitted-syn", func(t *testing.T) { testUnansweredConnectVerdictAge(t, false) })
+	t.Run("uplink-restored", func(t *testing.T) { testUnansweredConnectVerdictAge(t, true) })
+}
+
+// The live health loop reports the clock that matured, including the last
+// uplink recovery when the SYN was admitted during a stale interval.
+func testUnansweredConnectVerdictAge(t *testing.T, rebase bool) {
+	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		channel, _, passes, closeChannel := newParkingHealthTestChannel(ctx, cancel)
@@ -361,11 +369,24 @@ func TestDetectBlackholeJudgesUnansweredConnectPastItsWindow(t *testing.T) {
 		channel.reliabilitySettingsFunc = func() *ReliabilitySettings {
 			return reliabilitySettings
 		}
+		var restored time.Time
+		if rebase {
+			restored = time.Now().Add(12 * pollInterval)
+			channel.uplinkGateFunc = func(now time.Time) (bool, time.Time) {
+				if now.Before(restored) {
+					return true, time.Time{}
+				}
+				return false, restored
+			}
+		}
 		done, endTime := startParkingHealthLoop(channel)
 		time.Sleep(10 * pollInterval)
 		synctest.Wait()
 
-		synTime := time.Now()
+		clockStart := time.Now()
+		if rebase {
+			clockStart = restored
+		}
 		// This counter fixture models an admitted SYN, rather than an offer
 		// still waiting for its actual Transfer admission result.
 		channel.addSend(64, healthParkTestPath(1, false))
@@ -376,25 +397,31 @@ func TestDetectBlackholeJudgesUnansweredConnectPastItsWindow(t *testing.T) {
 		window := channel.settings.StatsWindowDuration
 		time.Sleep(window + 2*channel.settings.StatsWindowBucketDuration)
 		synctest.Wait()
-		judged := connectTimeout - time.Since(synTime) - pollInterval
+		judged := connectTimeout - time.Since(clockStart) - pollInterval
 		before := passes.Load()
 		time.Sleep(judged)
 		synctest.Wait()
 		if n, least := passes.Load()-before, int64(judged/pollInterval)-1; n < least {
 			t.Fatalf("the health loop judged %d times over %s with its syn out of the window and unanswered, want at least %d", n, judged, least)
 		}
-		time.Sleep(time.Until(synTime.Add(connectTimeout + pollInterval)))
+		time.Sleep(time.Until(clockStart.Add(connectTimeout + pollInterval)))
 		synctest.Wait()
 		select {
 		case <-done:
 		default:
 			t.Fatalf("an unanswered connect was not convicted within one poll of %s", connectTimeout)
 		}
-		if elapsed := endTime().Sub(synTime); elapsed < connectTimeout || connectTimeout+pollInterval < elapsed {
-			t.Fatalf("the unanswered connect was convicted %s after its syn, want within one poll of %s", elapsed, connectTimeout)
+		elapsed := endTime().Sub(clockStart)
+		if elapsed < connectTimeout || connectTimeout+pollInterval < elapsed {
+			t.Fatalf("the unanswered connect was convicted %s after its evidence clock began, want within one poll of %s", elapsed, connectTimeout)
 		}
-		if err := healthParkTestEndErr(channel); err == nil || !strings.Contains(err.Error(), string(blackholeNoReceiveSyn)) {
+		err := healthParkTestEndErr(channel)
+		if err == nil || !strings.Contains(err.Error(), string(blackholeNoReceiveSyn)) {
 			t.Fatalf("the channel ended with %v, want a no-receive-syn verdict", err)
+		}
+		wantAge := elapsed.Round(time.Millisecond).String()
+		if !strings.Contains(err.Error(), " synAge "+wantAge+" ") {
+			t.Fatalf("unanswered connect verdict has %q, want synAge %s", err, wantAge)
 		}
 	})
 }

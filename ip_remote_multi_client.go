@@ -8989,6 +8989,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			preferHealthyWindows := ipPath.Protocol == IpProtocolTcp && ipPath.Syn && !ipPath.Ack &&
 				!sendPacketGroup.pin.pinned() && !update.receivedInbound.Load()
 			need := flowNeedOf(ipPath)
+			synRetry := sendPacketGroup.isSynRetry()
 			var failedFallback, benchedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
@@ -9002,15 +9003,27 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					// the window's field with the limited window's merged in
 					// (raceField); every filter below runs on the merged field
 					orderedClients := self.raceField(window, need, offerChanged, &limitedOfferChanged)
-					// A destination+port failure is narrower than the
-					// window's rank. Widen across healthy tiers before
-					// filtering so a rejected SMTP endpoint actually gets a
-					// different egress address on its retransmitted SYN.
-					if self.destinationServiceFailurePresent(orderedClients, ipPath) {
+					serviceFailed := self.destinationServiceFailurePresent(orderedClients, ipPath)
+					refusedField := false
+					if synRetry {
+						hadOffer := 0 < len(orderedClients)
+						orderedClients = sendPacketGroup.excludeRefusedSynRetryRemotes(update, orderedClients)
+						refusedField = hadOffer && len(orderedClients) == 0
+					}
+					// A failure of this service is narrower than the window's
+					// rank. A refused paid remote can also exhaust the best tier
+					// after it returns on a new local channel.
+					if refusedField || serviceFailed {
 						if crossed := self.crossTierRaceField(window, need); 0 < len(crossed) {
 							orderedClients = crossed
 						} else if fallback := self.lastResortRaceField(window, need); 0 < len(fallback) {
 							orderedClients = fallback
+						}
+						if synRetry {
+							orderedClients = sendPacketGroup.excludeRefusedSynRetryRemotes(update, orderedClients)
+							if refusedField && sendPacketGroup.pin.pinned() && len(orderedClients) == 0 {
+								return nil
+							}
 						}
 					}
 					benchedField := false
@@ -11464,6 +11477,7 @@ type multiClientChannelUpdate struct {
 	nativeAckSerial  uint64
 	// Last replay invalidation outside the native TCP offer preparation.
 	nativeAckLastUnrelatedSerial uint64
+	nativeAckReplayEvidence      *nativeAckReplayEvidence
 	// openTime and activityTime bound one TCP generation's active lifetime for
 	// the affinity-performance learner; no timer or goroutine is retained per
 	// flow. Construction initializes it, and a same-tuple fresh SYN resets it
@@ -12096,12 +12110,23 @@ func (self *multiClientChannelUpdate) observeTcpControl(
 
 // Source dequeue and winner promotion already hold the generation lock.
 func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpControlObservation, ingress bool) bool {
+	return self.observeTcpControlAtSourceOrderWithLock(control, ingress, 0)
+}
+
+func (self *multiClientChannelUpdate) observeTcpControlAtSourceOrderWithLock(control tcpControlObservation, ingress bool, sourceOrder uint64) bool {
 	if !control.valid || ingress && self.pendingCollapseResetWithLock() {
 		return false
 	}
 
 	if control.rst || control.fin {
-		self.invalidateNativeAckRetryWithLock()
+		if !ingress && sourceOrder != 0 && control.ordinaryLocalFin() {
+			self.advanceNativeAckRetryWithLock(false)
+			if evidence := self.nativeAckReplayEvidence; evidence != nil {
+				evidence.localFinOrder = sourceOrder
+			}
+		} else {
+			self.invalidateNativeAckRetryWithLock()
+		}
 		self.clearSynRetryWithLock()
 	}
 	if control.rst {
@@ -12340,7 +12365,11 @@ func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 	defer self.stateLock.Unlock()
 	// Even a later control refused by collapse cannot leave an older local
 	// window reopening eligible. This does not change the connect clock.
-	self.invalidateNativeAckRetryWithLock()
+	if tcpControlFromIpPath(ipPath).ordinaryLocalFin() {
+		self.advanceNativeAckRetryWithLock(false)
+	} else {
+		self.invalidateNativeAckRetryWithLock()
+	}
 	if !ipPath.Syn || ipPath.Ack {
 		return
 	}
@@ -21591,11 +21620,14 @@ func (self *multiClientChannel) detectBlackhole() {
 						// dsts is the corroborating count read by the
 						// no-receive-ACK verdict.
 						nackSince := windowStats.firstSendNackTime
+						synSince := windowStats.firstSendSynTime
 						switch reason {
 						case blackholeNoSendAck:
 							nackSince = unacknowledgedSendSince(windowStats)
 						case blackholeNoReceiveAck:
 							nackSince = receiveAckOfferSince(windowStats)
+						case blackholeNoReceiveSyn:
+							synSince = rebaseReceiveClock(unansweredConnectSince(windowStats), receiveFreshSince)
 						}
 						self.addError(fmt.Errorf(
 							"Blackhole %s%s (send %d/%dB recv %d/%dB syn %d/%d nackAge %s synAge %s dsts=%d)",
@@ -21608,7 +21640,7 @@ func (self *multiClientChannel) detectBlackhole() {
 							windowStats.sendSynCount,
 							windowStats.receiveSynCount,
 							blackholeAgeString(nackSince),
-							blackholeAgeString(windowStats.firstSendSynTime),
+							blackholeAgeString(synSince),
 							windowStats.receiveAckDestinationCount,
 						))
 						return

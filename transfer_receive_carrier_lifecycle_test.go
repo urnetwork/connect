@@ -119,7 +119,7 @@ func (self *receiveCarrierLifecycleFixture) offer(
 		self.t.Fatalf("marshal synthetic receive Pack: %v", err)
 	}
 	receivePack := &ReceivePack{
-		carrierDone: carrierDone, Source: self.source, SequenceId: sequenceId, Pack: pack,
+		carrier: &receivePackCarrier{done: carrierDone}, Source: self.source, SequenceId: sequenceId, Pack: pack,
 		ReceiveCallback: self.client.receiveCallback, MessageByteCount: ByteCount(len(payload)),
 		TransferFrameBytes: wire, TransportType: TransportTypeH1,
 		Ctx: self.ctx, Unwrapped: true, EncryptionRole: sequenceTlsRoleServer,

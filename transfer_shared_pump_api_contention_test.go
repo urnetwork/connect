@@ -179,7 +179,7 @@ func sharedPumpPackContention(t *testing.T, probeZero bool) {
 				closed := make(chan struct{})
 				close(closed)
 				canceledInput := sharedPumpOwnedPack(t, f, fourth)
-				canceledInput.carrierDone = closed
+				canceledInput.carrier = &receivePackCarrier{done: closed}
 				canceled := start(canceledInput, 0)
 				synctest.Wait()
 				select {

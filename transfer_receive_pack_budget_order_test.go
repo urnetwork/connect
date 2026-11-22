@@ -243,7 +243,7 @@ func TestReceiveSequenceRetiredCarrierLeavesTheBudgetLine(t *testing.T) {
 					MessageByteCount:   packByteCount,
 					TransferFrameBytes: MessagePoolGet(packByteCount),
 					TransportType:      TransportTypeH1,
-					carrierDone:        carrierDone,
+					carrier:            &receivePackCarrier{done: carrierDone},
 				}
 				accepted, err := sequence.Pack(pack, -1)
 				if !accepted {

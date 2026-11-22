@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 	"unsafe"
 
 	"github.com/urnetwork/connect/protocol"
@@ -92,6 +93,104 @@ func TestSynRetryRemoteRefusalSurvivesLocalChannelRetirement(t *testing.T) {
 		if !update.synRetryHasRemoteRefusalWithLock() || !update.synRetryRemoteTailRefusedWithLock(alias) {
 			t.Fatal("SYN_RETRY_RETIRED_REMOTE_REFUSAL_LOST: a fresh local alias erased the same source's actual remote refusal")
 		}
+	})
+}
+
+// A different late provider wakes the paid retry after the original provider
+// returns on a new local channel. The kept refusal still owns the same flow.
+func TestSynRetryPublicationSkipsRefusedRemoteAfterChannelReplacement(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		h := newReraceHarness(t, []reraceExitSpec{
+			{name: "refused", tier: 0, answer: reraceAlways(reraceSignal)},
+		}, func(settings *MultiClientSettings) {
+			settings.WindowSizes[WindowTypeQuality] = WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}
+			settings.StrictWindowSizeHardMax, settings.StandingReserve, settings.EvaluationPoolMultiple = true, false, 1
+			settings.EffectiveTierSelection = false
+		})
+		h.settle()
+		refusedExit := h.exit("refused")
+		old := h.channel("refused")
+		path := reraceFlow(4, 0, 53201)
+		if !h.syn(path) {
+			t.Fatal("original source SYN was refused before reaching the provider")
+		}
+		update := h.update(path)
+		if update == nil {
+			t.Fatal("the original SYN lost its canonical flow update")
+		}
+		owner := synRetryControlOwner(t, update)
+		update.stateLock.Lock()
+		refused := update.synRetryHasRemoteRefusalWithLock() && update.synRetryRemoteTailRefusedWithLock(old) &&
+			update.race == nil && update.client.Load() == nil
+		update.stateLock.Unlock()
+		original := refusedExit.syns(path)
+		if !refused || len(original) != 1 || original[0].source != old.ClientId() || h.metrics().DialFailuresIntercepted != 1 {
+			t.Fatal("original live owner lacks its actual standing provider refusal")
+		}
+
+		window := h.multiClient.windows[WindowTypeQuality]
+		publications := make(chan *multiClientChannel, 2)
+		previous := window.clientAddCallback
+		window.clientAddCallback = func(client *multiClientChannel) {
+			previous(client)
+			select {
+			case publications <- client:
+			default:
+				t.Error("extra quality-window publication during fixed two-channel setup")
+			}
+		}
+		if !h.multiClient.DropExit(old.ClientId()) {
+			t.Fatal("no original channel was retired")
+		}
+		alias, installed := synPublicationTestAwaitInstalled(h.multiClient.ctx, publications, time.Now().Add(time.Minute))
+		if !installed || alias == old || alias.ClientId() == old.ClientId() || alias.Destination() != old.Destination() {
+			t.Fatal("original remote did not return on a distinct local channel")
+		}
+		h.settle()
+		update.stateLock.Lock()
+		refused = update.synRetry == owner && owner.validWithLock(update) && update.synRetryRemoteTailRefusedWithLock(alias) &&
+			update.race == nil && update.client.Load() == nil
+		update.stateLock.Unlock()
+		if h.update(path) != update || !refused || len(refusedExit.syns(path)) != 1 {
+			t.Fatal("alias publication changed the paid owner or sent a SYN before the fresh provider arrived")
+		}
+		need := flowNeedOf(path)
+		if preferred := h.multiClient.raceField(window, need, nil, nil); len(preferred) != 1 || preferred[0] != alias {
+			t.Fatal("replacement channel is not the first exact tier")
+		}
+		if h.multiClient.destinationServiceFailurePresent([]*multiClientChannel{alias}, path) {
+			t.Fatal("the old local channel's failure still masks the retired remote")
+		}
+		var dispatches atomic.Int32
+		h.multiClient.beforeSynRetryDispatchForTest = func(candidate *multiClientChannelUpdate) {
+			if candidate == update {
+				dispatches.Add(1)
+			}
+		}
+
+		freshExit := h.addExit(reraceExitSpec{name: "fresh", tier: 1})
+		window.resizeMonitor.NotifyAll()
+		fresh, installed := synPublicationTestAwaitInstalled(h.multiClient.ctx, publications, time.Now().Add(time.Minute))
+		if !installed || fresh.Destination() != freshExit.destination {
+			t.Fatal("fresh lower-tier provider was not actually published")
+		}
+		h.settle()
+		if dispatches.Load() == 0 || len(h.sentSyns(path)) != 1 {
+			t.Fatal("fresh publication did not wake the original paid retry by itself")
+		}
+
+		if got := len(refusedExit.syns(path)); got != 1 {
+			t.Errorf("SYN_RETRY_REPLAYED_REFUSED_REMOTE: original remote received %d SYNs from one source offer", got)
+		}
+		freshSyns := freshExit.syns(path)
+		if _, ok := h.synAck(path); !ok || h.boundTo(path) != fresh || len(freshSyns) != 1 ||
+			freshSyns[0].source != fresh.ClientId() || freshSyns[0].path.SequenceNumber != path.SequenceNumber ||
+			h.update(path) != update || len(h.delivered(path)) != 1 {
+			t.Error("fresh provider did not carry the original source SYN exactly once and complete the same flow")
+		}
+		reraceAssertNoErrorDelivered(t, h, path)
 	})
 }
 

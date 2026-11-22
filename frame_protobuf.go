@@ -376,6 +376,7 @@ type sendAckFrame struct {
 	deliveredImmediately       bool
 	immediateSequenceNumber    uint64
 	immediateSequenceNumberSet bool
+	streamForwardingAcceptance []byte
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -423,6 +424,9 @@ func (m *sendAckFrame) sizeAck() int {
 	}
 	if m.immediateSequenceNumberSet {
 		n += protoSizeTag(14) + protoSizeVarint(m.immediateSequenceNumber)
+	}
+	if m.streamForwardingAcceptance != nil {
+		n += protoSizeTag(15) + protowire.SizeBytes(len(m.streamForwardingAcceptance))
 	}
 	return n
 }
@@ -487,6 +491,10 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 	if m.immediateSequenceNumberSet {
 		b = protoAppendTag(b, 14, protoWireVarint)
 		b = protoAppendVarint(b, m.immediateSequenceNumber)
+	}
+	if m.streamForwardingAcceptance != nil {
+		b = protoAppendTag(b, 15, protoWireBytes)
+		b = protowire.AppendBytes(b, m.streamForwardingAcceptance)
 	}
 	return b
 }
@@ -824,7 +832,6 @@ type decodedTransferFrame struct {
 
 	path                       protocol.TransferPath
 	pathIds                    [3]Id
-	carrier                    protocol.Frame
 	packOwner                  *decodedPackOwner
 	ack                        protocol.Ack
 	ackIds                     [3]Id
@@ -1129,6 +1136,20 @@ func decodeTransferPathProto(b []byte) (*protocol.TransferPath, bool) {
 	return path, true
 }
 
+// Optional enrollment data does not change ordinary Pack or ACK semantics.
+// Preserve the existing skip for a wire-type mismatch and only copy a known
+// fixed-width record.
+func consumeStreamForwardingRecord(b []byte, typ protowire.Type, size int) ([]byte, int) {
+	if typ != protowire.BytesType {
+		return nil, protowire.ConsumeFieldValue(15, typ, b)
+	}
+	record, n := protowire.ConsumeBytes(b)
+	if n < 0 || len(record) != size {
+		return nil, n
+	}
+	return record, n
+}
+
 func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 	pack = &protocol.Pack{}
 	defer func() {
@@ -1409,6 +1430,8 @@ func decodePackOwned(b []byte, prepaid ...*decodedPackOwner) (owner *decodedPack
 
 func decodeAck(b []byte) (*protocol.Ack, bool) {
 	ack := &protocol.Ack{}
+	var recordSeen bool
+	var record []byte
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -1565,6 +1588,15 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 			b = b[vn:]
 			micros := uint32(v)
 			ack.ReceiverAckDelayMicros = &micros
+		case 15:
+			value, vn := consumeStreamForwardingRecord(b, typ, streamForwardingAnswerByteCount)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			if typ == protowire.BytesType {
+				record, recordSeen = value, true
+			}
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1572,6 +1604,9 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 			}
 			b = b[fn:]
 		}
+	}
+	if recordSeen {
+		ack.StreamForwardingAcceptance = copyProtoBytes(record)
 	}
 	return ack, true
 }
@@ -1582,6 +1617,8 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 // does not allocate a protocol object or three byte slices per frame.
 func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
 	ack := &decoded.ack
+	var recordSeen bool
+	var record []byte
 	for 0 < len(b) {
 		num, typ, n := protowire.ConsumeTag(b)
 		if n < 0 {
@@ -1739,6 +1776,15 @@ func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
 			b = b[vn:]
 			decoded.ackReceiverDelayMicros = uint32(v)
 			ack.ReceiverAckDelayMicros = &decoded.ackReceiverDelayMicros
+		case 15:
+			value, vn := consumeStreamForwardingRecord(b, typ, streamForwardingAnswerByteCount)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			if typ == protowire.BytesType {
+				record, recordSeen = value, true
+			}
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1746,6 +1792,9 @@ func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
 			}
 			b = b[fn:]
 		}
+	}
+	if recordSeen {
+		ack.StreamForwardingAcceptance = copyProtoBytes(record)
 	}
 	return true
 }
@@ -1815,18 +1864,13 @@ func unmarshalTransferFrameInto(
 			}
 			b = b[vn:]
 			returnDecodedFrameMessageBytes(tf.Frame)
-			if decoded == nil {
-				f, ok := decodeFrame(v)
-				if !ok {
-					return false
-				}
-				tf.Frame = f
-			} else {
-				if !decodeFrameInto(v, &decoded.carrier) {
-					return false
-				}
-				tf.Frame = &decoded.carrier
+			// This deprecated envelope owns its Frame only when present;
+			// ordinary V2 ACKs never pay its per-owner inline cost.
+			f, ok := decodeFrame(v)
+			if !ok {
+				return false
 			}
+			tf.Frame = f
 		case 3: // message_type (deprecated) — skip, nothing reads it
 			if typ != protowire.VarintType {
 				return false

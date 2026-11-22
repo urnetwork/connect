@@ -78,7 +78,7 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		group.completionFlags.Or(groupCompletionTracked)
 		update := group.collapseAdmission.update
 		update.stateLock.Lock()
-		if group.isSynRetry() && !group.validSynRetryWithLock(update) {
+		if group.isSynRetry() && (!group.validSynRetryWithLock(update) || update.synRetryRemoteTailRefusedWithLock(self)) {
 			update.stateLock.Unlock()
 			return false
 		}
@@ -727,7 +727,7 @@ func (self *parsedPacketGroup) activateCollapseWithLock() {
 		update.sequenceAdmissionWindow = path.TcpWindowSize
 		update.sequenceAdmissionStateSeen = true
 		packet.collapseAdmission.epoch = update.sequenceAdmissionEpoch
-		if update.observeTcpControlWithLock(tcpControlFromIpPath(path), false) {
+		if update.observeTcpControlAtSourceOrderWithLock(tcpControlFromIpPath(path), false, self.collapseOrder()) {
 			update.sequenceCloseReady.Store(true)
 		}
 	}
@@ -906,6 +906,8 @@ func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
 		self.affinitySourceState |= affinitySourceTerminal
 		if err != nil {
 			self.affinitySourceState |= affinitySourceFailed
+		} else if update.nativeAckReplayEvidence != nil {
+			self.recordNativeAckPeerDataWithLock(update)
 		}
 		self.settleAffinitySourceWithLock()
 		self.publishCollapseWithLock()
@@ -919,6 +921,32 @@ func (self *parsedPacketGroup) sendAckResult(_ ByteCount, err error) {
 		self.collapseAdmission.complete(err)
 	}
 	self.completionClient.observePacketGroupTransferCompletion(self, self.completionFlags.Load()&groupCompletionAck != 0, err)
+}
+
+// Only a materialized singleton proves the exact peer-acknowledged DATA
+// member in constant time. A nil group terminal alone proves neither.
+func (self *parsedPacketGroup) recordNativeAckPeerDataWithLock(update *multiClientChannelUpdate) {
+	owner := self.collapseOwner
+	const custody = groupCompletionAck | groupCompletionAdmitted | groupCompletionDequeued
+	if owner == nil || owner.materialized&1 == 0 || len(self.packets) != 1 ||
+		self.completionFlags.Load()&(custody|groupCompletionAbandoned) != custody ||
+		self.collapseAdmission.epoch != update.sequenceAdmissionEpoch ||
+		self.completionSelection == nil || self.completionSelection != update.client.loadSelection() ||
+		owner.sourceId == (Id{}) {
+		return
+	}
+	path := self.packets[0].ipPath
+	if !path.Ack || path.Syn || path.Fin || path.Rst || path.TcpPayloadByteCount == 0 {
+		return
+	}
+	proof := &update.nativeAckReplayEvidence.peerData
+	order := self.collapseOrder()
+	if proof.sourceId != owner.sourceId || proof.epoch != self.collapseAdmission.epoch || proof.order < order {
+		*proof = nativeAckPeerDataReceipt{
+			sourceId: owner.sourceId, epoch: self.collapseAdmission.epoch, order: order,
+			sequence: path.SequenceNumber, ack: path.AckSequenceNumber,
+		}
+	}
 }
 
 // This defer is installed only after the stalled fast path. The caller still

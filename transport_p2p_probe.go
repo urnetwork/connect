@@ -80,6 +80,8 @@ type p2pStreamProbeRouteGeneration struct {
 
 	sendAdmission p2pProbeSendAdmission
 	routeUpdates  sync.WaitGroup
+	// stateLock protects publication of the reverse application writer.
+	readinessPublished bool
 }
 
 // Creates one open route generation.
@@ -150,6 +152,13 @@ func (self *p2pStreamProbeObserverDispatcher) dispatch(
 	}
 }
 
+// A response stays with the precise local route on which its peer proof was
+// received, including while route replacement races the worker notification.
+type p2pStreamProbeResponse struct {
+	nonce      Id
+	generation *p2pStreamProbeRouteGeneration
+}
+
 // One endpoint connection generation owns the challenge nonce and readiness
 // lease. Route callbacks and message handling are concurrent-safe and
 // nonblocking; the lifecycle synchronously releases readiness on close.
@@ -157,6 +166,7 @@ type p2pStreamProbe struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	forwardReadiness *p2pStreamReadiness
 	routeManager     *RouteManager
 	streamId         Id
 	interval         time.Duration
@@ -183,7 +193,7 @@ type p2pStreamProbe struct {
 	testingAfterProbeTimerReset       func(time.Duration)
 	testingAfterProbeTimerEdge        func()
 
-	responses chan Id
+	responses chan p2pStreamProbeResponse
 	done      chan struct{}
 }
 
@@ -204,6 +214,18 @@ func newP2pStreamProbe(
 	streamId Id,
 	settings *P2pTransportSettings,
 ) *p2pStreamProbe {
+	return newP2pStreamProbeWithReadiness(ctx, routeManager, streamId, settings, nil)
+}
+
+// Starts an endpoint worker. A non-nil owner requires a live authenticated
+// enrollment for the entire physical connection and suppresses the direct echo.
+func newP2pStreamProbeWithReadiness(
+	ctx context.Context,
+	routeManager *RouteManager,
+	streamId Id,
+	settings *P2pTransportSettings,
+	forwardReadiness *p2pStreamReadiness,
+) *p2pStreamProbe {
 	probeCtx, cancel := context.WithCancel(ctx)
 	interval := settings.EndToEndProbeInterval
 	if interval <= 0 {
@@ -215,6 +237,7 @@ func newP2pStreamProbe(
 	}
 	probe := &p2pStreamProbe{
 		ctx:              probeCtx,
+		forwardReadiness: forwardReadiness,
 		cancel:           cancel,
 		routeManager:     routeManager,
 		streamId:         streamId,
@@ -223,7 +246,7 @@ func newP2pStreamProbe(
 		observer:         settings.EndToEndProbeObserver,
 		progressObserver: settings.ProgressObserver,
 		routeUpdate:      NewMonitor(),
-		responses:        make(chan Id, 1),
+		responses:        make(chan p2pStreamProbeResponse, 1),
 		done:             make(chan struct{}),
 	}
 	go HandleError(probe.run, cancel)
@@ -392,14 +415,16 @@ func (self *p2pStreamProbe) sendProbeMessage(
 	}
 	defer self.releaseSendGeneration(generation, p2pSendTransport)
 	if !generation.sendAdmission.isOpen() ||
-		p2pSendTransport != nil && !p2pSendTransport.probeSendAdmission.isOpen() {
+		p2pSendTransport != nil && !p2pSendTransport.probeSendAdmission.isOpen() ||
+		self.forwardReadiness != nil && self.forwardReadiness.activeKeys() == nil {
 		MessagePoolReturn(message)
 		self.observe(droppedEvent, nonce, generation.epoch)
 		return false
 	}
 
 	sendRoute := generation.route
-	if p2pSendTransport != nil && generation.route == p2pSendTransport.send && len(message) == p2pStreamProbeByteCount {
+	if p2pSendTransport != nil && generation.route == p2pSendTransport.send &&
+		(len(message) == p2pStreamProbeByteCount || len(message) == p2pForwardProbeByteCount) {
 		switch messageType {
 		case p2pStreamProbeRequestType:
 			if p2pSendTransport.probeRequests != nil {
@@ -437,15 +462,35 @@ func (self *p2pStreamProbe) handle(message []byte) bool {
 	if streamId != self.streamId {
 		return true
 	}
+	generation, _ := self.sendRouteState()
+	var keys *p2pStreamReadinessKeys
+	if self.forwardReadiness != nil {
+		keys = self.forwardReadiness.activeKeys()
+		if keys == nil || generation == nil || !keys.verifies(message) {
+			return true
+		}
+	} else if len(message) != p2pStreamProbeByteCount {
+		return true
+	}
 	switch messageType {
 	case p2pStreamProbeRequestType:
 		self.observe(P2pStreamProbeEventRequestReceived, nonce, self.currentRouteEpoch())
-		response := encodeP2pStreamProbe(
+		// The origin can confirm its installed receive path immediately. The
+		// destination confirms only after publishing its reverse writer.
+		if keys != nil && keys.destination {
+			self.stateLock.Lock()
+			published := self.sendGeneration == generation && generation.readinessPublished
+			self.stateLock.Unlock()
+			if !published {
+				return true
+			}
+		}
+		response := encodeP2pReadinessProbe(
+			keys,
 			p2pStreamProbeResponseType,
 			self.streamId,
 			nonce,
 		)
-		generation, _ := self.sendRouteState()
 		self.sendProbeMessage(
 			generation,
 			p2pStreamProbeResponseType,
@@ -457,7 +502,7 @@ func (self *p2pStreamProbe) handle(message []byte) bool {
 	case p2pStreamProbeResponseType:
 		self.observe(P2pStreamProbeEventResponseReceived, nonce, self.currentRouteEpoch())
 		select {
-		case self.responses <- nonce:
+		case self.responses <- p2pStreamProbeResponse{nonce: nonce, generation: generation}:
 		default:
 			self.observe(P2pStreamProbeEventResponseQueueFull, nonce, self.currentRouteEpoch())
 		}
@@ -505,6 +550,13 @@ func (self *p2pStreamProbe) setReady(
 		self.stateLock.Unlock()
 		return false
 	}
+	if ready && self.forwardReadiness != nil && self.forwardReadiness.activeKeys() == nil {
+		self.stateLock.Unlock()
+		return false
+	}
+	if !ready {
+		generation.readinessPublished = false
+	}
 	if !p2pSendTransport.setEndToEndReady(ready) {
 		self.stateLock.Unlock()
 		return false
@@ -523,6 +575,13 @@ func (self *p2pStreamProbe) setReady(
 			return false
 		}
 		generation.routeUpdates.Add(1)
+		if self.forwardReadiness != nil && self.forwardReadiness.activeKeys() == nil {
+			p2pSendTransport.setEndToEndReady(false)
+			self.stateLock.Unlock()
+			self.routeManager.RemoveTransport(sendTransport)
+			generation.routeUpdates.Done()
+			return false
+		}
 		self.stateLock.Unlock()
 		// Readiness rematches the same physical generation. Preserve its
 		// delivery semantics: a propertyless update here used to erase the
@@ -534,6 +593,12 @@ func (self *p2pStreamProbe) setReady(
 			[]Route{sendRoute},
 			p2pTransferCarrierProperties(sendTransport),
 		)
+		if self.forwardReadiness != nil {
+			self.stateLock.Lock()
+			generation.readinessPublished = self.sendGeneration == generation &&
+				p2pSendTransport.endToEndReady.Load() && self.forwardReadiness.activeKeys() != nil
+			self.stateLock.Unlock()
+		}
 		generation.routeUpdates.Done()
 	} else {
 		generation.routeUpdates.Add(1)
@@ -591,7 +656,11 @@ func (self *p2pStreamProbe) run() {
 		}
 	}
 
-	nonce := NewId()
+	var ownerDone <-chan struct{}
+	if self.forwardReadiness != nil {
+		ownerDone = self.forwardReadiness.ctx.Done()
+	}
+	var nonce Id
 	challengeMatched := false
 	var challengeRouteEpoch uint64
 	capabilityStartTime := self.now()
@@ -608,8 +677,25 @@ func (self *p2pStreamProbe) run() {
 				readyRouteEpoch = 0
 			}
 		}
-		if generation == nil {
+		var keys *p2pStreamReadinessKeys
+		var installed <-chan struct{}
+		if self.forwardReadiness != nil {
 			select {
+			case <-self.forwardReadiness.installed:
+				keys = self.forwardReadiness.activeKeys()
+				// Expired or retired keys never select the adjacent probe.
+				if keys == nil {
+					return
+				}
+			default:
+				installed = self.forwardReadiness.installed
+			}
+		}
+		if generation == nil || installed != nil {
+			select {
+			case <-ownerDone:
+				return
+			case <-installed:
 			case <-self.ctx.Done():
 				return
 			case <-routeUpdate:
@@ -621,7 +707,7 @@ func (self *p2pStreamProbe) run() {
 		routeEpoch := generation.epoch
 		if challengeRouteEpoch != routeEpoch {
 			challengeRouteEpoch = routeEpoch
-			nonce = NewId()
+			nonce = self.challengeNonce()
 			challengeMatched = false
 			capabilityStartTime = self.now()
 			lastResponseTime = time.Time{}
@@ -629,10 +715,11 @@ func (self *p2pStreamProbe) run() {
 		}
 
 		if challengeMatched {
-			nonce = NewId()
+			nonce = self.challengeNonce()
 			challengeMatched = false
 		}
-		request := encodeP2pStreamProbe(
+		request := encodeP2pReadinessProbe(
+			keys,
 			p2pStreamProbeRequestType,
 			self.streamId,
 			nonce,
@@ -647,8 +734,8 @@ func (self *p2pStreamProbe) run() {
 			P2pStreamProbeEventRequestDropped,
 		)
 
-		handleResponse := func(responseNonce Id) {
-			if responseNonce == nonce {
+		handleResponse := func(response p2pStreamProbeResponse) bool {
+			if response.nonce == nonce && response.generation == generation && (keys == nil || !challengeMatched) {
 				matchedNonce := nonce
 				self.observe(P2pStreamProbeEventResponseMatched, matchedNonce, routeEpoch)
 				lastResponseTime = self.now()
@@ -666,19 +753,22 @@ func (self *p2pStreamProbe) run() {
 						routeEpoch,
 					)
 				}
-			} else {
-				self.observe(P2pStreamProbeEventResponseStale, responseNonce, routeEpoch)
+				return true
 			}
+			self.observe(P2pStreamProbeEventResponseStale, response.nonce, routeEpoch)
+			return false
 		}
 		waitForInterval := true
 		for waitForInterval {
 			select {
+			case <-ownerDone:
+				return
 			case <-self.ctx.Done():
 				return
 			case <-routeUpdate:
 				waitForInterval = false
-			case responseNonce := <-self.responses:
-				handleResponse(responseNonce)
+			case response := <-self.responses:
+				handleResponse(response)
 			case <-probeTimerChannel:
 				if self.testingAfterProbeTimerEdge != nil {
 					self.testingAfterProbeTimerEdge()
@@ -688,8 +778,9 @@ func (self *p2pStreamProbe) run() {
 				// response so its duplicate challenge drains instead of creating
 				// a permanent request/response train.
 				select {
-				case responseNonce := <-self.responses:
-					handleResponse(responseNonce)
+				case response := <-self.responses:
+					matched := handleResponse(response)
+					waitForInterval = keys == nil || matched
 				default:
 					waitForInterval = false
 				}
@@ -726,6 +817,12 @@ func (self *p2pStreamProbe) close() {
 // Encodes one owned raw-stream envelope for the send route.
 func encodeP2pStreamProbe(messageType byte, streamId Id, nonce Id) []byte {
 	message := MessagePoolGet(p2pStreamProbeByteCount)
+	writeP2pStreamProbeHeader(message, messageType, streamId, nonce)
+	return message
+}
+
+// Writes the common fixed header to a caller-owned fixed-size control buffer.
+func writeP2pStreamProbeHeader(message []byte, messageType byte, streamId Id, nonce Id) {
 	copy(message, p2pStreamProbePrefix[:])
 	message[p2pStreamProbeTypeOffset] = messageType
 	copy(
@@ -733,14 +830,19 @@ func encodeP2pStreamProbe(messageType byte, streamId Id, nonce Id) []byte {
 		streamId.Bytes(),
 	)
 	copy(message[p2pStreamProbeNonceOffset:p2pStreamProbeByteCount], nonce.Bytes())
-	return message
 }
 
 // Decodes only the reserved invalid-protobuf envelope. A recognized message
 // with a mismatched stream is still consumed rather than reaching Client.
 func decodeP2pStreamProbe(message []byte) (bool, byte, Id, Id) {
-	if len(message) != p2pStreamProbeByteCount ||
-		!slices.Equal(message[:len(p2pStreamProbePrefix)], p2pStreamProbePrefix[:]) {
+	const versionOffset = len(p2pStreamProbePrefix) - 1
+	if len(message) != p2pStreamProbeByteCount && len(message) != p2pForwardProbeByteCount {
+		return false, 0, Id{}, Id{}
+	}
+	version := message[versionOffset]
+	if !slices.Equal(message[:versionOffset], p2pStreamProbePrefix[:versionOffset]) ||
+		(len(message) == p2pStreamProbeByteCount && version != p2pStreamProbePrefix[versionOffset]) ||
+		(len(message) == p2pForwardProbeByteCount && version != p2pForwardProbeVersion) {
 		return false, 0, Id{}, Id{}
 	}
 	streamId, streamErr := IdFromBytes(

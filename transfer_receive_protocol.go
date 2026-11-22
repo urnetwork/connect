@@ -62,7 +62,7 @@ func (self *ReceiveSequence) packProtocol(pack *ReceivePack, timeout time.Durati
 		return false, nil
 	}
 	select {
-	case <-pack.carrierDone:
+	case <-pack.carrierDone():
 		return false, errors.New("receive carrier closed")
 	default:
 	}
@@ -83,7 +83,7 @@ func (self *ReceiveSequence) packProtocol(pack *ReceivePack, timeout time.Durati
 	select {
 	case <-self.ctx.Done():
 		return false, errors.New("Done.")
-	case <-pack.carrierDone:
+	case <-pack.carrierDone():
 		return false, errors.New("receive carrier closed")
 	case self.protocolPacks <- pack:
 		return true, nil

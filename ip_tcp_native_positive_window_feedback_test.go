@@ -181,6 +181,7 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 			case <-f.ctx.Done():
 			}
 		},
+		observeWire: w.observeTargetWire,
 		afterReceipt: func(f *persistNativeFixture, offer persistNativeOffer) {
 			if !offer.header.pureAck() || offer.header.window == 0 || f.firstReturnData.Load() == nil || f.zero.Load() != nil {
 				return
@@ -223,7 +224,7 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 				priorDisposition(sequence, disposition, frames)
 			}
 			target := w.target.Load()
-			if !w.manualControl || target == nil || len(frames) != 1 || frames[0].MessageType != protocol.MessageType_IpIpPacketToProvider {
+			if target == nil || len(frames) != 1 || frames[0].MessageType != protocol.MessageType_IpIpPacketToProvider {
 				return
 			}
 			packet, err := ipPacketToProviderBytes(frames[0])
@@ -233,6 +234,16 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 			group, ok := disposition.target.(*parsedPacketGroup)
 			if !ok || group == nil || len(sequence.sendItems) == 0 || disposition.start != 0 || disposition.end != 1 {
 				t.Error("exact native feedback lacks its actual singleton group disposition")
+				return
+			}
+			index := 0
+			if attempt := group.nativeAckRetry; attempt != nil && attempt.replay {
+				index = 1
+				if attempt.source != sequence {
+					t.Error("automatic feedback retry changed source owner")
+					return
+				}
+			} else if !w.manualControl {
 				return
 			}
 			item := sequence.sendItems[len(sequence.sendItems)-1]
@@ -247,14 +258,6 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 			if record.target != group || record.lifecycle.token == 0 || record.lifecycle.clientId != sequence.client.ClientId() {
 				t.Error("exact native feedback lost its original lifecycle identity")
 				return
-			}
-			index := 0
-			if attempt := group.nativeAckRetry; attempt != nil && attempt.replay {
-				index = 1
-				if attempt.source != sequence {
-					t.Error("automatic feedback retry changed source owner")
-					return
-				}
 			}
 			w.stateLock.Lock()
 			original := &w.targetOriginals[index]
@@ -275,7 +278,7 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 				return
 			}
 			wire, pressure := w.f.sourceWire.Load(), w.pressure.Load()
-			if wire == nil || pressure == nil {
+			if wire == nil || wire.message != event.MessageId || wire.number != event.SequenceNumber || pressure == nil {
 				return
 			}
 			if wire.header == pressure.offer.header {
@@ -293,33 +296,6 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 				}
 				w.stateLock.Unlock()
 				w.notify()
-			}
-			if target := w.target.Load(); target != nil && wire.header.opens(*w.f.zero.Load()) {
-				pack := decodeSendPackLifecycleWirePack(t, event.TransferFrameBytes)
-				if len(pack.Frames) != 1 {
-					t.Error("native feedback changed singleton shape")
-					return
-				}
-				packet, err := ipPacketToProviderBytes(pack.Frames[0])
-				if err == nil && bytes.Equal(packet, *target) {
-					if w.manualControl {
-						w.stateLock.Lock()
-						matched := false
-						for index := range w.targetOriginals {
-							original := &w.targetOriginals[index]
-							if original.dispositions != 0 && original.wire.owner == wire.owner && original.wire.generation == wire.generation &&
-								original.wire.message == wire.message && original.wire.number == wire.number && original.wire.sequence == wire.sequence {
-								original.writes++
-								original.wire = *wire
-								matched = true
-							}
-						}
-						if !matched {
-							t.Error("exact target wire lacks its captured manual or automatic original")
-						}
-						w.stateLock.Unlock()
-					}
-				}
 			}
 		}
 		priorAck := settings.SendBufferSettings.afterAckSendItemForTest
@@ -340,28 +316,7 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 				w.notify()
 				return
 			}
-			manual := false
-			if w.manualControl {
-				w.stateLock.Lock()
-				originals := w.targetOriginals
-				w.stateLock.Unlock()
-				for index, original := range originals {
-					if original.dispositions != 0 && original.wire.owner == id && original.wire.number == number {
-						buffer := original.wire.sequence.client.sendBuffer
-						buffer.mutex.Lock()
-						current := buffer.sendSequences[id] == original.wire.sequence && buffer.sendSequencesBySequenceId[original.wire.generation] == original.wire.sequence
-						buffer.mutex.Unlock()
-						w.stateLock.Lock()
-						w.targetOriginals[index].receipts++
-						receipts := w.targetOriginals[index].receipts
-						w.stateLock.Unlock()
-						if !current || original.writes != 1 || receipts != 1 {
-							t.Error("exact target terminal lacks one actual original wire")
-						}
-						manual = index == 0
-					}
-				}
-			}
+			manual := w.observeTargetAck(id, number)
 			opened := false
 			if w.f != nil {
 				if wire := w.f.openWire.Load(); wire != nil && wire.owner == id && wire.number == number {
@@ -477,6 +432,62 @@ func newNativePositiveWitness(t *testing.T, manualControl bool) *nativePositiveW
 	return w
 }
 
+// A byte-identical reoffer owns a different Transfer ordinal and terminal.
+// Compare the actual wire to its own disposition, including that ordinal.
+func (self *nativePositiveWitness) observeTargetWire(wire *persistNativeWire, packet []byte, frameCount int) bool {
+	target := self.target.Load()
+	if target == nil || !wire.header.opens(*self.f.zero.Load()) {
+		return false
+	}
+	if frameCount != 1 {
+		self.t.Error("native feedback changed singleton shape")
+		return false
+	}
+	if !bytes.Equal(packet, *target) {
+		return false
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	for index := range self.targetOriginals {
+		original := &self.targetOriginals[index]
+		if original.dispositions == 1 && original.wire.owner == wire.owner && original.wire.generation == wire.generation &&
+			original.wire.message == wire.message && original.wire.number == wire.number && original.wire.sequence == wire.sequence {
+			original.writes++
+			original.wire = *wire
+			return index == 1
+		}
+	}
+	if self.manualControl {
+		self.t.Error("exact target wire lacks its captured manual or automatic original")
+	}
+	return false
+}
+
+// Real retirement must still agree with both live sequence registry indexes.
+func (self *nativePositiveWitness) observeTargetAck(id sendSequenceId, number uint64) bool {
+	self.stateLock.Lock()
+	originals := self.targetOriginals
+	self.stateLock.Unlock()
+	for index, original := range originals {
+		if original.dispositions == 0 || original.wire.owner != id || original.wire.number != number {
+			continue
+		}
+		buffer := original.wire.sequence.client.sendBuffer
+		buffer.mutex.Lock()
+		current := buffer.sendSequences[id] == original.wire.sequence && buffer.sendSequencesBySequenceId[original.wire.generation] == original.wire.sequence
+		buffer.mutex.Unlock()
+		self.stateLock.Lock()
+		self.targetOriginals[index].receipts++
+		receipts := self.targetOriginals[index].receipts
+		self.stateLock.Unlock()
+		if !current || original.writes != 1 || receipts != 1 {
+			self.t.Error("exact target terminal lacks one actual original wire")
+		}
+		return index == 0
+	}
+	return false
+}
+
 func (self *nativePositiveWitness) releaseClaims() {
 	self.stateLock.Lock()
 	claims := self.claims
@@ -509,13 +520,19 @@ func (self *nativePositiveWitness) cut() nativeWindowCadenceCut {
 // The desired outcome is progress from the genuine refused advancing ACK,
 // before ordinary retained-DATA recovery. A pass falsifies this candidate gap.
 func TestTcpNativeAdvancingFeedbackProgressesAfterFiniteAckService(t *testing.T) {
-	checkNativePositiveFeedback(t, false)
+	checkNativePositiveFeedback(t, false, false)
 }
 
 // The sole intervention is the exact same native packet after source owners
 // drain; no provider field, TCP timer or acknowledgement is manufactured.
 func TestTcpNativeAdvancingFeedbackExactPacketControl(t *testing.T) {
-	checkNativePositiveFeedback(t, true)
+	checkNativePositiveFeedback(t, true, false)
+}
+
+// Retire the automatic retry while the bridge is parked, then reoffer the
+// exact capture and await its independent terminal before reading the queue.
+func TestTcpNativeAdvancingFeedbackSeparatesAutomaticReceipt(t *testing.T) {
+	checkNativePositiveFeedback(t, true, true)
 }
 
 // Cancellation between a native read and its offer leaves no flow to inspect.
@@ -533,7 +550,7 @@ func TestTcpNativeFeedbackOfferAfterParentCloseReturnsBuffer(t *testing.T) {
 	}
 }
 
-func checkNativePositiveFeedback(t *testing.T, manualReoffer bool) {
+func checkNativePositiveFeedback(t *testing.T, manualReoffer, receiptOrderingControl bool) {
 	t.Helper()
 	MessagePoolReturn(MessagePoolGet(1))
 	assertMessagePoolOwnership(t)
@@ -714,39 +731,30 @@ func checkNativePositiveFeedback(t *testing.T, manualReoffer bool) {
 	if drained.dataBytes != 0 {
 		t.Fatal("protocol pressure charged DATA bytes")
 	}
+	if receiptOrderingControl {
+		f.await(w.openedSignal, "automatic original retired before its duplicate offer")
+		w.stateLock.Lock()
+		automatic := w.targetOriginals[1]
+		w.stateLock.Unlock()
+		if automatic.dispositions != 1 || automatic.writes != 1 || automatic.receipts != 1 || automatic.wire.header != target.header {
+			t.Fatalf("automatic original did not complete alone: %+v", automatic)
+		}
+	}
 	if manualReoffer {
+		previousWire := f.sourceWire.Load()
 		offer := f.offer(MessagePoolCopy(target.copy), false)
 		if !offer.accepted || offer.count != 1 || offer.header != target.header {
 			t.Fatalf("identical native feedback did not admit after finite drain: %+v", offer)
 		}
 		f.await(w.manualAckSignal, "manual original applied and serial terminal handoff complete")
-		// The automatic retry may have completed first. Only its separately
-		// identified original may precede the manual receipt in these two slots.
-		manualReceipt := false
-		var consumed [2]bool
-		for count := 0; count < len(consumed) && !manualReceipt; count++ {
-			select {
-			case receipt := <-f.serialAcks:
-				w.stateLock.Lock()
-				originals := w.targetOriginals
-				w.stateLock.Unlock()
-				matched := -1
-				for index, original := range originals {
-					if original.dispositions == 1 && original.writes == 1 && original.receipts == 1 && receipt == original.wire {
-						matched = index
-					}
-				}
-				if matched < 0 || consumed[matched] {
-					t.Fatal("manual feedback received an unknown or repeated original terminal")
-				}
-				consumed[matched] = true
-				manualReceipt = matched == 0
-			case <-f.ctx.Done():
-				t.Fatal("exact manual target terminal receipt", f.ctx.Err())
-			}
-		}
-		if !manualReceipt {
-			t.Fatal("bounded target receipt set omitted the manual original")
+		// The automatic terminal has an independent witness. This receipt
+		// belongs to the exact manually submitted original.
+		receipt, err := f.takeSerialAck(previousWire, offer.header)
+		w.stateLock.Lock()
+		manual := w.targetOriginals[0]
+		w.stateLock.Unlock()
+		if err != nil || receipt == nil || *receipt != manual.wire {
+			t.Fatalf("serialized duplicate did not receive its own terminal: receipt=%+v err=%v", receipt, err)
 		}
 	}
 	f.resumeDo.Do(func() { close(f.resumeBridge) })

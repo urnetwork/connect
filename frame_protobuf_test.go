@@ -301,18 +301,24 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 		receiverDelay = &value
 	}
 	ack := &protocol.Ack{
-		AckCompressTimeoutMicros: compression,
-		ReceiverAckDelayMicros:   receiverDelay,
-		MessageId:                m.messageId.Bytes(),
-		SequenceId:               m.sequenceId.Bytes(),
-		Selective:                m.selective,
-		Tag:                      tag,
-		MissingContractId:        missingContractId,
-		CompactContractRecovery:  m.compactContractRecovery,
-		LogicalLaneVersion:       m.logicalLaneVersion,
-		ContractAhead:            m.contractAhead,
-		ReceiveWindowByteCount:   receiveWindowByteCount,
-		EvictedSequenceNumbers:   m.evictedSequenceNumbers,
+		AckCompressTimeoutMicros:   compression,
+		StreamForwardingAcceptance: m.streamForwardingAcceptance,
+		DeliveredImmediately:       m.deliveredImmediately,
+		ReceiverAckDelayMicros:     receiverDelay,
+		MessageId:                  m.messageId.Bytes(),
+		SequenceId:                 m.sequenceId.Bytes(),
+		Selective:                  m.selective,
+		Tag:                        tag,
+		MissingContractId:          missingContractId,
+		CompactContractRecovery:    m.compactContractRecovery,
+		LogicalLaneVersion:         m.logicalLaneVersion,
+		ContractAhead:              m.contractAhead,
+		ReceiveWindowByteCount:     receiveWindowByteCount,
+		EvictedSequenceNumbers:     m.evictedSequenceNumbers,
+	}
+	if m.immediateSequenceNumberSet {
+		ordinal := m.immediateSequenceNumber
+		ack.ImmediateSequenceNumber = &ordinal
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -1613,7 +1619,9 @@ func TestDecodedTransferFramePoolRetainedSizeStaysSmall(t *testing.T) {
 	size := unsafe.Sizeof(decodedTransferFrame{})
 	// Includes optional compression metadata and inline capacity/compression
 	// storage: the hot decoder keeps these fields allocation-free.
-	if want := uintptr(680 + immediateDecodeWrapperStateByteCount); size != want || size+8 > 704 || decodedTransferFramePoolCapacity != 256 {
+	// Compensate for the optional ACK field with the deprecated V1 Frame
+	// that now allocates only for that wire form. The ceiling is unchanged.
+	if want := uintptr(680+immediateDecodeWrapperStateByteCount+24) - unsafe.Sizeof(protocol.Frame{}); size != want || size+8 > 704 || decodedTransferFramePoolCapacity != 256 {
 		t.Fatalf("decoded TransferFrame owner=%d expected=%d, header-inclusive limit704, fixed pool256", size, want)
 	}
 	t.Logf(

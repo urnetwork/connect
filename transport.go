@@ -2981,6 +2981,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
 			}
+			platformOwner := newPlatformReceiveOwner(clientId, handleCtx.Done(), nil, verifiedH1PlatformTls(self.platformUrl, ws))
 			self.routeManager.UpdateTransportWithProperties(
 				receiveTransport,
 				[]Route{receive},
@@ -2988,6 +2989,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ReceiveReliability: CarrierReliabilityReliable,
 					h1ReceiveRetained:  receiveLane,
 					h1ReceiveDone:      receiveDone,
+					platformReceive:    platformOwner.provenance(platformReceiveH1),
 				},
 			)
 			// the extender carrying this connection is published for exactly
@@ -3017,6 +3019,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// Stop new priority admissions before retiring the public route.
 				// RemoveTransport then joins any writer that already acquired the
 				// old snapshot, so the final drain cannot race an enqueue.
+				platformOwner.retire()
 				unregisterH1AckPriorityRoute(exportedSend)
 				self.routeManager.RemoveTransport(sendTransport)
 				if self.settings.SendRouteObserver != nil {
@@ -3641,6 +3644,7 @@ func (self *PlatformTransport) runH3(
 			// both lanes carry the delay header after the auth exchange
 			// (transport_delay_h3.go)
 			useTransportDelay bool
+			verifiedPlatform  bool
 		}
 
 		connect := func(attemptCtx context.Context) (*ConnStream, error) {
@@ -3754,6 +3758,7 @@ func (self *PlatformTransport) runH3(
 			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
 			useH3Datagrams := false
 			useTransportDelay := false
+			verifiedPlatform := false
 			if responseBytes, err := framer.Read(stream); err != nil {
 				return nil, err
 			} else {
@@ -3767,6 +3772,7 @@ func (self *PlatformTransport) runH3(
 					return nil, fmt.Errorf("Auth response error: got %T.", responseMessage)
 				}
 				connectionState := conn.ConnectionState()
+				verifiedPlatform = verifiedPlatformTlsState(serverName, connectionState.TLS)
 				useH3Datagrams, responseErr = negotiateH3DatagramAuthResponse(
 					authMessage,
 					authResponse,
@@ -3803,6 +3809,7 @@ func (self *PlatformTransport) runH3(
 				attempt:           attempt,
 				useH3Datagrams:    useH3Datagrams,
 				useTransportDelay: useTransportDelay,
+				verifiedPlatform:  verifiedPlatform,
 			}, nil
 		}
 
@@ -4112,11 +4119,13 @@ func (self *PlatformTransport) runH3(
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, send, true)
 			}
+			platformOwner := newPlatformReceiveOwner(clientId, handleCtx.Done(), conn.Context().Done(), connStream.verifiedPlatform)
 			self.routeManager.UpdateTransportWithProperties(
 				receiveTransport,
 				[]Route{reliableReceive},
 				TransferCarrierProperties{
 					ReceiveReliability: CarrierReliabilityReliable,
+					platformReceive:    platformOwner.provenance(platformReceiveH3Stream),
 				},
 			)
 			var unreliableReceiveTransport Transport
@@ -4127,6 +4136,7 @@ func (self *PlatformTransport) runH3(
 					[]Route{unreliableReceive},
 					TransferCarrierProperties{
 						ReceiveReliability: CarrierReliabilityUnreliable,
+						platformReceive:    platformOwner.provenance(platformReceiveH3Datagram),
 					},
 				)
 			}
@@ -4143,6 +4153,7 @@ func (self *PlatformTransport) runH3(
 			}
 
 			defer func() {
+				platformOwner.retire()
 				self.setRegistered(false)
 				releaseRelayedConnection()
 				self.routeManager.RemoveTransport(sendTransport)

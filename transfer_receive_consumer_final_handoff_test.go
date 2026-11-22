@@ -5,6 +5,7 @@ package connect
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -287,17 +288,19 @@ func testReceiveConsumerFinalHandoff(t *testing.T, mode string) {
 			t.Fatal("CONSUMER_FINAL_HANDOFF_FUNDED_EXACT_FLOOR_PREMISE_FAILED")
 		}
 		targetId = targetScan.messageId
-		dropBefore := fixture.receiver.receivePackHandoffDropCount.Load()
-		bytesBefore := fixture.receiver.receivePackHandoffDropByteCount.Load()
+		before := fixture.receiver.ReceiveStats()
 		fixture.forward(head, fixture.receiverIn)
-		drops := fixture.receiver.receivePackHandoffDropCount.Load() - dropBefore
-		dropBytes := fixture.receiver.receivePackHandoffDropByteCount.Load() - bytesBefore
+		after := fixture.receiver.ReceiveStats()
+		drops := after.PackHandoffDropCount - before.PackHandoffDropCount
+		dropBytes := after.PackHandoffDropByteCount - before.PackHandoffDropByteCount
+		var wantDecodeOwner, wantFinal uint64
 		if mode == "predecode" {
 			if begin != 0 || end != 0 || released != 0 || refused != 0 || recovery.UsedByteCount() != 0 ||
 				drops != 1 || dropBytes != uint64(targetScan.messageByteCount) || fixture.deliveredCount != 0 ||
 				fixture.ackedCount != 0 || sequence.nextSequenceNumber != head.pack.SequenceNumber || sequence.ctx.Err() != nil {
 				t.Fatalf("CONSUMER_PREDECODE_COUNTER_NOT_ISOLATED begin=%d end=%d released=%d refused=%d drops=%d", begin, end, released, refused, drops)
 			}
+			wantDecodeOwner = 1
 			t.Log("CONSUMER_PREDECODE_REFUSED_BEFORE_FINAL_CALLBACK")
 		} else if mode == "rx-parented-pack" {
 			if begin != 1 || end != 1 || released != 0 || refused != 1 || !paid || !exactRoots ||
@@ -307,6 +310,7 @@ func testReceiveConsumerFinalHandoff(t *testing.T, mode string) {
 				recovery.UsedByteCount() != 0 || client.UsedByteCount() != rxBytes || root.UsedByteCount() != rxBytes {
 				t.Fatalf("CONSUMER_REAL_FINAL_CALLBACK_REFUSAL_NOT_ISOLATED begin=%d end=%d released=%d refused=%d paid=%t roots=%t drops=%d", begin, end, released, refused, paid, exactRoots, drops)
 			}
+			wantFinal = 1
 			t.Log("CONSUMER_REAL_DECODED_FINAL_CALLBACK_QUOTA_REFUSED")
 		} else {
 			if begin != 1 || end != 1 || released != 1 || refused != 0 || !paid || !exactRoots ||
@@ -324,6 +328,31 @@ func testReceiveConsumerFinalHandoff(t *testing.T, mode string) {
 			foreignItem.memoryBudget != rx || foreignItem.QueueByteCount() != foreignBytes || foreign.holdPromise.set ||
 			recovery.UsedByteCount() != 0 || pack.UsedByteCount() != 0 || pack.Stats().QuotaByteCount != 0 {
 			t.Fatal("CONSUMER_FINAL_HANDOFF_CHANGED_FOREIGN_CUSTODY_OR_LEAKED_CHILD")
+		}
+
+		// Transfer diagnostics serialize this same snapshot for each receiver.
+		stageCounts := func(snapshot ClientReceiveStatsSnapshot) (decodeOwner, final uint64) {
+			encoded, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var reported struct {
+				PackHandoffDecodeOwnerRefusalCount *uint64
+				PackHandoffFinalRefusalCount       *uint64
+			}
+			if err := json.Unmarshal(encoded, &reported); err != nil {
+				t.Fatal(err)
+			}
+			if reported.PackHandoffDecodeOwnerRefusalCount == nil || reported.PackHandoffFinalRefusalCount == nil {
+				t.Fatalf("missing Pack handoff stage counters: mode=%s aggregate_delta=%d begin=%d end=%d", mode, drops, begin, end)
+			}
+			return *reported.PackHandoffDecodeOwnerRefusalCount, *reported.PackHandoffFinalRefusalCount
+		}
+		beforeDecodeOwner, beforeFinal := stageCounts(before)
+		afterDecodeOwner, afterFinal := stageCounts(after)
+		if afterDecodeOwner != beforeDecodeOwner+wantDecodeOwner || afterFinal != beforeFinal+wantFinal {
+			t.Fatalf("Pack handoff stage counter mismatch: mode=%s decode_owner=%d->%d want_delta=%d final=%d->%d want_delta=%d",
+				mode, beforeDecodeOwner, afterDecodeOwner, wantDecodeOwner, beforeFinal, afterFinal, wantFinal)
 		}
 	})
 }

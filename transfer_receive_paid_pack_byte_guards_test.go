@@ -6,6 +6,7 @@ package connect
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/urnetwork/connect/protocol"
@@ -184,6 +185,29 @@ func (f *paidPackByteGuardFixture) offer(pack *ReceivePack) (bool, error) {
 	return accepted, err
 }
 
+// Mobile receive diagnostics serialize this public snapshot for every client.
+// A zero should identify the measured branch even when both limits had room.
+func assertH1PackRefusalCounts(t *testing.T, client *Client, wantCount, wantLocalBytes uint64) {
+	t.Helper()
+	encoded, err := json.Marshal(client.ReceiveStats())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var counters struct {
+		H1PackCountLimitRefusalCount     *uint64
+		H1PackLocalByteLimitRefusalCount *uint64
+	}
+	if err := json.Unmarshal(encoded, &counters); err != nil {
+		t.Fatal(err)
+	}
+	if counters.H1PackCountLimitRefusalCount == nil || counters.H1PackLocalByteLimitRefusalCount == nil {
+		t.Fatalf("receive diagnostic omitted H1 refusal counters, want count=%d local_bytes=%d", wantCount, wantLocalBytes)
+	}
+	if count, localBytes := *counters.H1PackCountLimitRefusalCount, *counters.H1PackLocalByteLimitRefusalCount; count != wantCount || localBytes != wantLocalBytes {
+		t.Fatalf("H1 refusals at count and local byte limits = (%d, %d), want (%d, %d)", count, localBytes, wantCount, wantLocalBytes)
+	}
+}
+
 // Physical and encoded quota are different quantities, charged once each.
 // An already full physical root cannot deny its independently paid handoff.
 func TestReceivePaidPackBytesUsesSharedQuotaAtFullPhysicalRoot(t *testing.T) {
@@ -209,6 +233,7 @@ func TestReceivePaidPackBytesUsesSharedQuotaAtFullPhysicalRoot(t *testing.T) {
 		extra.release()
 		t.Fatal("paid-byte exception expanded the physical root")
 	}
+	assertH1PackRefusalCounts(t, f.sequence.client, 0, 0)
 	dequeued := <-f.sequence.packs
 	f.sequence.releasePackQueue(dequeued)
 	if f.root.UsedByteCount() != 2*f.physical || f.pack.Stats().QuotaByteCount != f.encoded {
@@ -237,6 +262,7 @@ func TestReceivePaidPackBytesKeepsCountBound(t *testing.T) {
 		f.sequence.client.ReceiveStats().PackHandoffDepthGrowCount != 0 {
 		t.Fatal("paid byte permission bypassed count, changed quota, or grew the queue")
 	}
+	assertH1PackRefusalCounts(t, f.sequence.client, 1, 0)
 }
 
 // An unbuffered direct API still requires an actual receiver immediately.
@@ -273,6 +299,7 @@ func TestReceivePaidPackBytesKeepsSharedQuotaBounds(t *testing.T) {
 		if f.quotaParent != nil && f.quotaParent.Stats().QuotaByteCount != f.encoded {
 			t.Fatal("target-exclusive ancestor quota changed on refusal")
 		}
+		assertH1PackRefusalCounts(t, f.sequence.client, 0, 0)
 	}
 }
 
@@ -298,6 +325,7 @@ func TestReceivePaidPackBytesKeepsUnownedLegacyAndIndependentLimits(t *testing.T
 				t.Fatalf("%s: excluded model changed its original Pack accounting", mode)
 			}
 		}
+		assertH1PackRefusalCounts(t, f.sequence.client, 0, 1)
 	}
 }
 
@@ -347,7 +375,7 @@ func TestReceivePaidPackBytesKeepsClosedCarrierAndCancellation(t *testing.T) {
 		if carrierClosed {
 			done := make(chan struct{})
 			close(done)
-			pack.carrierDone = done
+			pack.carrier = &receivePackCarrier{done: done}
 		} else {
 			f.sequence.Cancel()
 		}
@@ -398,6 +426,7 @@ func TestReceivePaidPackBytesKeepsTransportIsolation(t *testing.T) {
 				second.decodedOwner != owner || len(f.sequence.packs) != 2 {
 				t.Fatalf("same paid H1 owner lost its explicit or inherited exception: transport=%s inherited=%t accepted=%t error=%v", transport, inherit, accepted, err)
 			}
+			assertH1PackRefusalCounts(t, f.sequence.client, 0, 0)
 		}
 	}
 }

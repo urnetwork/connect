@@ -292,6 +292,11 @@ message Ack {
     // This is not independent ACK authority: the sender verifies the exact
     // identity against its live original or known terminal-delivery range.
     optional uint64 immediate_sequence_number = 14;
+
+    // Versioned endpoint public key and commitment to the grant introduction.
+    // Only a delivery ACK carried by a verified physical platform receive
+    // lane can complete enrollment.
+    optional bytes stream_forwarding_acceptance = 15;
 }
 
 
@@ -401,6 +406,9 @@ message StreamOpen {
     bytes authorization_generation = 4;
     uint32 authorization_lease_millis = 5;
     int64 authorization_deadline_unix_millis = 6;
+    // Set only by the platform's existing authenticated stream grant. Absent
+    // keeps legacy adjacent-only eligibility.
+    optional bool path_has_intermediaries = 7;
     // ulid
     optional bytes source_id = 2;
     // ulid
@@ -627,6 +635,11 @@ message Contract {
     // Authoritative copy lives in `StoredContract`; this is a
     // convenience copy.
     bytes destination_client_key_signed_tls_certificate = 6;
+
+    // Versioned ephemeral endpoint public key. Only the reliable introduction
+    // received on a verified physical platform lane may supply this offer.
+    // StoredContract's signed bytes stay unchanged.
+    optional bytes stream_forwarding_offer = 15;
 }
 
 message StoredContract {

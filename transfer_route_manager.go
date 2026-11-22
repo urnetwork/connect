@@ -126,6 +126,12 @@ type TransferCarrierProperties struct {
 	// is every platform carrier (the platform attributes sources itself) and
 	// every custom carrier.
 	boundSourceId Id
+	// Issued by the verified platform connection to the exact receive route.
+	platformReceive      *platformReceiveProvenance
+	receivePackCarrier   *receivePackCarrier
+	forwardingReceive    *streamForwardingReceiveLane
+	forwardingSend       *streamForwardingBinding
+	forwardingInnerLimit int
 }
 
 func (self TransferCarrierProperties) messageUnreliable(
@@ -354,7 +360,10 @@ type transferReceiveDisposition struct {
 	h1Credit            platformH1ReceiveCredit
 	// the source the delivering route is bound to, zero when it binds none
 	// (TransferCarrierProperties.boundSourceId)
-	boundSourceId Id
+	boundSourceId      Id
+	platformReceive    *platformReceiveProvenance
+	receivePackCarrier *receivePackCarrier
+	forwardingReceive  *streamForwardingReceiveLane
 }
 
 type transferCarrierMultiRouteReader interface {
@@ -1198,6 +1207,12 @@ func (self *RouteManager) UpdateTransportWithProperties(
 	routes []Route,
 	properties TransferCarrierProperties,
 ) {
+	if len(routes) != 0 && (properties.h1ReceiveDone != nil || properties.platformReceive != nil) {
+		properties.receivePackCarrier = &receivePackCarrier{
+			done:       properties.h1ReceiveDone,
+			provenance: properties.platformReceive,
+		}
+	}
 	self.transportUpdateLock.Lock()
 	self.mutex.Lock()
 	retiredSnapshots := self.writerMatchState.updateTransportWithProperties(
@@ -1386,6 +1401,9 @@ func (self *MatchState) matchesMultiRouteSelectorWithLock(
 	multiRouteSelector *MultiRouteSelector,
 ) bool {
 	destination := multiRouteSelector.destination
+	if endpoint, ok := transport.(*P2pSendTransport); ok && !endpoint.matchesEndpointDestination(destination) {
+		return false
+	}
 	if self.matches(transport, destination) {
 		return true
 	}
@@ -1714,7 +1732,8 @@ type routeSnapshot struct {
 	// h1Only is true only when every currently active writer route is an H1
 	// carrier. Transfer uses it to recover H1's larger WebSocket message
 	// envelope without making an H3 DATAGRAM candidate exceed one tunnel MTU.
-	h1Only bool
+	h1Only             bool
+	hasForwardingRoute bool
 	// Minimum advertised positive ceiling among the active H1 routes. Unknown
 	// routes add no invented limit and are not thereby proved capable.
 	h1MaxMessageByteCount int
@@ -2011,16 +2030,20 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 }
 
 func (self *routeSnapshot) receiveDisposition(route Route, message []byte) transferReceiveDisposition {
+	properties := self.routeCarrierProperties[route]
 	return transferReceiveDisposition{
-		maxMessageByteCount: self.routeCarrierProperties[route].MaxMessageByteCount,
+		maxMessageByteCount: properties.MaxMessageByteCount,
 		transportType:       self.transportType(route),
-		reliability:         self.routeCarrierProperties[route].ReceiveReliability,
+		reliability:         properties.ReceiveReliability,
 		h1Credit: platformH1ReceiveCredit{
-			lane:      self.routeCarrierProperties[route].h1ReceiveRetained,
+			lane:      properties.h1ReceiveRetained,
 			byteCount: ByteCount(cap(message)),
-			done:      self.routeCarrierProperties[route].h1ReceiveDone,
+			done:      properties.h1ReceiveDone,
 		},
-		boundSourceId: self.routeCarrierProperties[route].boundSourceId,
+		boundSourceId:      properties.boundSourceId,
+		platformReceive:    properties.platformReceive,
+		receivePackCarrier: properties.receivePackCarrier,
+		forwardingReceive:  properties.forwardingReceive,
 	}
 }
 
@@ -2215,6 +2238,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 	routePriorities := map[Route]int{}
 	routeCarrierProperties := map[Route]TransferCarrierProperties{}
 	reliableRoutes := []Route{}
+	hasForwardingRoute := false
 	unreliableTransferPath := false
 	unreliableFlightByteLimit := ByteCount(0)
 	unreliableFlightMessageLimit := 0
@@ -2264,6 +2288,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		if transportActive {
 			activeTransports = append(activeTransports, transport)
 			properties := self.transportProperties[transport]
+			hasForwardingRoute = hasForwardingRoute || properties.forwardingSend != nil
 			if properties.Unreliable {
 				unreliableTransferPath = true
 				unreliableFlowIsolation = unreliableFlowIsolation &&
@@ -2403,6 +2428,7 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 		h1Only:                         h1Only,
 		h1MaxMessageByteCount:          h1MaxMessageByteCount,
 		h1MessageLimitsKnown:           h1MessageLimitsKnown,
+		hasForwardingRoute:             hasForwardingRoute,
 		preferDirectRoute:              preferDirectRoute,
 		weight:                         weight,
 		notify:                         self.transportUpdate.NotifyChannel(),
@@ -3059,23 +3085,14 @@ func (self *MultiRouteSelector) writeDetailedReplyWithCarrierPreference(
 	transferFrameBytes []byte,
 	timeout time.Duration,
 	preferredTransportType TransportType,
+	forwarding ...streamForwardingWrite,
 ) (bool, transferWriteDisposition, error) {
-	if self.transportPotentiallyUnreliable(preferredTransportType) {
-		return self.writeDetailedWithRoutePolicy(
-			ctx,
-			transferFrameBytes,
-			timeout,
-			TransportTypeUnknown,
-			true,
-		)
+	reliableOnly := self.transportPotentiallyUnreliable(preferredTransportType)
+	if reliableOnly {
+		preferredTransportType = TransportTypeUnknown
 	}
-	return self.writeDetailedWithRoutePolicy(
-		ctx,
-		transferFrameBytes,
-		timeout,
-		preferredTransportType,
-		false,
-	)
+	return self.writeDetailedWithRoutePolicyGeneration(ctx, transferFrameBytes, timeout,
+		preferredTransportType, reliableOnly, 0, false, nil, forwarding...)
 }
 
 // transportPotentiallyUnreliable reports whether every active route of the
@@ -3138,7 +3155,12 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 	generation uint64,
 	checkGeneration bool,
 	beforeWrite func(),
+	forwarding ...streamForwardingWrite,
 ) (bool, transferWriteDisposition, error) {
+	scope := streamForwardingWrite{inner: transferFrameBytes}
+	if len(forwarding) > 0 {
+		scope = forwarding[0]
+	}
 	enterTime := time.Now()
 	preferredBlockedObserved := false
 
@@ -3153,7 +3175,11 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 	if beforeWrite != nil {
 		beforeWrite()
 	}
-	initialRoutes := initialSnapshot.writeRoutesFor(preferredTransportType, reliableOnly)
+	initialRoutes, fits := initialSnapshot.forwardingWriteRoutes(preferredTransportType, reliableOnly, scope, len(transferFrameBytes))
+	if !fits {
+		initialSnapshot.releaseWriter()
+		return false, failedTransferWriteDisposition(transferWriteFailureOther, enterTime, false), ErrMessageTooLarge
+	}
 	if self.log.V(2).Enabled() {
 		self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(initialRoutes))
 	}
@@ -3220,7 +3246,11 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 			beforeWrite()
 		}
 		notify := snapshot.notify
-		activeRoutes := snapshot.writeRoutesFor(preferredTransportType, reliableOnly)
+		activeRoutes, fits := snapshot.forwardingWriteRoutes(preferredTransportType, reliableOnly, scope, len(transferFrameBytes))
+		if !fits {
+			snapshot.releaseWriter()
+			return false, failedTransferWriteDisposition(transferWriteFailureOther, enterTime, true), ErrMessageTooLarge
+		}
 
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[mrw] %s->%s s(%s) routes = %d\n", self.clientTag, self.destination.DestinationId, self.destination.StreamId, len(activeRoutes))

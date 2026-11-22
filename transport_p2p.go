@@ -330,6 +330,7 @@ type P2pTransport struct {
 	// endpointProbe is enabled only where the multihop stream terminates.
 	// Intermediaries must relay the reserved envelope unchanged.
 	endpointProbe bool
+	forwarding    *streamForwardingBinding
 
 	settings *P2pTransportSettings
 }
@@ -363,14 +364,17 @@ func p2pTransferCarrierProperties(transport Transport) TransferCarrierProperties
 	fastConn, supportsFastPath := send.conn.(webRtcFastPathConn)
 	potentiallyUnreliable := send.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly &&
 		(supportsFastPath || send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly)
+	var properties TransferCarrierProperties
+	if send.forwarding != nil {
+		properties.forwardingSend = send.forwarding
+		properties.forwardingInnerLimit = max(0, send.forwardingPhysicalLimit-streamForwardingTrailerByteCount)
+	}
 	if !potentiallyUnreliable {
-		return TransferCarrierProperties{}
+		return properties
 	}
-	properties := TransferCarrierProperties{
-		Unreliable:                   true,
-		unreliableFlightByteLimit:    p2pUnreliableFlightByteLimit(send.settings),
-		unreliableFlightMessageLimit: p2pUnreliableFlightMessageLimit(send.settings),
-	}
+	properties.Unreliable = true
+	properties.unreliableFlightByteLimit = p2pUnreliableFlightByteLimit(send.settings)
+	properties.unreliableFlightMessageLimit = p2pUnreliableFlightMessageLimit(send.settings)
 	properties.unreliableForMessageByteCount = func(int) bool {
 		if send.settings.DataPlaneMode == P2pDataPlaneModeFastOnly {
 			return true
@@ -438,6 +442,7 @@ type p2pConnectionRouteTestHooks struct {
 }
 
 type p2pReceiveRouteLane struct {
+	forwarding  *streamForwardingReceiveLane
 	transport   Transport
 	route       Route
 	reliability CarrierReliability
@@ -483,6 +488,7 @@ func updateP2pConnectionReceiveRoutes(
 			TransferCarrierProperties{
 				ReceiveReliability: lane.reliability,
 				boundSourceId:      boundSourceId,
+				forwardingReceive:  lane.forwarding,
 			},
 		)
 	}
@@ -643,6 +649,17 @@ func newP2pTransport(
 	settings *P2pTransportSettings,
 	endpointProbe bool,
 ) *P2pTransport {
+	return newP2pTransportWithForwarding(ctx, client, webRtcManager, sendRouteManager, receiveRouteManager, peerId, streamId, peerType, settings, endpointProbe, nil)
+}
+
+// Attaches the stream endpoint's authenticated forwarding scope before either
+// physical direction or its first connected callback can run.
+func newP2pTransportWithForwarding(
+	ctx context.Context, client *Client, webRtcManager *WebRtcManager,
+	sendRouteManager, receiveRouteManager *RouteManager,
+	peerId, streamId Id, peerType PeerType, settings *P2pTransportSettings,
+	endpointProbe bool, forwarding *streamForwardingBinding,
+) *P2pTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	p2pTransport := &P2pTransport{
 		ctx:                 cancelCtx,
@@ -656,6 +673,7 @@ func newP2pTransport(
 		streamId:            streamId,
 		peerType:            peerType,
 		endpointProbe:       endpointProbe,
+		forwarding:          forwarding,
 		settings:            settings,
 	}
 	go HandleError(p2pTransport.run, cancel)
@@ -881,11 +899,16 @@ func (self *P2pTransport) run() {
 			defer handleCancel()
 			var streamProbe *p2pStreamProbe
 			if self.endpointProbe {
-				streamProbe = newP2pStreamProbe(
+				var readiness *p2pStreamReadiness
+				if self.forwarding != nil {
+					readiness = self.forwarding.readiness
+				}
+				streamProbe = newP2pStreamProbeWithReadiness(
 					handleCtx,
 					self.sendRouteManager,
 					self.streamId,
 					self.settings,
+					readiness,
 				)
 				defer streamProbe.close()
 			}
@@ -937,6 +960,14 @@ func (self *P2pTransport) run() {
 					messageHandler,
 					ready.transportDelay,
 				)
+				if self.forwarding != nil {
+					for index := range receiveLanes {
+						lane := &receiveLanes[index]
+						lane.forwarding = &streamForwardingReceiveLane{ctx: handleCtx, binding: self.forwarding, streamId: self.streamId, adjacentId: self.peerId,
+							wireLimit: streamForwardingWireLimit(conn, self.settings, ready.transportDelay,
+								lane.reliability == CarrierReliabilityUnreliable)}
+					}
+				}
 				if self.settings.afterReceiveTransportForTest != nil {
 					self.settings.afterReceiveTransportForTest(p2pReceiveTransport)
 				}
@@ -1040,7 +1071,7 @@ func (self *P2pTransport) run() {
 				// streak.
 				close(setupReady)
 
-				t, route := newP2pSendTransportForPeerWithDelay(
+				t, route := newP2pSendTransportWithForwarding(
 					handleCtx,
 					handleCancel,
 					conn,
@@ -1050,6 +1081,7 @@ func (self *P2pTransport) run() {
 					self.endpointProbe,
 					sendRouteRetired,
 					transportDelay,
+					self.endpointProbe, self.forwarding,
 				)
 				p2pSendTransport = t.(*P2pSendTransport)
 				if self.settings.afterSendTransportForTest != nil {
@@ -1216,8 +1248,11 @@ type P2pSendTransport struct {
 	done           chan struct{}
 	closeOnce      sync.Once
 
-	endToEndReadinessRequired bool
-	endToEndReady             atomic.Bool
+	endToEndReadinessRequired   bool
+	endpointDestinationRequired bool
+	forwarding                  *streamForwardingBinding
+	forwardingPhysicalLimit     int
+	endToEndReady               atomic.Bool
 	// probeSendAdmission joins direct endpoint-probe producers before the send
 	// worker performs its final pooled-route drain.
 	probeSendAdmission p2pProbeSendAdmission
@@ -1317,20 +1352,35 @@ func newP2pSendTransportForPeerWithDelay(
 	routeRetired <-chan struct{},
 	delay *p2pTransportDelay,
 ) (Transport, Route) {
+	return newP2pSendTransportWithForwarding(ctx, cancel, conn, peerId, streamId, settings, endToEndReadinessRequired, routeRetired, delay, false, nil)
+}
+
+// Starts a physical writer after installing immutable stream policy and the
+// shared forwarding association. Compatibility callers retain direct capacity.
+func newP2pSendTransportWithForwarding(
+	ctx context.Context, cancel context.CancelFunc, conn net.Conn,
+	peerId, streamId Id, settings *P2pTransportSettings, endToEndReadinessRequired bool,
+	routeRetired <-chan struct{}, delay *p2pTransportDelay, endpointDestinationRequired bool, forwarding *streamForwardingBinding,
+) (Transport, Route) {
 	send := make(chan []byte, settings.ChannelBufferSize)
 	p2pSendTransport := &P2pSendTransport{
-		transportId:               NewId(),
-		ctx:                       ctx,
-		cancel:                    cancel,
-		conn:                      conn,
-		peerId:                    peerId,
-		streamId:                  streamId,
-		send:                      send,
-		done:                      make(chan struct{}),
-		endToEndReadinessRequired: endToEndReadinessRequired,
-		routeRetired:              routeRetired,
-		settings:                  settings,
-		delay:                     delay,
+		transportId:                 NewId(),
+		ctx:                         ctx,
+		cancel:                      cancel,
+		conn:                        conn,
+		peerId:                      peerId,
+		streamId:                    streamId,
+		send:                        send,
+		done:                        make(chan struct{}),
+		endToEndReadinessRequired:   endToEndReadinessRequired,
+		endpointDestinationRequired: endpointDestinationRequired,
+		forwarding:                  forwarding,
+		routeRetired:                routeRetired,
+		settings:                    settings,
+		delay:                       delay,
+	}
+	if forwarding != nil {
+		p2pSendTransport.forwardingPhysicalLimit = p2pSendTransport.forwardingWireLimit()
 	}
 	p2pSendTransport.probeSendAdmission.open = true
 	if endToEndReadinessRequired {
@@ -1615,10 +1665,26 @@ func (self *P2pSendTransport) run() {
 			if len(transferFrameBytes) > maxMessageByteCount {
 				DefaultLogger().V(1).Infof("[p2p]s(%s) send message too large = %d\n", self.streamId, len(transferFrameBytes))
 				MessagePoolReturn(transferFrameBytes)
+				if self.forwarding != nil {
+					continue
+				}
 				return
 			}
-			messageByteCount := len(transferFrameBytes)
 			probeMessage := isP2pStreamProbe(transferFrameBytes)
+			if self.forwarding != nil && !probeMessage {
+				association := self.forwarding.association.Load()
+				if association == nil || association.grant.path.StreamId != self.streamId || association.sendPath.DestinationId == self.peerId {
+					MessagePoolReturn(transferFrameBytes)
+					continue
+				}
+				wire, admitted := association.seal(transferFrameBytes, self.forwardingPhysicalLimit)
+				MessagePoolReturn(transferFrameBytes)
+				if !admitted {
+					continue
+				}
+				transferFrameBytes = wire
+			}
+			messageByteCount := len(transferFrameBytes)
 			fastConn, supportsFastPath := self.conn.(webRtcFastPathConn)
 			if self.settings.DataPlaneMode != P2pDataPlaneModeLegacyOnly {
 				if supportsFastPath &&

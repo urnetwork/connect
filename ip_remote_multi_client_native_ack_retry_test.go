@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"unsafe"
 
 	"github.com/urnetwork/connect/protocol"
@@ -292,4 +295,139 @@ func TestNativeAdvancingAckPreparationHasNoHeapAllocation(t *testing.T) {
 	if allocations != 0 || group.nativeAckRetry != nil || group.nativeAckRetrySelection == nil || group.nativeAckRetrySerial == 0 {
 		t.Fatalf("ordinary advancing preparation: allocations=%g attempt=%p serial=%d", allocations, group.nativeAckRetry, group.nativeAckRetrySerial)
 	}
+}
+
+// A retry turn signals a vacancy. Another producer can buy the slot before
+// the retained native ACK offers its original bytes again.
+func TestNativeRetainedAckReadyRefusalPreservesAdmissionProvenance(t *testing.T) {
+	MessagePoolReturn(MessagePoolGet(1))
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		var contend, reserved atomic.Pointer[sendPackAdmission]
+		observations := make(chan SendPackLifecycleObservation, 16)
+		fixture := newGroupDispositionQueueFixture(t, nil, func(settings *ClientSettings) {
+			settings.SendBufferSettings.SequenceBufferSize = 1
+			previous := settings.SendBufferSettings.SendPackLifecycleObserver
+			settings.SendBufferSettings.SendPackLifecycleObserver = func(observation SendPackLifecycleObservation) {
+				previous(observation)
+				if observation.MessageType != protocol.MessageType_IpIpPacketToProvider {
+					return
+				}
+				if observation.Phase == SendPackLifecyclePhaseStarted {
+					if admission := contend.Swap(nil); admission != nil {
+						acquired, closed, _ := admission.tryAcquire(sendSchedulingKey{}, false)
+						if !acquired || closed {
+							t.Error("the competing producer could not take the actual raw vacancy")
+						} else {
+							reserved.Store(admission)
+						}
+					}
+				}
+				select {
+				case observations <- observation:
+				default:
+					t.Error("native retry lifecycle exceeded the fixture bound")
+				}
+			}
+		})
+		release := func() {
+			if admission := reserved.Swap(nil); admission != nil {
+				admission.release(sendSchedulingKey{})
+			}
+		}
+		t.Cleanup(func() {
+			release()
+			fixture.update.Close()
+			fixture.parent.discardNativeAckRetries()
+		})
+
+		zero := groupDispositionControlPacket(100, 500, 0, tcpFlagAck)
+		advancing := groupDispositionControlPacket(100, 501, 4096, tcpFlagAck)
+		parsed := groupRecoveryParsed(t, zero)
+		fixture.update.ipPath = parsed.ipPath
+		fixture.update.updateSequence(parsed)
+		fixture.update.receivedInbound.Store(true)
+		fixture.parent.ip4PathUpdates = map[Ip4Path]*multiClientChannelUpdate{parsed.ipPath.ToIp4Path(): fixture.update}
+		fixture.parent.flowReaperDone = make(chan struct{})
+		fixture.parent.flowReaperWake = make(chan struct{}, 1)
+
+		offer := func(packet []byte) (int, bool) {
+			original := MessagePoolCopy(packet)
+			fixture.witnesses = append(fixture.witnesses, MessagePoolShareReadOnly(original))
+			accepted := [1]bool{true}
+			count := fixture.parent.SendNativePacketBatchWithResults(
+				fixture.source, protocol.ProvideMode_Network, [][]byte{original}, 0, accepted[:])
+			return count, accepted[0]
+		}
+		if count, accepted := offer(zero); count != 1 || !accepted {
+			t.Fatalf("the initial ACK did not fill the raw protocol slot: %d %t", count, accepted)
+		}
+		fixture.requireParked()
+		if count, accepted := offer(advancing); count != 0 || accepted {
+			t.Fatalf("the original advancing native offer was not refused at capacity: %d %t", count, accepted)
+		}
+		owner := fixture.update.nativeAckRetry
+		if owner == nil || owner.attempt.source == nil || owner.credit == nil ||
+			!bytes.Equal(owner.packet, advancing) || !owner.attempt.gate.Load() {
+			t.Fatal("the original refusal did not retain its exact ACK against the occupied raw slot")
+		}
+		admission := owner.attempt.source.protocolAdmission
+		fixture.unpark()
+		fixture.acknowledgeAll(zero)
+		if !owner.attempt.gate.watchGranted(&owner.waiter, owner.installation) {
+			t.Fatal("the prior reliable ACK did not expose the real raw vacancy")
+		}
+
+		contend.Store(admission)
+		fixture.parent.drainNativeAckRetries()
+		synctest.Wait()
+		if reserved.Load() != admission || fixture.update.nativeAckRetry != owner ||
+			owner.installation == 0 || !owner.attempt.gate.Load() || len(fixture.route) != 0 ||
+			!bytes.Equal(owner.packet, advancing) || fixture.parent.NativeAdmissionRefusalCount() != 1 {
+			t.Fatal("the retained replay did not rearm after a raw refusal without a wire write or second original")
+		}
+		var failures []SendPackLifecycleObservation
+		for len(observations) != 0 {
+			if observation := <-observations; observation.Err != nil {
+				failures = append(failures, observation)
+			}
+		}
+		if len(failures) != 4 || failures[0].Token == failures[2].Token {
+			t.Fatalf("missing distinct original/replay refusal lifecycles: %+v", failures)
+		}
+		for index := 0; index < len(failures); index += 2 {
+			first, terminal := failures[index], failures[index+1]
+			if first.Phase != SendPackLifecyclePhaseFirstRouteWrite || terminal.Phase != SendPackLifecyclePhaseTerminal ||
+				first.Token != terminal.Token || first.ClientId != terminal.ClientId || first.DestinationId != terminal.DestinationId {
+				t.Fatalf("refusal phases did not join the same Pack: %+v %+v", first, terminal)
+			}
+		}
+		var replayMarked bool
+		for index, failure := range failures {
+			var detail *SendPackAdmissionError
+			if !failure.AckRequired || !errors.As(failure.Err, &detail) || detail.Boundary != "pack-admission" ||
+				detail.Timeout != 0 || detail.RecoveredByOwner || detail.OwnerTrackingOverflow ||
+				!errors.Is(detail.Err, ErrSendPackNotAdmitted) {
+				t.Fatalf("refusal %d lacked exact pre-admission evidence: %+v", index, failure)
+			}
+			if index < 2 && !detail.NativeReadyPureTcpAck {
+				t.Fatalf("original refusal %d lost its native ACK provenance", index)
+			}
+			if index == 2 {
+				replayMarked = detail.NativeReadyPureTcpAck
+			} else if index == 3 {
+				replayMarked = replayMarked && detail.NativeReadyPureTcpAck
+			}
+		}
+
+		release()
+		fixture.parent.drainNativeAckRetries()
+		fixture.acknowledgeAll(advancing)
+		if fixture.update.nativeAckRetry != nil || owner.credit != nil || owner.packet != nil {
+			t.Fatal("the later exact replay did not retire its owner")
+		}
+		if !replayMarked {
+			t.Error("retained native ACK retry lost ready-refusal provenance in its matched Pack phases")
+		}
+	})
 }

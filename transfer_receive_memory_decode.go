@@ -110,6 +110,7 @@ func (self *Client) unmarshalReceiveMemoryFrame(carrier []byte, decoded *decoded
 		if sequence != nil {
 			sequence.requestReceiveMemoryPressure(scan, decrypted)
 		}
+		self.receivePackDecodeOwnerRefusalCount.Add(1)
 		self.recordReceivePackHandoffDrop(scan.messageByteCount)
 		return false, true
 	}
