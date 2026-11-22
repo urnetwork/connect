@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -25,6 +26,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -1044,6 +1047,16 @@ type tlsHandshakeEpoch struct {
 	// immediately, keeping the receive-loop work — and therefore the DoS
 	// surface — minimal.
 	serverFlightSent bool
+	// A responder epoch's answer to its named attempt (see
+	// `deliverAttemptHandshake`): set when the epoch is fed the attempt's
+	// ClientHello, with that ClientHello's SHA-256, and again for the one
+	// second ClientHello TLS 1.3 allows, after a HelloRetryRequest. A
+	// ClientHello equal to either is a retransmit of the attempt already
+	// answered, and no other record of the attempt is fed before the first.
+	clientHelloAnswered      bool
+	clientHelloDigest        [sha256.Size]byte
+	retryClientHelloAnswered bool
+	retryClientHelloDigest   [sha256.Size]byte
 }
 
 // Stands for a contract with no signed deadline, or a seal under no contract.
@@ -1234,6 +1247,20 @@ type peerEncryptionSession struct {
 	// on the sealing side. Guarded by stateLock.
 	lastUnknownWrapNackTime        time.Time
 	nextUnknownWrapNackRestartTime time.Time
+	// The attempt the latest nack demotion started (see
+	// `handleUnknownWrapNack`). Every attempt this session minted before it was
+	// dropped there, and their handshake records still queued or retransmittable
+	// in a send sequence leave it before it writes them again
+	// (`SendSequence.dropStaleHandshakeRecords`), so the peer, which lost its
+	// session, never meets them ahead of the new ClientHello. Attempt ids are
+	// this session's own, minted in increasing order. Guarded by stateLock;
+	// staleHandshakeRecordsSet lets a send sequence skip the lock until a
+	// demotion has happened.
+	staleHandshakeRecordsBefore Id
+	staleHandshakeRecordsSet    atomic.Bool
+	// Nil test observer sees the attempt a nack demotion started, called with
+	// stateLock held, so it must not block.
+	staleHandshakeRecordsForTest func(Id)
 	// Stable establishment failures log once per streak. Mobile provider
 	// windows can hold dozens of stale candidates; writing the same timeout
 	// for every retry adds disk/logd work without adding evidence.
@@ -2478,7 +2505,15 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 // Non-ClientHello handshake bytes arriving after the handshake completed are
 // stale post-completion records; dropped rather than re-fed to a closed TLS
 // state machine.
+//
+// A responder's named control (the TLS-server role, epoch_id set) goes to
+// `deliverAttemptHandshake` instead, which answers each attempt at most once.
+// What follows is the initiator's path, and a pre-epoch peer's.
 func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) {
+	if self.role == sequenceTlsRoleServer && epochId != (Id{}) {
+		self.deliverAttemptHandshake(payload, epochId)
+		return
+	}
 	// A control naming a DIFFERENT generation than the epoch we hold is the
 	// peer having restarted its handshake. Reset onto the new generation
 	// instead of feeding foreign bytes to the current TLS state (which would
@@ -2545,6 +2580,157 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 	e.transport.Deliver(payload)
 }
 
+// Feeds a responder's named handshake control (`EncryptedControl.epoch_id`
+// names the initiator's attempt) to the epoch of its attempt, answering each
+// attempt at most once, so one attempt's records never meet another's TLS
+// state. A second answer to one attempt is always wrong: the initiator
+// consumes whichever server flight reaches it first, and its second flight
+// then fails against the other with a bad record MAC.
+//
+//   - A ClientHello of a newer attempt than the current epoch's, or with no
+//     epoch of a named attempt, opens a fresh epoch; the established one keeps
+//     serving until it establishes.
+//   - A ClientHello of the attempt the current epoch already answered is a
+//     retransmit, through a replaced carrier sequence or the receive loop's
+//     early delivery (`optimisticallyDeliverClientHelloForEpoch`). It is
+//     dropped, never fed again and never a reset, whether that handshake is in
+//     flight, failed or established. The one exception is the different
+//     second ClientHello TLS 1.3 sends after a HelloRetryRequest, fed while
+//     the attempt's handshake is in flight.
+//   - Any other handshake record, the initiator's second flight, is fed only
+//     to the epoch that answered its attempt's ClientHello, and opens none.
+//     With no such epoch it belongs to an attempt this responder never
+//     answered: a prior process's, which a restarted responder meets as the
+//     initiator retransmits what the prior process never acknowledged, or a
+//     superseded one.
+//   - A record of an older attempt than the current epoch's is a straggler.
+//
+// Safe to call from the receive loop: it starts epoch workers and appends to
+// a transport's inbox, and never blocks.
+func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epochId Id) {
+	clientHello := isClientHelloRecord(payload)
+	var digest [sha256.Size]byte
+	if clientHello {
+		digest = sha256.Sum256(payload)
+	}
+	var feed *tlsHandshakeEpoch
+	opened := false
+	dropReason := ""
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		e := self.epoch
+		if e != nil && e.epochId != (Id{}) && e.epochId != epochId &&
+			!e.epochId.LessThan(epochId) {
+			dropReason = "a straggler of an older attempt"
+			return
+		}
+		if e == nil || e.epochId != epochId {
+			// no epoch, an unnamed one, or one of an older attempt
+			if !clientHello {
+				dropReason = "no epoch answered its attempt"
+				return
+			}
+			self.buildAndStartEpochWithLock()
+			if self.epoch == e {
+				// the session is closing
+				dropReason = "the session is closed"
+				return
+			}
+			e = self.epoch
+			e.epochId = epochId
+			opened = true
+		}
+		if !clientHello {
+			if !e.clientHelloAnswered {
+				dropReason = "no ClientHello of its attempt was answered"
+				return
+			}
+			if isClosed(e.handshakeDone) {
+				dropReason = "its attempt's handshake is done"
+				return
+			}
+			feed = e
+			return
+		}
+		switch {
+		case !e.clientHelloAnswered:
+			e.clientHelloAnswered = true
+			e.clientHelloDigest = digest
+		case digest == e.clientHelloDigest ||
+			e.retryClientHelloAnswered && digest == e.retryClientHelloDigest:
+			dropReason = "a retransmit of the ClientHello already answered"
+			return
+		case !e.retryClientHelloAnswered && !isClosed(e.handshakeDone):
+			e.retryClientHelloAnswered = true
+			e.retryClientHelloDigest = digest
+		default:
+			dropReason = "its attempt was already answered"
+			return
+		}
+		if isClosed(e.handshakeDone) {
+			// an epoch that failed closed as it was built
+			dropReason = "the epoch failed as it opened"
+			return
+		}
+		feed = e
+	}()
+	if dropReason != "" {
+		if self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s handshake for attempt %s (%d bytes, ClientHello=%t) dropped: %s\n",
+				self.logTag, epochId, len(payload), clientHello, dropReason,
+			)
+		}
+		return
+	}
+	if feed == nil || feed.transport == nil {
+		return
+	}
+	if self.client.log.V(1).Enabled() {
+		self.client.log.Infof(
+			"[tls]%s handshake for attempt %s: feeding %d bytes (ClientHello=%t, new epoch=%t) to TLS state\n",
+			self.logTag, epochId, len(payload), clientHello, opened,
+		)
+	}
+	feed.transport.Deliver(payload)
+}
+
+// Delivers a named ClientHello from the receive loop, ahead of the ordered
+// receive sequence, to a responder that holds no established epoch, as a client
+// second flight is delivered early. Such a responder can read nothing from the
+// initiator and so has nothing to protect: it restarted, or lost its session,
+// while the initiator kept its own. Its receive sequence for the initiator's
+// carrier can hold the recovery ClientHello indefinitely. The initiator's
+// records sealed under the epoch it demoted cannot be opened here and leave a
+// gap before it, and a restarted responder that never saw the carrier's head
+// waits for a head that only a resend sealed under the next epoch carries. The
+// handshake would wait on itself. Delivered here, the attempt is answered at
+// once, its second flight and identity proof follow early too, and the ordered
+// path's later copy of the ClientHello is a retransmit `deliverAttemptHandshake`
+// drops. A session with an established epoch keeps the ordered path alone.
+//
+// Only a session that requires encryption (`RequireEncryption`) takes it. The
+// wait exists only where the demoted epoch's records cannot be resent in
+// plaintext, which is Required's rule; under Opportunistic the initiator resends
+// them in plaintext, they fill the gap, and the ClientHello arrives in order
+// behind them, as it always has. Sessions run in one mode on both ends.
+func (self *peerEncryptionSession) optimisticallyDeliverClientHelloForEpoch(payload []byte, epochId Id) {
+	if self.role != sequenceTlsRoleServer || epochId == (Id{}) || !isClientHelloRecord(payload) ||
+		!self.RequireEncryption() {
+		return
+	}
+	established := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		return self.establishedEpoch != nil
+	}()
+	if established {
+		return
+	}
+	self.deliverAttemptHandshake(payload, epochId)
+}
+
 // receivePeerIdentityProof buffers the peer's identity-proof payload
 // and attempts verification. If the peer key and our TLS exporter are
 // both already known, verification runs immediately. Otherwise the
@@ -2572,7 +2758,35 @@ func (self *peerEncryptionSession) receivePeerIdentityProof(payload []byte) {
 // a mismatch is diagnosed instead: the peer has moved to a new epoch, so
 // restart the handshake to converge, and never let a foreign-epoch proof mark
 // this one failed.
+//
+// A responder's named proof goes only to the epoch that answered its attempt's
+// ClientHello (see `deliverAttemptHandshake`), which the initiator's proof
+// always follows, since the initiator signs only after our server flight. With
+// no such epoch the proof belongs to an attempt this responder never answered,
+// a prior process's or a superseded one: it opens no epoch, adopts no name and
+// judges none.
 func (self *peerEncryptionSession) receivePeerIdentityProofForEpoch(payload []byte, epochId Id) {
+	if self.role == sequenceTlsRoleServer && epochId != (Id{}) {
+		e := func() *tlsHandshakeEpoch {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.epoch == nil || self.epoch.epochId != epochId || !self.epoch.clientHelloAnswered {
+				return nil
+			}
+			return self.epoch
+		}()
+		if e == nil {
+			if self.client.log.V(1).Enabled() {
+				self.client.log.Infof(
+					"[tls]%s identity proof for attempt %s dropped: no epoch answered its attempt\n",
+					self.logTag, epochId,
+				)
+			}
+			return
+		}
+		self.bufferPeerIdentityProof(e, payload)
+		return
+	}
 	// The proof binds the current epoch's exporter; ensure an epoch exists to
 	// buffer it against (a proof can race ahead of our handshake completing).
 	self.startEpoch()
@@ -2604,6 +2818,12 @@ func (self *peerEncryptionSession) receivePeerIdentityProofForEpoch(payload []by
 			return
 		}
 	}
+	self.bufferPeerIdentityProof(e, payload)
+}
+
+// Buffers the peer's identity proof on epoch e, the epoch it was resolved to,
+// and attempts verification (see `receivePeerIdentityProof`).
+func (self *peerEncryptionSession) bufferPeerIdentityProof(e *tlsHandshakeEpoch, payload []byte) {
 	stored, identityFailed, skipReason := func() (bool, bool, string) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -4734,6 +4954,16 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 // sequence the first application pack re-wedges ahead of it) behind a gap
 // that never fills (the §8.1 head-of-line shape; both observed directly).
 // Client-role only: in TLS only the client can initiate.
+//
+// Under Required the demoted backlog cannot fill that gap either, since it is
+// never resent in plaintext, and a restarted peer never saw the sequence's
+// head. The recovery reaches such a peer anyway (QD-1176): its responder takes
+// the recovery ClientHello from the receive loop
+// (`optimisticallyDeliverClientHelloForEpoch`) and answers each attempt once
+// (`deliverAttemptHandshake`), and the demoted attempts' handshake records,
+// which it would otherwise meet first, leave this side's send sequences
+// (`dropStaleHandshakeRecords`). Once the recovery seals, the backlog's resend
+// carries the new epoch, its oldest Pack promoted to the sequence's head.
 func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -4785,9 +5015,109 @@ func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 		self.priorEstablishedEpoch.cancel()
 		self.priorEstablishedEpoch = nil
 	}
+	demotedEpoch := self.epoch
 	self.establishedEpoch.cancel()
 	self.establishedEpoch = nil
 	self.buildAndStartEpochWithLock()
+	// Every attempt minted before the new one is dropped, so are its handshake
+	// records still queued or retransmittable: a peer that lost its session
+	// would answer a stale ClientHello, and meet a stale second flight or proof
+	// with no ClientHello of it, before the new ClientHello reached it.
+	if self.epoch != demotedEpoch && self.epoch != nil && self.epoch.epochId != (Id{}) {
+		self.staleHandshakeRecordsBefore = self.epoch.epochId
+		self.staleHandshakeRecordsSet.Store(true)
+		if self.staleHandshakeRecordsForTest != nil {
+			self.staleHandshakeRecordsForTest(self.epoch.epochId)
+		}
+	}
+}
+
+// Whether a send sequence carrying this session's records must look for stale
+// ones: a nack demotion has dropped attempts (see `handleUnknownWrapNack`).
+func (self *peerEncryptionSession) dropsStaleHandshakeRecords() bool {
+	return self.staleHandshakeRecordsSet.Load()
+}
+
+// Whether frame is a handshake record of this session, a TLS handshake flight
+// or an identity proof, of an attempt a nack demotion dropped: its attempt id
+// is below the one the latest demotion started. Anything else, an unknown-wrap
+// nack among them, is not.
+func (self *peerEncryptionSession) handshakeRecordStale(frame *protocol.Frame) bool {
+	if frame == nil || frame.MessageType != protocol.MessageType_TransferEncryptedControl ||
+		!self.staleHandshakeRecordsSet.Load() {
+		return false
+	}
+	ec := &protocol.EncryptedControl{}
+	if err := ProtoUnmarshal(frame.MessageBytes, ec); err != nil {
+		return false
+	}
+	switch ec.ControlType {
+	case protocol.EncryptedControlType_EncryptedControlHandshake,
+		protocol.EncryptedControlType_EncryptedControlIdentityProof:
+	default:
+		return false
+	}
+	epochId, err := IdFromBytes(ec.GetEpochId())
+	if err != nil {
+		return false
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return epochId.LessThan(self.staleHandshakeRecordsBefore)
+}
+
+// Rewrites a queued or retransmittable item of this sequence so it carries no
+// handshake record of an attempt its session's nack demotion dropped
+// (`peerEncryptionSession.handshakeRecordStale`). The stale records leave the
+// Pack, which keeps its sequence number, head, contract and every other frame,
+// so the receiver's order is intact and the peer that lost its session meets
+// the new attempt's ClientHello rather than the dropped attempts' records. A
+// Pack left with no frame carries nothing, as a contract-only Pack does, and the
+// receiver acknowledges it. Runs on the sequence's own worker, as setHead does.
+func (self *SendSequence) dropStaleHandshakeRecords(item *sendItem) error {
+	var transferFrame protocol.TransferFrame
+	if err := ProtoUnmarshal(item.transferFrameBytes, &transferFrame); err != nil {
+		return err
+	}
+	var pack *protocol.Pack
+	if transferFrame.Pack != nil {
+		pack = transferFrame.Pack
+	} else {
+		if transferFrame.Frame == nil {
+			return nil
+		}
+		pack = &protocol.Pack{}
+		if err := ProtoUnmarshal(transferFrame.Frame.MessageBytes, pack); err != nil {
+			return err
+		}
+	}
+	keptFrames := make([]*protocol.Frame, 0, len(pack.Frames))
+	for _, frame := range pack.Frames {
+		if !self.session.handshakeRecordStale(frame) {
+			keptFrames = append(keptFrames, frame)
+		}
+	}
+	if len(keptFrames) == len(pack.Frames) {
+		return nil
+	}
+	pack.Frames = keptFrames
+	if transferFrame.Pack == nil {
+		packBytes, err := ProtoMarshal(pack)
+		if err != nil {
+			return err
+		}
+		defer MessagePoolReturn(packBytes)
+		transferFrame.Frame.MessageBytes = packBytes
+	}
+	if !item.reserveFrameRewrite(ByteCount(proto.Size(&transferFrame)), len(pack.Frames), self.sendBufferSettings.ProtocolVersion < 2) {
+		return ErrSendPackNotAdmitted
+	}
+	transferFrameBytes, err := ProtoMarshal(&transferFrame)
+	if err != nil {
+		return err
+	}
+	self.replaceSendItemFrame(item, transferFrameBytes)
+	return nil
 }
 
 // maybeFetchPeerClientPublicKeyForIdentity resolves the peer's identity key

@@ -290,6 +290,10 @@ func TestOptimisticIdentityProofCarriesEpoch(t *testing.T) {
 	e := injectTestEpochWithId(sess, true, nil, newer)
 	sess.stateLock.Lock()
 	e.tlsExporter = make([]byte, 32)
+	// a responder's epoch holds a generation's name only once it answered that
+	// generation's ClientHello (deliverAttemptHandshake), and takes only that
+	// generation's proof
+	e.clientHelloAnswered = true
 	sess.stateLock.Unlock()
 
 	// buildProofFrame renders a peer identity-proof control for `epochId` on

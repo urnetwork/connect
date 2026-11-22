@@ -1,9 +1,11 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"testing"
@@ -669,9 +671,14 @@ func TestPeerSessionIdentityVerifiedOnProof(t *testing.T) {
 // real epochs. No epoch is started; the caller drives the lifecycle. A short
 // handshake timeout keeps any stray real epoch from lingering.
 func newTestEncryptionSession(t *testing.T, role sequenceTlsRole) (*peerEncryptionSession, func()) {
+	return newTestEncryptionSessionWithMode(t, role, EncryptionModeOpportunistic)
+}
+
+// newTestEncryptionSession with the encryption mode selectable.
+func newTestEncryptionSessionWithMode(t *testing.T, role sequenceTlsRole, mode EncryptionMode) (*peerEncryptionSession, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := DefaultClientSettings()
-	settings.EncryptionSettings.Mode = EncryptionModeOpportunistic
+	settings.EncryptionSettings.Mode = mode
 	settings.EncryptionSettings.TlsTimeout = 2 * time.Second
 	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
 	keyManager, err := NewClientKeyManager(ctx, client)
@@ -1571,5 +1578,415 @@ func TestEncryptedControlCarrierMirrorsForceStream(t *testing.T) {
 	}
 	if s.carrierNetworkPeer.Load() {
 		t.Fatal("AcquireForSend(networkPeer=false) must retune Network contract policy")
+	}
+}
+
+// QD-1176's responder rules, on a session's state alone. An injected epoch has
+// no handshake goroutine behind it, so what is fed to it stays in its
+// transport's inbox, where a test reads it.
+
+// A test ClientHello: record type 22, handshake type 1, its last byte distinct.
+func testAttemptClientHello(variant byte) []byte {
+	return []byte{22, 3, 3, 0, 100, 1, 0, 0, 96, variant}
+}
+
+// A test second flight's first record: a legacy ChangeCipherSpec.
+func testAttemptSecondFlight() []byte {
+	return []byte{20, 3, 3, 0, 1, 1}
+}
+
+// Injects a responder epoch of attempt epochId, which answered clientHello when
+// it is not nil, completed when completed is set.
+func injectTestAttemptEpoch(sess *peerEncryptionSession, epochId Id, clientHello []byte, completed bool, handshakeErr error) *tlsHandshakeEpoch {
+	e := injectTestEpoch(sess, completed, handshakeErr)
+	sess.stateLock.Lock()
+	defer sess.stateLock.Unlock()
+	e.epochId = epochId
+	e.transport = newSequenceTlsTransport(e.ctx)
+	if clientHello != nil {
+		e.clientHelloAnswered = true
+		e.clientHelloDigest = sha256.Sum256(clientHello)
+	}
+	return e
+}
+
+// The bytes fed to e's transport.
+func testInboxByteCount(e *tlsHandshakeEpoch) int {
+	e.transport.inboxLock.Lock()
+	defer e.transport.inboxLock.Unlock()
+	return len(e.transport.inboxBuf)
+}
+
+// The current epoch's attempt id and whether it answered a ClientHello.
+func testCurrentAttempt(sess *peerEncryptionSession) (*tlsHandshakeEpoch, Id, bool) {
+	sess.stateLock.Lock()
+	defer sess.stateLock.Unlock()
+	if sess.epoch == nil {
+		return nil, Id{}, false
+	}
+	return sess.epoch, sess.epoch.epochId, sess.epoch.clientHelloAnswered
+}
+
+// A retransmitted ClientHello of the attempt the responder answered, through a
+// replaced carrier sequence or the receive loop's early delivery, is never fed
+// again and never resets the epoch, whatever its handshake's state: a second
+// answer to one attempt is what put a client second flight into another
+// attempt's TLS state (the bad record MAC of QD-1176's question).
+func TestResponderDropsARetransmittedClientHelloOfItsAnsweredAttempt(t *testing.T) {
+	cases := []struct {
+		name         string
+		completed    bool
+		handshakeErr error
+	}{
+		{name: "in flight"},
+		{name: "completed", completed: true},
+		{name: "failed", completed: true, handshakeErr: errors.New("boom")},
+	}
+	clientHello := testAttemptClientHello(1)
+	for _, c := range cases {
+		sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+		attemptId := NewId()
+		e := injectTestAttemptEpoch(sess, attemptId, clientHello, c.completed, c.handshakeErr)
+		sess.deliverHandshake(clientHello, attemptId)
+		sess.optimisticallyDeliverClientHelloForEpoch(clientHello, attemptId)
+		if current, _, _ := testCurrentAttempt(sess); current != e {
+			t.Errorf("%s: a retransmitted ClientHello replaced the answered attempt's epoch", c.name)
+		}
+		if n := testInboxByteCount(e); n != 0 {
+			t.Errorf("%s: a retransmitted ClientHello fed %d bytes to the answered attempt's TLS state", c.name, n)
+		}
+		cleanup()
+	}
+}
+
+// A ClientHello of a newer attempt opens a fresh epoch named for it; one of an
+// older attempt is a straggler and changes nothing.
+func TestResponderOpensANewerAttemptAndDropsAnOlderOne(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	olderId, currentId, newerId := NewId(), NewId(), NewId()
+	e := injectTestAttemptEpoch(sess, currentId, testAttemptClientHello(1), true, nil)
+
+	sess.deliverHandshake(testAttemptClientHello(2), olderId)
+	if current, _, _ := testCurrentAttempt(sess); current != e || testInboxByteCount(e) != 0 {
+		t.Fatal("an older attempt's ClientHello reached the current epoch")
+	}
+
+	sess.deliverHandshake(testAttemptClientHello(3), newerId)
+	current, attemptId, answered := testCurrentAttempt(sess)
+	if current == e || attemptId != newerId || !answered {
+		t.Fatalf("a newer attempt's ClientHello opened %s (answered=%t), want a fresh epoch of %s", attemptId, answered, newerId)
+	}
+	select {
+	case <-e.ctx.Done():
+	default:
+		t.Fatal("the replaced epoch was left running")
+	}
+}
+
+// TLS 1.3's one second ClientHello, after a HelloRetryRequest, is fed while
+// the attempt is in flight, once. Any other ClientHello of the attempt is not.
+func TestResponderFeedsOneHelloRetryClientHello(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	attemptId := NewId()
+	first, retry, third := testAttemptClientHello(1), testAttemptClientHello(2), testAttemptClientHello(3)
+	e := injectTestAttemptEpoch(sess, attemptId, first, false, nil)
+
+	sess.deliverHandshake(retry, attemptId)
+	if n := testInboxByteCount(e); n != len(retry) {
+		t.Fatalf("the retry ClientHello fed %d bytes, want %d", n, len(retry))
+	}
+	for _, clientHello := range [][]byte{retry, first, third} {
+		sess.deliverHandshake(clientHello, attemptId)
+	}
+	if n := testInboxByteCount(e); n != len(retry) {
+		t.Fatalf("after the retry, %d bytes were fed, want %d", n, len(retry))
+	}
+
+	// once the attempt's handshake is done, no other ClientHello of it is fed
+	done := injectTestAttemptEpoch(sess, attemptId, first, true, nil)
+	sess.deliverHandshake(retry, attemptId)
+	if current, _, _ := testCurrentAttempt(sess); current != done || testInboxByteCount(done) != 0 {
+		t.Fatal("a second ClientHello reached an attempt whose handshake is done")
+	}
+}
+
+// A handshake record other than a ClientHello is fed only to the epoch that
+// answered its attempt's ClientHello, and opens no epoch: a restarted
+// responder meets the initiator's retransmitted second flight of an attempt
+// its prior process answered.
+func TestResponderRecordOfAnUnansweredAttemptOpensNoEpoch(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	secondFlight := testAttemptSecondFlight()
+	olderId, currentId, newerId := NewId(), NewId(), NewId()
+
+	sess.deliverHandshake(secondFlight, currentId)
+	if current, _, _ := testCurrentAttempt(sess); current != nil {
+		t.Fatal("a second flight with no answered ClientHello opened an epoch")
+	}
+
+	e := injectTestAttemptEpoch(sess, currentId, testAttemptClientHello(1), false, nil)
+	sess.deliverHandshake(secondFlight, olderId)
+	sess.deliverHandshake(secondFlight, newerId)
+	if current, _, _ := testCurrentAttempt(sess); current != e || testInboxByteCount(e) != 0 {
+		t.Fatal("another attempt's second flight reached the current epoch, or opened one")
+	}
+	sess.deliverHandshake(secondFlight, currentId)
+	if n := testInboxByteCount(e); n != len(secondFlight) {
+		t.Fatalf("the answered attempt's second flight fed %d bytes, want %d", n, len(secondFlight))
+	}
+
+	unanswered := injectTestAttemptEpoch(sess, currentId, nil, false, nil)
+	sess.deliverHandshake(secondFlight, currentId)
+	if testInboxByteCount(unanswered) != 0 {
+		t.Fatal("a second flight reached an epoch that answered no ClientHello of its attempt")
+	}
+
+	completed := injectTestAttemptEpoch(sess, currentId, testAttemptClientHello(1), true, nil)
+	sess.deliverHandshake(secondFlight, currentId)
+	if testInboxByteCount(completed) != 0 {
+		t.Fatal("a second flight reached an attempt whose handshake is done")
+	}
+}
+
+// A responder's named identity proof goes only to the epoch that answered its
+// attempt: with none it opens no epoch, adopts no name and converges on
+// nothing, so a prior process's proof never judges a restarted responder's
+// state.
+func TestResponderIdentityProofOfAnUnansweredAttemptOpensNoEpoch(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+	defer cleanup()
+	proof := make([]byte, ed25519.SignatureSize)
+	currentId, newerId := NewId(), NewId()
+
+	sess.receivePeerIdentityProofForEpoch(proof, currentId)
+	if current, _, _ := testCurrentAttempt(sess); current != nil {
+		t.Fatal("a proof of an unanswered attempt opened an epoch")
+	}
+
+	e := injectTestAttemptEpoch(sess, currentId, testAttemptClientHello(1), false, nil)
+	sess.receivePeerIdentityProofForEpoch(proof, newerId)
+	if current, _, _ := testCurrentAttempt(sess); current != e {
+		t.Fatal("a proof of an attempt no ClientHello opened moved the responder to it")
+	}
+	unanswered := injectTestAttemptEpoch(sess, currentId, nil, false, nil)
+	sess.receivePeerIdentityProofForEpoch(proof, currentId)
+	sess.stateLock.Lock()
+	unansweredPending := len(unanswered.pendingPeerIdentityProof)
+	sess.stateLock.Unlock()
+	if unansweredPending != 0 {
+		t.Fatal("a proof was buffered on an epoch that answered no ClientHello of its attempt")
+	}
+
+	answered := injectTestAttemptEpoch(sess, currentId, testAttemptClientHello(1), false, nil)
+	sess.receivePeerIdentityProofForEpoch(proof, currentId)
+	sess.stateLock.Lock()
+	answeredPending := len(answered.pendingPeerIdentityProof)
+	sess.stateLock.Unlock()
+	if answeredPending != ed25519.SignatureSize {
+		t.Fatalf("the answered attempt's proof was not buffered (%d bytes)", answeredPending)
+	}
+}
+
+// The receive loop's early ClientHello reaches a responder that requires
+// encryption and holds no established epoch, which opens the attempt at once; a
+// responder with an established epoch, an Opportunistic one, whose initiator
+// resends the demoted epoch's records in plaintext, and an initiator keep the
+// ordered path alone.
+func TestEarlyClientHelloReachesOnlyAResponderWithNoEstablishedEpoch(t *testing.T) {
+	clientHello := testAttemptClientHello(1)
+
+	sess, cleanup := newTestEncryptionSessionWithMode(t, sequenceTlsRoleServer, EncryptionModeRequired)
+	defer cleanup()
+	established := injectTestAttemptEpoch(sess, NewId(), testAttemptClientHello(2), true, nil)
+	sess.stateLock.Lock()
+	sess.establishedEpoch = established
+	sess.stateLock.Unlock()
+	sess.optimisticallyDeliverClientHelloForEpoch(clientHello, NewId())
+	if current, _, _ := testCurrentAttempt(sess); current != established {
+		t.Fatal("an early ClientHello moved a responder with an established epoch")
+	}
+
+	fresh, freshCleanup := newTestEncryptionSessionWithMode(t, sequenceTlsRoleServer, EncryptionModeRequired)
+	defer freshCleanup()
+	attemptId := NewId()
+	fresh.optimisticallyDeliverClientHelloForEpoch(clientHello, attemptId)
+	if _, currentId, answered := testCurrentAttempt(fresh); currentId != attemptId || !answered {
+		t.Fatalf("an early ClientHello to a responder with no session state opened %s (answered=%t), want %s", currentId, answered, attemptId)
+	}
+
+	opportunistic, opportunisticCleanup := newTestEncryptionSessionWithMode(t, sequenceTlsRoleServer, EncryptionModeOpportunistic)
+	defer opportunisticCleanup()
+	opportunistic.optimisticallyDeliverClientHelloForEpoch(clientHello, NewId())
+	if current, _, _ := testCurrentAttempt(opportunistic); current != nil {
+		t.Fatal("an early ClientHello reached an Opportunistic responder")
+	}
+
+	initiator, initiatorCleanup := newTestEncryptionSessionWithMode(t, sequenceTlsRoleClient, EncryptionModeRequired)
+	defer initiatorCleanup()
+	initiator.optimisticallyDeliverClientHelloForEpoch(clientHello, NewId())
+	if current, _, _ := testCurrentAttempt(initiator); current != nil {
+		t.Fatal("an early ClientHello reached an initiator")
+	}
+}
+
+// A test EncryptedControl frame of type controlType naming attempt epochId,
+// none when it is zero.
+func testEncryptedControlFrame(t *testing.T, controlType protocol.EncryptedControlType, epochId Id) *protocol.Frame {
+	t.Helper()
+	ec := &protocol.EncryptedControl{
+		ControlType: controlType,
+		Payload:     testAttemptClientHello(1),
+		SessionRole: protocol.SequenceRole_SequenceRoleClient,
+	}
+	if epochId != (Id{}) {
+		ec.EpochId = epochId.Bytes()
+	}
+	ecBytes, err := ProtoMarshal(ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &protocol.Frame{MessageType: protocol.MessageType_TransferEncryptedControl, MessageBytes: ecBytes}
+}
+
+// A nack demotion drops every attempt the initiator minted before the one it
+// starts, an in-flight rekey's among them, and so marks their handshake flights
+// and identity proofs stale; the new attempt's records, a nack, an unnamed
+// record and an application frame are not.
+func TestNackDemotionMarksTheDroppedAttemptsHandshakeRecordsStale(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	established := injectTestAttemptEpoch(sess, NewId(), nil, true, nil)
+	rekey := injectTestAttemptEpoch(sess, NewId(), nil, false, nil)
+	sess.stateLock.Lock()
+	sess.establishedEpoch = established
+	sess.stateLock.Unlock()
+	handshake := protocol.EncryptedControlType_EncryptedControlHandshake
+	proof := protocol.EncryptedControlType_EncryptedControlIdentityProof
+	nack := protocol.EncryptedControlType_EncryptedControlUnknownWrapNack
+	if sess.dropsStaleHandshakeRecords() || sess.handshakeRecordStale(testEncryptedControlFrame(t, handshake, established.epochId)) {
+		t.Fatal("records were stale before any demotion")
+	}
+
+	sess.handleUnknownWrapNack(Id{})
+	_, recoveryId, _ := testCurrentAttempt(sess)
+	if !sess.dropsStaleHandshakeRecords() || recoveryId == rekey.epochId || recoveryId == established.epochId {
+		t.Fatal("the demotion started no new attempt")
+	}
+	for _, c := range []struct {
+		frame *protocol.Frame
+		stale bool
+	}{
+		{frame: testEncryptedControlFrame(t, handshake, established.epochId), stale: true},
+		{frame: testEncryptedControlFrame(t, proof, established.epochId), stale: true},
+		{frame: testEncryptedControlFrame(t, handshake, rekey.epochId), stale: true},
+		{frame: testEncryptedControlFrame(t, proof, rekey.epochId), stale: true},
+		{frame: testEncryptedControlFrame(t, handshake, recoveryId), stale: false},
+		{frame: testEncryptedControlFrame(t, proof, recoveryId), stale: false},
+		{frame: testEncryptedControlFrame(t, nack, established.epochId), stale: false},
+		{frame: testEncryptedControlFrame(t, handshake, Id{}), stale: false},
+		{frame: &protocol.Frame{MessageType: protocol.MessageType_TestSimpleMessage, MessageBytes: []byte{1}}, stale: false},
+	} {
+		if got := sess.handshakeRecordStale(c.frame); got != c.stale {
+			t.Errorf("frame %v: stale=%t, want %t", c.frame.MessageType, got, c.stale)
+		}
+	}
+}
+
+// The stale records leave a queued or retransmittable Pack, which keeps its
+// sequence number, head, message id and every other frame, in both Pack
+// encodings; a Pack with nothing stale is left as it was.
+func TestStaleHandshakeRecordsLeaveTheirPack(t *testing.T) {
+	sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	established := injectTestAttemptEpoch(sess, NewId(), nil, true, nil)
+	sess.stateLock.Lock()
+	sess.establishedEpoch = established
+	sess.stateLock.Unlock()
+	sess.handleUnknownWrapNack(Id{})
+	_, recoveryId, _ := testCurrentAttempt(sess)
+	sequence := &SendSequence{session: sess, sendBufferSettings: DefaultSendBufferSettings()}
+
+	handshake := protocol.EncryptedControlType_EncryptedControlHandshake
+	proof := protocol.EncryptedControlType_EncryptedControlIdentityProof
+	nack := protocol.EncryptedControlType_EncryptedControlUnknownWrapNack
+	pack := func(frames ...*protocol.Frame) *protocol.Pack {
+		return &protocol.Pack{MessageId: NewId().Bytes(), SequenceId: NewId().Bytes(), SequenceNumber: 7, Head: true, Frames: frames}
+	}
+	path := &protocol.TransferPath{SourceId: NewId().Bytes(), DestinationId: sess.peerId.Bytes()}
+	encode := func(legacy bool, pack *protocol.Pack) []byte {
+		transferFrame := &protocol.TransferFrame{TransferPath: path}
+		if legacy {
+			packBytes, err := ProtoMarshal(pack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer MessagePoolReturn(packBytes)
+			transferFrame.Frame = &protocol.Frame{MessageType: protocol.MessageType_TransferPack, MessageBytes: packBytes}
+		} else {
+			transferFrame.Pack = pack
+		}
+		b, err := ProtoMarshal(transferFrame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	decode := func(b []byte) *protocol.Pack {
+		var transferFrame protocol.TransferFrame
+		if err := ProtoUnmarshal(b, &transferFrame); err != nil {
+			t.Fatal(err)
+		}
+		if transferFrame.Pack != nil {
+			return transferFrame.Pack
+		}
+		decoded := &protocol.Pack{}
+		if err := ProtoUnmarshal(transferFrame.Frame.MessageBytes, decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+
+	for _, legacy := range []bool{false, true} {
+		original := pack(
+			testEncryptedControlFrame(t, handshake, established.epochId),
+			testEncryptedControlFrame(t, proof, recoveryId),
+			testEncryptedControlFrame(t, nack, established.epochId),
+			testEncryptedControlFrame(t, proof, established.epochId),
+		)
+		item := &sendItem{transferFrameBytes: encode(legacy, original)}
+		if err := sequence.dropStaleHandshakeRecords(item); err != nil {
+			t.Fatal(err)
+		}
+		rewritten := decode(item.transferFrameBytes)
+		if !bytes.Equal(rewritten.MessageId, original.MessageId) || rewritten.SequenceNumber != 7 || !rewritten.Head {
+			t.Fatalf("legacy=%t: the rewrite moved the Pack's place in its sequence", legacy)
+		}
+		if len(rewritten.Frames) != 2 || !bytes.Equal(rewritten.Frames[0].MessageBytes, original.Frames[1].MessageBytes) ||
+			!bytes.Equal(rewritten.Frames[1].MessageBytes, original.Frames[2].MessageBytes) {
+			t.Fatalf("legacy=%t: %d frames left, want the recovery attempt's proof and the nack", legacy, len(rewritten.Frames))
+		}
+
+		emptied := &sendItem{transferFrameBytes: encode(legacy, pack(testEncryptedControlFrame(t, handshake, established.epochId)))}
+		if err := sequence.dropStaleHandshakeRecords(emptied); err != nil {
+			t.Fatal(err)
+		}
+		if frames := decode(emptied.transferFrameBytes).Frames; len(frames) != 0 {
+			t.Fatalf("legacy=%t: a Pack of stale records kept %d frames", legacy, len(frames))
+		}
+
+		live := encode(legacy, pack(testEncryptedControlFrame(t, handshake, recoveryId)))
+		untouched := &sendItem{transferFrameBytes: live}
+		if err := sequence.dropStaleHandshakeRecords(untouched); err != nil {
+			t.Fatal(err)
+		}
+		if &untouched.transferFrameBytes[0] != &live[0] {
+			t.Fatalf("legacy=%t: a Pack with nothing stale was rewritten", legacy)
+		}
+		MessagePoolReturn(item.transferFrameBytes)
+		MessagePoolReturn(emptied.transferFrameBytes)
+		MessagePoolReturn(untouched.transferFrameBytes)
 	}
 }

@@ -358,6 +358,16 @@ func (self *SendSequence) selectDueRecovery(
 	}
 	item.selectiveAcked = false
 
+	// A handshake record of an attempt its session's nack demotion dropped
+	// leaves the Pack before it goes again (dropStaleHandshakeRecords). Only an
+	// encrypted control item is pinned to plaintext without being contract-only.
+	if item.forceUnwrapped && !item.contractControl && self.session != nil &&
+		self.session.dropsStaleHandshakeRecords() {
+		if err := self.dropStaleHandshakeRecords(item); err != nil && self.log.V(1).Enabled() {
+			self.log.Infof("[s]%s->%s s(%s) stale handshake records kept = %s\n", self.client.ClientTag(), self.destination, self.contractMultiRouteWriterAlias.StreamId, err)
+		}
+	}
+
 	// resend
 	var transferFrameBytes []byte
 	if self.sendItems[0].sequenceNumber == item.sequenceNumber &&

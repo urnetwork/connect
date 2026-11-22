@@ -5100,6 +5100,12 @@ func (self *Client) run() {
 				//     check in `OptimisticallyDeliverHandshake` that rejects
 				//     ClientHello-shaped retransmits, so no duplicate bytes reach the
 				//     TLS state machine.
+				//   - A named ClientHello, to a responder that requires encryption
+				//     and holds no established epoch:
+				//     `optimisticallyDeliverClientHelloForEpoch` answers each
+				//     attempt once and drops its retransmits, so a responder that
+				//     restarted or lost its session answers a recovery handshake its
+				//     receive sequence holds behind the dead epoch's records.
 				//   - IdentityProof: `receivePeerIdentityProof` short-circuits once
 				//     verified, failed, or already buffered — safe to re-deliver.
 				// The ReceiveSequence's later in-order delivery still runs and
@@ -5126,13 +5132,6 @@ func (self *Client) run() {
 						// matching where the EC routes below.
 						receiveRole = senderRole.complement()
 						receiveCompanion = ec.GetCompanion()
-						// Optimistically apply to the complement local session
-						// if it already exists; the ReceiveSequence's in-order
-						// delivery getOrCreates it otherwise.
-						session := self.encryptionSessionManager.Lookup(path.SourceId, senderRole.complement(), ec.GetCompanion())
-						if session == nil {
-							continue
-						}
 						var controlEpochId Id
 						if raw := ec.GetEpochId(); 0 < len(raw) {
 							parsed, err := IdFromBytes(raw)
@@ -5141,9 +5140,29 @@ func (self *Client) run() {
 							}
 							controlEpochId = parsed
 						}
+						namedClientHello := ec.ControlType == protocol.EncryptedControlType_EncryptedControlHandshake &&
+							senderRole == sequenceTlsRoleClient && controlEpochId != (Id{}) &&
+							isClientHelloRecord(ec.Payload)
+						// Optimistically apply to the complement local session
+						// if it already exists; the ReceiveSequence's in-order
+						// delivery getOrCreates it otherwise. A named ClientHello
+						// opens the responder session here, as an undecryptable
+						// wrap's nack does, since the in-order delivery may be the
+						// very thing holding it.
+						session := self.encryptionSessionManager.Lookup(path.SourceId, senderRole.complement(), ec.GetCompanion())
+						if session == nil && namedClientHello && self.encryptionSessionManager.requireEncryptionForPeer(path.SourceId) {
+							session = self.encryptionSessionManager.getOrCreate(path.SourceId, sequenceTlsRoleServer, ec.GetCompanion())
+						}
+						if session == nil {
+							continue
+						}
 						switch ec.ControlType {
 						case protocol.EncryptedControlType_EncryptedControlHandshake:
-							session.optimisticallyDeliverHandshakeForEpoch(ec.Payload, controlEpochId)
+							if namedClientHello {
+								session.optimisticallyDeliverClientHelloForEpoch(ec.Payload, controlEpochId)
+							} else {
+								session.optimisticallyDeliverHandshakeForEpoch(ec.Payload, controlEpochId)
+							}
 						case protocol.EncryptedControlType_EncryptedControlIdentityProof:
 							// Optimistic path must not create epoch state from a
 							// stale/reordered/retransmitted proof; only deliver
