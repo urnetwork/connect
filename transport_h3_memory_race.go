@@ -19,15 +19,19 @@ import (
 // Preserve Happy Eyeballs when the extra lease fits. When it does not, retain
 // the candidate and start it after the preceding owner has completely closed;
 // a refused speculative dial must not permanently hide a working fallback.
+// Direct H3 ends the preceding attempt at the stagger for it. A dns carrier
+// (a whodis race) keeps the preceding attempt while it hears from alt, and
+// starts the candidate once that attempt fails or stalls (quic_dial_race.go).
 func raceH3DialWithMemory(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
 	budget *PlatformTransportBudget,
 	extraByteCount ByteCount,
 	nestedByteCount ByteCount,
+	schedule quicDialRaceSchedule,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
-	return raceH3DialWithMemoryProgressive(ctx, candidates, nil, budget, extraByteCount, nestedByteCount, dial)
+	return raceH3DialWithMemoryProgressive(ctx, candidates, nil, budget, extraByteCount, nestedByteCount, schedule, dial)
 }
 
 // Pending DNS is another source of candidates, not an admission bypass. A
@@ -39,6 +43,7 @@ func raceH3DialWithMemoryProgressive(
 	budget *PlatformTransportBudget,
 	extraByteCount ByteCount,
 	nestedByteCount ByteCount,
+	schedule quicDialRaceSchedule,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	defer source.close()
@@ -47,12 +52,13 @@ func raceH3DialWithMemoryProgressive(
 		return nil, errors.New("h3 race: no candidates")
 	}
 	type result struct {
+		index   int
 		attempt *h3DialAttempt
 		claim   *platformTransportBudgetReservation
 		err     error
 	}
 	results := make(chan result, len(candidates))
-	cancels := make([]context.CancelFunc, 0, len(candidates))
+	attempts := &quicDialRaceAttempts{schedule: schedule}
 	launched, pending := 0, 0
 	launch := func() bool {
 		var claim *platformTransportBudgetReservation
@@ -67,21 +73,18 @@ func raceH3DialWithMemoryProgressive(
 				dialCtx = context.WithValue(dialCtx, platformTransportNestedBudgetContextKey{}, NewPlatformTransportBudget(nestedByteCount, 0))
 			}
 		}
-		attemptCtx, cancel := context.WithCancel(dialCtx)
-		cancels = append(cancels, cancel)
+		attemptCtx, index := attempts.launch(dialCtx)
 		address := candidates[launched]
 		launched++
 		pending++
 		go func() {
 			attempt, err := dial(attemptCtx, address)
-			results <- result{attempt, claim, err}
+			results <- result{index: index, attempt: attempt, claim: claim, err: err}
 		}()
 		return true
 	}
 	finish := func() {
-		for _, cancel := range cancels {
-			cancel()
-		}
+		attempts.cancelAll()
 		// Join cleanup before the winner may allocate its steady application
 		// graph or the caller may return the base carrier reservation.
 		for pending > 0 {
@@ -91,8 +94,27 @@ func raceH3DialWithMemoryProgressive(
 			loser.claim.Release()
 		}
 	}
+	// Armed while a dns carrier candidate the budget refused waits for an
+	// attempt out to stall.
+	stall := time.NewTimer(0)
+	stall.Stop()
+	defer stall.Stop()
+	armStall := func(stallTime time.Time) {
+		stall.Stop()
+		if !stallTime.IsZero() {
+			stall.Reset(time.Until(stallTime))
+		}
+	}
 	advance := func() {
 		if launch() {
+			stall.Stop()
+			return
+		}
+		if schedule.whodis {
+			// A whodis attempt hearing from alt keeps the socket; one that has
+			// stalled gives it up, and the deferred candidate launches from its
+			// fully closed result.
+			armStall(attempts.cancelStalled(time.Now()))
 			return
 		}
 		// There is no admitted speculative socket. End the current attempt
@@ -100,12 +122,10 @@ func raceH3DialWithMemoryProgressive(
 		// candidate from its fully closed result using the base lease. Merely
 		// disabling the stagger would strand a healthy fallback behind a
 		// blackholed first endpoint until the long QUIC handshake timeout.
-		for _, cancel := range cancels {
-			cancel()
-		}
+		attempts.cancelAll()
 	}
 	launch()
-	stagger := time.NewTimer(platformH3FamilyRaceStagger)
+	stagger := time.NewTimer(schedule.stagger)
 	defer stagger.Stop()
 	var firstErr error
 	staggerReady := false
@@ -113,6 +133,7 @@ func raceH3DialWithMemoryProgressive(
 		select {
 		case completed := <-results:
 			pending--
+			attempts.ended(completed.index)
 			if completed.err == nil {
 				finish()
 				completed.claim.Release()
@@ -126,7 +147,7 @@ func raceH3DialWithMemoryProgressive(
 			if launched < len(candidates) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
 			} else if pending == 0 && resolution == nil {
 				finish()
 				return nil, firstErr
@@ -136,7 +157,11 @@ func raceH3DialWithMemoryProgressive(
 			if launched < len(candidates) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
+			}
+		case <-stall.C:
+			if launched < len(candidates) {
+				armStall(attempts.cancelStalled(time.Now()))
 			}
 		case resolved := <-resolution:
 			candidates = source.appendReady(candidates, resolved)
@@ -144,7 +169,7 @@ func raceH3DialWithMemoryProgressive(
 			if launched < len(candidates) && (pending == 0 || staggerReady) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
 			} else if pending == 0 && resolution == nil {
 				finish()
 				return nil, firstErr

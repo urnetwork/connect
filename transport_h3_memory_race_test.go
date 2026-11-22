@@ -61,7 +61,7 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 			var peakBytes atomic.Int64
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			winner, err := raceH3DialWithMemory(ctx, candidates, budget, settings.h3DialTransientByteCount(), 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
+			winner, err := raceH3DialWithMemory(ctx, candidates, budget, settings.h3DialTransientByteCount(), 0, transport.h3DialRaceSchedule(mode), func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 				if address == candidates[1] && budget.Stats().UsedByteCount < settings.H3BudgetByteCount+settings.h3DialTransientByteCount() {
 					t.Error("second socket opened before its transient claim")
 				}
@@ -117,48 +117,53 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 	}
 }
 
+// A blackholed first candidate holding the only socket yields it to the
+// fallback: at the stagger for direct H3, and once it has stalled for a dns
+// carrier's whodis race.
 func TestPlatformH3MemoryRaceFullTransientCancelsBlackholeBeforeFallback(t *testing.T) {
-	budget := NewPlatformTransportBudget(mib(3), 1)
-	inner := budget.register(platformTransportBudgetH3Explicit, mib(3), true)
-	if !inner.TryAcquire() {
-		t.Fatal("inner admission")
-	}
-	defer inner.Release()
-	candidates := []*net.UDPAddr{{IP: net.ParseIP("127.0.0.1"), Port: 53}, {IP: net.ParseIP("127.0.0.1"), Port: 4053}}
-	var firstClosed atomic.Bool
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	start := time.Now()
-	winner, err := raceH3DialWithMemory(ctx, candidates, budget, testingH3DialTransientByteCount, 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
-		if address == candidates[1] && !firstClosed.Load() {
-			t.Error("fallback reused the base claim before blackhole closed")
+	for _, schedule := range []quicDialRaceSchedule{testingDirectRaceSchedule, testingWhodisRaceSchedule} {
+		budget := NewPlatformTransportBudget(mib(3), 1)
+		inner := budget.register(platformTransportBudgetH3Explicit, mib(3), true)
+		if !inner.TryAcquire() {
+			t.Fatal("inner admission")
 		}
-		socket, err := net.ListenPacket("udp4", "127.0.0.1:0")
-		if err != nil {
-			return nil, err
-		}
-		attempt := &h3DialAttempt{udpAddr: address, packetConn: &memoryRaceSocket{PacketConn: socket, onClose: func() {
-			if address == candidates[0] {
-				firstClosed.Store(true)
+		candidates := []*net.UDPAddr{{IP: net.ParseIP("127.0.0.1"), Port: 53}, {IP: net.ParseIP("127.0.0.1"), Port: 4053}}
+		var firstClosed atomic.Bool
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		start := time.Now()
+		winner, err := raceH3DialWithMemory(ctx, candidates, budget, testingH3DialTransientByteCount, 0, schedule, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
+			if address == candidates[1] && !firstClosed.Load() {
+				t.Error("fallback reused the base claim before blackhole closed")
 			}
-		}}}
-		if address == candidates[0] {
-			<-ctx.Done()
-			return attempt, ctx.Err()
+			socket, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			attempt := &h3DialAttempt{udpAddr: address, packetConn: &memoryRaceSocket{PacketConn: socket, onClose: func() {
+				if address == candidates[0] {
+					firstClosed.Store(true)
+				}
+			}}}
+			if address == candidates[0] {
+				<-ctx.Done()
+				return attempt, ctx.Err()
+			}
+			return attempt, nil
+		})
+		if err != nil || winner == nil || winner.udpAddr != candidates[1] {
+			t.Fatalf("deferred fallback=%v %v", winner, err)
 		}
-		return attempt, nil
-	})
-	if err != nil || winner == nil || winner.udpAddr != candidates[1] {
-		t.Fatalf("deferred fallback=%v %v", winner, err)
-	}
-	defer winner.close()
-	if time.Since(start) > 4*platformH3FamilyRaceStagger || budget.Stats().UsedByteCount != mib(3) {
-		t.Fatal("fallback stalled or escaped base claim")
-	}
-	canceled, cancel := context.WithCancel(t.Context())
-	cancel()
-	_, err = raceH3DialWithMemory(canceled, candidates[:1], budget, testingH3DialTransientByteCount, 0, func(ctx context.Context, _ *net.UDPAddr) (*h3DialAttempt, error) { return nil, ctx.Err() })
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled race=%v", err)
+		if time.Since(start) > 4*schedule.stagger+schedule.stallTimeout || budget.Stats().UsedByteCount != mib(3) {
+			t.Fatalf("fallback stalled or escaped base claim (whodis=%v)", schedule.whodis)
+		}
+		winner.close()
+		cancel()
+		canceled, cancelNow := context.WithCancel(t.Context())
+		cancelNow()
+		_, err = raceH3DialWithMemory(canceled, candidates[:1], budget, testingH3DialTransientByteCount, 0, schedule, func(ctx context.Context, _ *net.UDPAddr) (*h3DialAttempt, error) { return nil, ctx.Err() })
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled race=%v", err)
+		}
+		inner.Release()
 	}
 }

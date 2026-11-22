@@ -15,10 +15,18 @@ import (
 	"time"
 )
 
+// A blackholed first candidate never hides the fallback: alt h3 ends it at
+// the stagger when only one claim fits, alt whodis once it has stalled, and
+// with two claims the fallback launches beside it at the stagger.
 func TestAltMemoryRaceRetainsBudgetRefusedFallback(t *testing.T) {
 	for _, mode := range []string{"h3-family", "whodis-ports"} {
 		for _, concurrent := range []bool{false, true} {
 			t.Run(mode+map[bool]string{false: "/one-claim", true: "/two-claims"}[concurrent], func(t *testing.T) {
+				schedule := testingDirectRaceSchedule
+				if mode == "whodis-ports" {
+					schedule = testingWhodisRaceSchedule
+				}
+				fallbackBound := 4*schedule.stagger + schedule.stallTimeout
 				const claimBytes = 4096
 				capacity := ByteCount(claimBytes)
 				if concurrent {
@@ -32,10 +40,10 @@ func TestAltMemoryRaceRetainsBudgetRefusedFallback(t *testing.T) {
 				}
 				var sockets, peak, opened atomic.Int32
 				var firstClosed atomic.Bool
-				ctx, cancel := context.WithTimeout(t.Context(), 4*platformH3FamilyRaceStagger+time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), fallbackBound+time.Second)
 				defer cancel()
 				start := time.Now()
-				winner, err := raceAltQuicDial(ctx, candidates, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+				winner, err := raceAltQuicDial(ctx, candidates, policy, schedule, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 					if address == candidates[1] && !concurrent && !firstClosed.Load() {
 						t.Error("fallback socket opened before previous claim closed")
 					}
@@ -81,7 +89,7 @@ func TestAltMemoryRaceRetainsBudgetRefusedFallback(t *testing.T) {
 				if want := int32(1 + map[bool]int{false: 0, true: 1}[concurrent]); peak.Load() != want {
 					t.Fatalf("peak sockets=%d, want %d", peak.Load(), want)
 				}
-				if time.Since(start) > 4*platformH3FamilyRaceStagger {
+				if time.Since(start) > fallbackBound {
 					t.Fatal("fallback remained behind blackhole")
 				}
 				winner.close()
@@ -234,7 +242,7 @@ func TestAltMemoryRaceRefusesBeforeDialAndReturnsCancellation(t *testing.T) {
 	policy := extenderQuicMemoryPolicy{budget: budget, byteCount: 2, usesSlot: true}
 	candidates := []*net.UDPAddr{{IP: net.ParseIP("127.0.0.1"), Port: 443}}
 	opened := false
-	_, err := raceAltQuicDial(t.Context(), candidates, policy, func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+	_, err := raceAltQuicDial(t.Context(), candidates, policy, testingDirectRaceSchedule, func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 		opened = true
 		return nil, errors.New("must not dial")
 	})
@@ -246,7 +254,7 @@ func TestAltMemoryRaceRefusesBeforeDialAndReturnsCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = raceAltQuicDial(ctx, candidates, policy, func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+	_, err = raceAltQuicDial(ctx, candidates, policy, testingDirectRaceSchedule, func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 		t.Error("canceled race opened a socket")
 		return nil, errors.New("must not dial")
 	})

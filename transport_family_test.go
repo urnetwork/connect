@@ -1246,14 +1246,14 @@ func TestRaceH3DialLaunchesNextOnFailureAndClosesLosers(t *testing.T) {
 			}
 		}
 	}
-	winner, err := raceH3Dial(ctx, candidates, dial)
+	winner, err := raceH3Dial(ctx, candidates, testingDirectRaceSchedule, dial)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if winner.udpAddr.Port != 2 {
 		t.Fatalf("winner = %v, want port 2", winner.udpAddr)
 	}
-	if elapsed := time.Since(start); platformH3FamilyRaceStagger <= elapsed {
+	if elapsed := time.Since(start); testingDirectRaceSchedule.stagger <= elapsed {
 		t.Fatalf("a definitive failure did not launch the next candidate immediately (%s)", elapsed)
 	}
 	launchLock.Lock()

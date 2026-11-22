@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "golang.org/x/net/proxy"
@@ -56,6 +57,11 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 
 		DohSettings: DefaultDohSettings(),
 		DnsTlds:     [][]byte{[]byte(DefaultExtenderDnsTld)},
+
+		AltH3RaceStagger:          250 * time.Millisecond,
+		AltWhodisRaceStagger:      1 * time.Second,
+		AltWhodisRaceStallTimeout: 2 * time.Second,
+		AltWhodisLateStart:        3 * time.Second,
 
 		HelloRetryTimeout: 5 * time.Second,
 		// API calls return JSON/control data rather than streamed payloads;
@@ -199,6 +205,35 @@ type ClientStrategySettings struct {
 	// The encoding tlds of the alt whodis dialer, one picked at random per
 	// dial. Empty takes `DefaultExtenderDnsTld`.
 	DnsTlds [][]byte
+	// AltH3RaceStagger is the Happy Eyeballs delay between the candidate
+	// addresses of the alt h3 dialer (raceAltQuicDial): the next candidate
+	// launches when the attempts out have neither connected nor failed within
+	// it. 250 ms, a few round trips of a QUIC handshake. A candidate the
+	// budget cannot admit at the stagger ends the attempts out. Non-positive
+	// launches every candidate the budget admits at once.
+	AltH3RaceStagger time.Duration
+	// AltWhodisRaceStagger is that delay for the alt whodis dialer, between 53
+	// and 4053 and the families, whose handshake takes about 0.4 to 1 s
+	// (quic_dial_race.go). One second, so a healthy handshake on 53 is done
+	// before 4053 is tried. A candidate the budget cannot admit at the stagger
+	// never ends an attempt that is hearing from alt. Non-positive launches
+	// every candidate the budget admits at once.
+	AltWhodisRaceStagger time.Duration
+	// AltWhodisRaceStallTimeout is how long an alt whodis attempt may hear
+	// nothing from alt before it gives up its claim to a candidate the budget
+	// refused. Two seconds: a healthy handshake hears alt within a round trip
+	// of its ClientHello and then every few paced responses. Non-positive
+	// never ends an attempt for its silence: a refused candidate waits for an
+	// attempt to fail.
+	AltWhodisRaceStallTimeout time.Duration
+	// AltWhodisLateStart is how long an api race waits for one of its other
+	// dialers to connect before it starts the alt whodis dialer beside the
+	// dialers still out (parallelEvalWithRouteHedge). Three seconds: a network
+	// where the other dialers work connects well within it, so it never dials
+	// whodis, and a network where only whodis works connects in about this
+	// and one whodis handshake. A round whose other dialers have all failed
+	// starts whodis at once. Non-positive starts it with the others.
+	AltWhodisLateStart time.Duration
 
 	DohSettings *DohSettings
 	// Refuses DoH servers other than the built-in ones, whatever path they
@@ -391,6 +426,11 @@ type ClientStrategy struct {
 	scores            *networkStrategyScores
 	currentNetworkId  string
 	networkGeneration uint64
+	// The network on which a last-resort dialer last won a race: there it
+	// starts with the other dialers, until one of them wins a race there
+	// (parallelEvalWithRouteHedge). Guarded by mutex.
+	lastResortWonNetworkId  string
+	lastResortWonNetworkSet bool
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -1516,6 +1556,39 @@ func preferredHttpAttemptContext(
 	}
 }
 
+// The current network's private id (net_strategy_score.go).
+func (self *ClientStrategy) networkIdSnapshot() string {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.currentNetworkId
+}
+
+// Whether a last-resort dialer last won a race on the network, so that it
+// starts there with the other dialers.
+func (self *ClientStrategy) lastResortWonOn(networkId string) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.lastResortWonNetworkSet && self.lastResortWonNetworkId == networkId
+}
+
+// A race on the network selected the dialer: a last-resort dialer's win marks
+// the network, where it then starts with the others, and any other dialer's
+// win clears the mark.
+func (self *ClientStrategy) noteRaceWinner(networkId string, dialer *clientDialer) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if dialer.lastResort {
+		self.lastResortWonNetworkId = networkId
+		self.lastResortWonNetworkSet = true
+	} else if self.lastResortWonNetworkSet && self.lastResortWonNetworkId == networkId {
+		self.lastResortWonNetworkId = ""
+		self.lastResortWonNetworkSet = false
+	}
+}
+
+// The error of a last-resort dial whose evaluator returned no result.
+var errLastResortNoResult = errors.New("the last-resort dial returned no result")
+
 // parallelEval races the dialers of one request. `webSocketOnly` restricts it
 // to the dialers that can carry a websocket, which is what a platform dial
 // needs and an api request does not (L4).
@@ -1540,12 +1613,31 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 	eval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 	preferredHedgeDelay time.Duration,
-) *evalResult {
+) (selected *evalResult) {
 	// Ordinary ordering (GET can retain the first preferred attempt while
 	// allowing known alternatives to race after its establishment head start):
 	// 1. try all dialers that previously worked sequentially
 	// 2. try dialers that previously failed in parallel blocks
 	// 3. expand the extenders and try new extenders in parallel blocks
+	//
+	// The last-resort dialers (alt whodis, L4) take no part in that order.
+	// Their handshake is the slowest, about 0.4 to 1 s for whodis, and a
+	// faster dialer's win ended it, so alt's front waited out its idle
+	// timeout for nearly every one (2026-11-21). A last resort starts late,
+	// beside the dialers still out: once AltWhodisLateStart passes with none
+	// of the round's others connected (none has written its request), or at
+	// once when they have all failed. On a network where it last won a race
+	// it starts with them, and another dialer's win clears that. So a network
+	// whose other dialers connect within the delay never dials it, and one
+	// where only whodis works connects in about the delay and one whodis
+	// handshake, on its first request.
+	//
+	// A started last resort never ends for another dialer's win or the
+	// caller's end: it runs to its own end, the request's deadline or the
+	// strategy's close, and the call does not wait for it. When the race ends
+	// without it, an attempt still dialing that has heard nothing from alt for
+	// AltWhodisRaceStallTimeout ends then, to free its socket; one hearing
+	// alt goes on, and its result is released.
 
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	// Every parallel attempt remains owned by this call until its eval stack
@@ -1583,6 +1675,173 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 
 	out := make(chan *evalResult)
 
+	// Whether a dialer other than the last resort has connected in this
+	// round: written its request, which takes a connection on every carrier.
+	// Traced only in a round with a last resort to start.
+	var roundConnected atomic.Bool
+	var traceConnected atomic.Bool
+	evalDialer := func(evalCtx context.Context, dialer *clientDialer) *evalResult {
+		if traceConnected.Load() {
+			// a trace of its own: WithClientTrace composes into the one it is given
+			evalCtx = httptrace.WithClientTrace(evalCtx, &httptrace.ClientTrace{
+				WroteHeaders: func() { roundConnected.Store(true) },
+			})
+		}
+		return eval(evalCtx, dialer)
+	}
+
+	// The last resort's attempts. Each is this goroutine's once its result
+	// is received, and its own goroutine's until then.
+	type lateAttempt struct {
+		ctx    context.Context
+		cancel func()
+		// what the attempt's dial has heard from alt (quic_dial_race.go)
+		clock *quicDialReceiveClock
+		// the attempt wrote its request: its dial is done
+		connected atomic.Bool
+		received  bool
+	}
+	type lateResult struct {
+		attempt *lateAttempt
+		result  *evalResult
+	}
+	lateOut := make(chan lateResult)
+	callDone := make(chan struct{})
+	lateAttempts := []*lateAttempt{}
+	latePending := 0
+	// a late result found the dialer retired (canRefreshRetiredSnapshot)
+	lateRetired := false
+	var lateWinner *lateAttempt
+	// the current round's network
+	var networkId string
+	defer func() {
+		close(callDone)
+		// an attempt still dialing that has heard nothing from alt for the
+		// stall timeout ends with the race; any other goes on
+		stallTimeout := self.settings.AltWhodisRaceStallTimeout
+		now := time.Now()
+		for _, attempt := range lateAttempts {
+			if attempt.received || attempt.connected.Load() || stallTimeout <= 0 {
+				continue
+			}
+			if !now.Before(attempt.clock.silentSince().Add(stallTimeout)) {
+				attempt.cancel()
+			}
+		}
+		if lateWinner != nil {
+			lateWinner.cancel()
+		}
+		if selected != nil && selected.err == nil && selected.dialer != nil {
+			self.noteRaceWinner(networkId, selected.dialer)
+		}
+	}()
+	startLate := func(dialers []*clientDialer) {
+		// the request's deadline, which the attempt keeps without its cancel
+		deadline, _ := handleCtx.Deadline()
+		for _, dialer := range dialers {
+			attempt := &lateAttempt{clock: newQuicDialReceiveClock(nil)}
+			attemptCtx, attemptCancel := context.WithDeadline(context.WithoutCancel(handleCtx), deadline)
+			stopStrategyClose := context.AfterFunc(self.ctx, attemptCancel)
+			attempt.cancel = func() {
+				stopStrategyClose()
+				attemptCancel()
+			}
+			attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
+				WroteHeaders: func() { attempt.connected.Store(true) },
+			})
+			attempt.ctx = withQuicDialReceiveClock(attemptCtx, attempt.clock)
+			lateAttempts = append(lateAttempts, attempt)
+			latePending += 1
+			go HandleError(func() {
+				result := eval(attempt.ctx, dialer)
+				if result == nil {
+					result = &evalResult{err: errLastResortNoResult}
+				}
+				result.dialer = dialer
+				select {
+				case lateOut <- lateResult{attempt: attempt, result: result}:
+				case <-callDone:
+					// the race ended without it: its result is no one's
+					result.releaseAfterUse(attempt.ctx)
+					attempt.cancel()
+				}
+			})
+		}
+	}
+	// A received last-resort result: a win to return, or a failure released.
+	handleLate := func(late lateResult) *evalResult {
+		latePending -= 1
+		late.attempt.received = true
+		lateRetired = lateRetired || late.result.err == errClientDialerRetired
+		if late.result.Selected().err == nil || late.result.terminal {
+			lateWinner = late.attempt
+			if self.log.V(2).Enabled() {
+				self.log.Infof("[net][p]select last resort: %s\n", late.result.dialer.String())
+			}
+			return late.result
+		}
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[net][p]select last resort: %s = %s\n", late.result.dialer.String(), late.result.err)
+		}
+		late.result.releaseAfterUse(late.attempt.ctx)
+		late.attempt.cancel()
+		return nil
+	}
+	// the current round's last-resort dialers, and their start
+	lastResortDialers := []*clientDialer{}
+	lateStarted := false
+	var lateDue <-chan time.Time
+	startRoundLate := func() {
+		if lateStarted || len(lastResortDialers) == 0 {
+			return
+		}
+		lateStarted = true
+		lateDue = nil
+		startLate(lastResortDialers)
+	}
+	// the late start came due: unless one of the others connected
+	lateStartDue := func() {
+		lateDue = nil
+		if !roundConnected.Load() {
+			startRoundLate()
+		}
+	}
+	// Waits for the next result of a dialer other than the last resort,
+	// starting the last resort when due and receiving its results meanwhile.
+	// ended is set when the request ends, or the last resort won (won).
+	receive := func() (result *evalResult, won *evalResult, ended bool) {
+		for {
+			select {
+			case <-handleCtx.Done():
+				return nil, nil, true
+			case <-lateDue:
+				lateStartDue()
+			case late := <-lateOut:
+				if won := handleLate(late); won != nil {
+					return nil, won, true
+				}
+			case result := <-out:
+				return result, nil, false
+			}
+		}
+	}
+	// receive without waiting, for the last resort's start or results that
+	// came due while a serial attempt ran
+	pollLate := func() *evalResult {
+		for {
+			select {
+			case <-lateDue:
+				lateStartDue()
+			case late := <-lateOut:
+				if won := handleLate(late); won != nil {
+					return won
+				}
+			default:
+				return nil
+			}
+		}
+	}
+
 	runWithContext := func(evalCtx context.Context, dialer *clientDialer) {
 		success := false
 		defer func() {
@@ -1593,7 +1852,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				}
 			}
 		}()
-		result := eval(evalCtx, dialer)
+		result := evalDialer(evalCtx, dialer)
 		if result == nil {
 			return
 		}
@@ -1628,7 +1887,32 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 		// the number of runs with pending out
 		p := 0
 
+		networkId = self.networkIdSnapshot()
 		dialerWeights, limitedUntil, dialerGeneration := self.dialerWeightsSnapshot(webSocketOnly)
+		dialerCount := len(dialerWeights)
+		// the last resort starts late, or with the others where it last won
+		lastResortDialers = []*clientDialer{}
+		for dialer := range dialerWeights {
+			if dialer.lastResort {
+				lastResortDialers = append(lastResortDialers, dialer)
+				delete(dialerWeights, dialer)
+			}
+		}
+		slices.SortStableFunc(lastResortDialers, func(a *clientDialer, b *clientDialer) int {
+			return a.priority - b.priority
+		})
+		lateStarted = false
+		lateDue = nil
+		lateRetired = false
+		roundConnected.Store(false)
+		traceConnected.Store(0 < len(lastResortDialers))
+		if 0 < len(lastResortDialers) {
+			if self.settings.AltWhodisLateStart <= 0 || self.lastResortWonOn(networkId) {
+				startRoundLate()
+			} else {
+				lateDue = time.After(self.settings.AltWhodisLateStart)
+			}
+		}
 
 		if 0 < len(dialerWeights) {
 			serialDialers := []*clientDialer{}
@@ -1684,6 +1968,13 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					case <-handleCtx.Done():
 						timer.Stop()
 						return nil
+					case <-lateDue:
+						lateStartDue()
+					case late := <-lateOut:
+						if won := handleLate(late); won != nil {
+							timer.Stop()
+							return won
+						}
 					case <-writtenSignal:
 						// A valid slow response is not a stale establishment.
 						timer.Stop()
@@ -1719,12 +2010,15 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					return nil
 				default:
 				}
+				if won := pollLate(); won != nil {
+					return won
+				}
 
 				attemptCtx, attemptCancel := attemptContext(
 					handleCtx,
 					len(serialDialers)-i,
 				)
-				result := eval(attemptCtx, dialer)
+				result := evalDialer(attemptCtx, dialer)
 				if result != nil {
 					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 					result.dialer = dialer
@@ -1760,27 +2054,26 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				})
 			}
 			for _, dialer := range parallelDialers[n:] {
-				select {
-				case <-handleCtx.Done():
-					return nil
-				case result := <-out:
-					if result != nil {
-						retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
-						if result.Selected().err == nil || result.terminal {
-							if self.log.V(2).Enabled() {
-								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
-							}
-							return result
-						}
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
-						}
-						result.releaseAfterUse(handleCtx)
-					}
-					startWorker(func() {
-						run(dialer)
-					})
+				result, won, ended := receive()
+				if ended {
+					return won
 				}
+				if result != nil {
+					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
+					if result.Selected().err == nil || result.terminal {
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select: %s\n", result.dialer.String())
+						}
+						return result
+					}
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+					}
+					result.releaseAfterUse(handleCtx)
+				}
+				startWorker(func() {
+					run(dialer)
+				})
 			}
 		}
 
@@ -1793,44 +2086,57 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				})
 			}
 			for _, dialer := range expandedDialers[n:] {
-				select {
-				case <-handleCtx.Done():
-					return nil
-				case result := <-out:
-					if result != nil {
-						retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
-						if result.Selected().err == nil || result.terminal {
-							if self.log.V(2).Enabled() {
-								self.log.Infof("[net][p]select: %s\n", result.dialer.String())
-							}
-							return result
-						}
-						if self.log.V(2).Enabled() {
-							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
-						}
-						result.releaseAfterUse(handleCtx)
-					}
-					startWorker(func() {
-						run(dialer)
-					})
+				result, won, ended := receive()
+				if ended {
+					return won
 				}
+				if result != nil {
+					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
+					if result.Selected().err == nil || result.terminal {
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select: %s\n", result.dialer.String())
+						}
+						return result
+					}
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
+					}
+					result.releaseAfterUse(handleCtx)
+				}
+				startWorker(func() {
+					run(dialer)
+				})
 			}
 		}
 
 		for range p {
+			result, won, ended := receive()
+			if ended {
+				return won
+			}
+			if result != nil {
+				retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
+				if result.Selected().err == nil || result.terminal {
+					return result
+				}
+				result.releaseAfterUse(handleCtx)
+			}
+		}
+
+		// every other dialer of the round is done without a winner: the last
+		// resort starts now if it has not, and the round waits for it
+		startRoundLate()
+		for 0 < latePending {
 			select {
 			case <-handleCtx.Done():
 				return nil
-			case result := <-out:
-				if result != nil {
-					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
-					if result.Selected().err == nil || result.terminal {
-						return result
-					}
-					result.releaseAfterUse(handleCtx)
+			case late := <-lateOut:
+				if won := handleLate(late); won != nil {
+					return won
 				}
 			}
 		}
+		retiredSnapshot = retiredSnapshot || lateRetired
 
 		if !retirementRefreshed && retiredSnapshot && self.canRefreshRetiredSnapshot(dialerGeneration, webSocketOnly) {
 			retirementRefreshed = true
@@ -1844,7 +2150,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			return nil
 		case <-reconnect.After():
 		}
-		if len(dialerWeights) == 0 && p == 0 && !limitedUntil.IsZero() {
+		if dialerCount == 0 && p == 0 && !limitedUntil.IsZero() {
 			// every dialer there was is a limited extender: nothing is dialed
 			// again before the first backoff passes (A12)
 			select {
@@ -2905,6 +3211,11 @@ type clientDialer struct {
 	minimumWeight float32
 	// 0 is max
 	priority int
+	// A dialer a race starts late, beside the others still out, and never
+	// ends for their win: alt whodis (L4), the slowest path, whose handshake a
+	// faster dialer's win would end (parallelEvalWithRouteHedge). Constant
+	// after construction.
+	lastResort bool
 
 	// WebSocket upgrades require HTTP/1.1, while ordinary API requests can
 	// negotiate HTTP/2. Keep protocol-specific TLS dialers so enabling h2 for

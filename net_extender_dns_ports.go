@@ -34,12 +34,11 @@ import (
 // directory record stays the carrier's: a 53 that never answers on an app
 // extender neither holds the address nor drops the dialer that reached it on
 // 4053, and it takes no second slot of the strategy's parallel block or
-// expand budget. This is the race the platform's alt dns carrier runs its two
-// ports through (raceAltQuicDial), at the same stagger.
+// expand budget. Alt's dns carriers race their ports differently: a second
+// apart, and never ending an attempt that is hearing from alt for the next
+// port (quic_dial_race.go).
 
-// The launch stagger of the dns carrier's ports (L2), which is what the
-// platform's alt dns carrier staggers its ports by
-// (platformH3FamilyRaceStagger).
+// The launch stagger of the dns carrier's ports (L2).
 const extenderDnsPortRaceStagger = 250 * time.Millisecond
 
 // The ports one dns carrier dial races, in launch order: DnsPorts without a

@@ -64,9 +64,9 @@ func checkH3DohFirstAnswer(t *testing.T, readyIpv6 bool, budgeted bool) {
 			}
 			var attempt *h3DialAttempt
 			if budgeted {
-				attempt, err = raceH3DialWithMemoryProgressive(ctx, candidates, pending, budget, 4096, 0, dial)
+				attempt, err = raceH3DialWithMemoryProgressive(ctx, candidates, pending, budget, 4096, 0, transport.h3DialRaceSchedule(TransportModeH3), dial)
 			} else {
-				attempt, err = raceH3DialProgressive(ctx, candidates, pending, dial)
+				attempt, err = raceH3DialProgressive(ctx, candidates, pending, transport.h3DialRaceSchedule(TransportModeH3), dial)
 			}
 			attempt.close()
 			done <- err
