@@ -11084,8 +11084,11 @@ paths:
         by side, with a receipt of this authorization for this person, valid
         10 minutes. A sign-in older than 10 minutes is answered
         `reauthentication_required`, and the page signs the person in again.
-        Consent is never remembered. The caller is a team member's credential
-        with the keys permission (`RolePermissionRefused`).
+        Consent is never remembered. In a team the caller is a member's
+        credential with the keys permission, or any member's signed-in
+        credential for `ur login`'s one command, a single-use key for its own
+        devices; any other is refused by the role gate
+        (`RolePermissionRefused`).
       operationId: oauthDeviceConsent
       security:
         - BearerAuth: []
@@ -11116,8 +11119,10 @@ paths:
       description: |
         The signed-in person's answer to a device authorization: `approve`
         true with the receipt `/oauth/device_consent` gave, on a sign-in at
-        most 10 minutes old, or false to deny it. The caller is a team
-        member's credential with the keys permission
+        most 10 minutes old, or false to deny it. In a team the caller is a
+        member's credential with the keys permission, or any member's
+        signed-in credential for `ur login`'s one command, a single-use key
+        for its own devices; any other is refused by the role gate
         (`RolePermissionRefused`).
       operationId: oauthDeviceApprove
       security:
@@ -11156,6 +11161,12 @@ paths:
         forces the screen even when the scopes are already approved. `issuer`
         is returned so the page can echo `iss` when the user declines, as
         rfc 9207 requires on error responses too.
+
+        In a team the caller is a member's credential with the keys
+        permission, since a consent grants a client access; any member's
+        signed-in credential also reaches it for a members site's sign-in and
+        for `ur login`'s one command, a single-use key for its own devices.
+        Any other is refused by the role gate (`RolePermissionRefused`).
       operationId: oauthConsent
       security:
         - BearerAuth: []
@@ -11228,6 +11239,12 @@ paths:
         abandoned screen grants nothing. The redirect carries `code`, the
         request's `state` when it had one, and `iss` per rfc 9207 so the
         client can detect a mix-up attack.
+
+        In a team the caller is a member's credential with the keys
+        permission, since a consent grants a client access; any member's
+        signed-in credential also reaches it for a members site's sign-in and
+        for `ur login`'s one command, a single-use key for its own devices.
+        Any other is refused by the role gate (`RolePermissionRefused`).
       operationId: oauthAuthorize
       security:
         - BearerAuth: []
@@ -12406,6 +12423,10 @@ paths:
         The network's auth keys that have not expired, oldest first, without
         their secrets, which only their hash stores. A key's tags are opaque tag
         ids, never names.
+
+        In a team, the Owners and Admins list them (`RolePermissionKeys`);
+        any other member is refused by the role gate
+        (`RolePermissionRefused`).
       operationId: networkAuthKeys
       security:
         - BearerAuth: []
@@ -12434,6 +12455,14 @@ paths:
         A pre-approved key's bundle, the genesis hash, the authorization head and
         a Delegation's seeds, is built on the creating device and never sent here.
         A `ur-cli` session creates only single-use keys of at most 5 minutes.
+
+        In a team every member creates keys for its own devices, whatever its
+        role (`RolePermissionOwnDevices`): an untagged key that is not
+        pre-approved, which enrolls a device the member owns. A tagged or a
+        pre-approved key takes the keys permission, an Owner's or an Admin's
+        role; any other member's is refused 403 and creates nothing, as is
+        every key of a member whose role cannot be read. A credential's scopes
+        cut its role: only `auth_keys` and `all` reach this route.
       operationId: networkAuthKeyCreate
       security:
         - BearerAuth: []
@@ -12465,7 +12494,9 @@ paths:
         `DelegationRevoke` statement from a device.
 
         Revoking a key sends the account's security notice and records an admin
-        event.
+        event. In a team, the Owners and Admins revoke keys
+        (`RolePermissionKeys`); any other member is refused by the role gate
+        (`RolePermissionRefused`).
       operationId: networkAuthKeyRevoke
       security:
         - BearerAuth: []
