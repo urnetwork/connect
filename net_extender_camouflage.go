@@ -47,8 +47,7 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-// The launch stagger between the camouflaged and legacy attempts (P8), the same
-// stagger the dns carrier's ports race by (extenderDnsPortRaceStagger).
+// The launch stagger between the camouflaged and legacy attempts (P8).
 const extenderTcpCamouflageStagger = 250 * time.Millisecond
 
 // The alpn a faithful Chrome hello offers (P4). The extender negotiates
@@ -362,10 +361,9 @@ type extenderTcpCamouflageAttempt struct {
 	err       error
 }
 
-// Races the camouflaged and legacy tcp attempts (P8), exactly
-// raceExtenderDnsPorts' shape for two attempts: the camouflaged attempt at
-// once, the legacy attempt one stagger later while the first is pending or at
-// once when the first has failed. The first to answer wins and its round trip
+// Races the camouflaged and legacy tcp attempts (P8): the camouflaged attempt
+// at once, the legacy attempt one stagger later while the first is pending or
+// at once when the first has failed. The first to answer wins and its round trip
 // is copied into roundTrip; a refusal or a limit (A4, A12) ends the race with
 // that answer, since the extender gives the same one to either attempt. Every
 // other attempt is canceled and joined before the race returns, and a loser
