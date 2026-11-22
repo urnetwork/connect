@@ -42,9 +42,9 @@ const (
 	// quic-go's own queue lengths, which a setting of zero keeps
 	platformH3DefaultUnprocessedPacketCount    = 256
 	platformH3DefaultDatagramReceiveQueueCount = 128
-	// quic-go raises a smaller unprocessed-packet limit to this, so a
-	// server's buffered 0-RTT packets always fit (third_party/quic-go
-	// URNETWORK.md)
+	// URnetwork's quic-go raises a smaller unprocessed-packet limit to this,
+	// so a server's buffered 0-RTT packets always fit
+	// (../quic-go/URNETWORK.md)
 	platformH3MinUnprocessedPacketCount = 32
 )
 

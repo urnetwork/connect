@@ -617,8 +617,8 @@ type PlatformTransportSettings struct {
 	H3InitialConnectionReceiveWindowByteCount ByteCount
 	H3MaxConnectionReceiveWindowByteCount     ByteCount
 	// H3MaxUnprocessedPacketCount, H3DatagramSendQueueCount and
-	// H3DatagramReceiveQueueCount bound quic-go's queues on each H3
-	// connection (third_party/quic-go/URNETWORK.md): the received packets its
+	// H3DatagramReceiveQueueCount bound the queues of URnetwork's quic-go on
+	// each H3 connection (../quic-go/URNETWORK.md): the received packets its
 	// run loop has not processed yet, each in a 1452-byte packet buffer, and
 	// the DATAGRAM frames queued to send or received and unread, each a copy
 	// of its payload. The send count also bounds the retained-send

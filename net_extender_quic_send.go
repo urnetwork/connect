@@ -40,8 +40,8 @@ const (
 // quicSendFlightLimits bounds one connection's flight: the STREAM roots it
 // retains until acknowledged, and the DATAGRAM roots it retains queued or
 // sent until acknowledged or lost, which matches quic-go's DATAGRAM send queue
-// length so a full queue never blocks the send (third_party/quic-go
-// URNETWORK.md).
+// length so a full queue never blocks the send (URnetwork's quic-go,
+// ../quic-go/URNETWORK.md).
 type quicSendFlightLimits struct {
 	frames    int
 	datagrams int
