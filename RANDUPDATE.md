@@ -72,7 +72,7 @@ The import counts include tests, which may keep deterministic generators.
 
 ### Left as they are
 
-- **Vendored code:** `third_party/quic-go` seeds PCG from `crypto/rand` upstream, and the gvisor `tcpip` stack seeds its source from `crypto/rand`. go-substrate-rpc-client is vendored too. These are upstream patterns; review them separately if we fork further.
+- **Forked and vendored code:** URnetwork's quic-go (the fork at `../quic-go`) seeds PCG from `crypto/rand`, as upstream does, and the gvisor `tcpip` stack seeds its source from `crypto/rand`. go-substrate-rpc-client is vendored too. These are upstream patterns; review them separately if we fork further.
 - **Deterministic on purpose:** simulations and tools, such as `connect/sim-latency`, the competition latency simulation, `runner/perf`, the sdk `js/gen_lag.go` generator, and the finance liquidation history. These keep their seeds.
 
 ### The other connect imports
