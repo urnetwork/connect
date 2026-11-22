@@ -96,7 +96,7 @@ spec_paths() {
 # Every NewRoute( and NewStreamingRoute( occurrence, not every line: some
 # source lines hold two.
 route_files=()
-for f in $server_dir/api/api.go $server_dir/oauth/handlers.go; do
+for f in $server_dir/api/api.go $server_dir/api/oauth_routes.go $server_dir/oauth/handlers.go; do
     [[ -f $f ]] && route_files+=$f
 done
 
