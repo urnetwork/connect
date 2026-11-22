@@ -30,8 +30,11 @@ import (
 // The addresses come from the strategy's own resolver -- the network space DoH
 // cache when the host is protected, the egress-aware resolver otherwise -- for
 // both families, and are raced happy eyeballs style when concurrent complete
-// carrier claims fit. Otherwise a fallback waits for the preceding attempt's
-// teardown. The whodis dialer races 53 before 4053, so a network that passes
+// carrier claims fit. Otherwise alt h3's fallback waits for the teardown of
+// the preceding attempt, which its stagger ends, and whodis's for the
+// preceding attempt to fail or to stall: a whodis handshake hearing from alt
+// is never ended for the next candidate (quic_dial_race.go). The whodis
+// dialer races 53 before 4053, a second apart, so a network that passes
 // public dns still reaches alt on the port the router forwards.
 
 // The dialer priorities of L4: alt h3 runs after the tcp dialers (0 to 50) and
@@ -149,17 +152,7 @@ func (self *ClientStrategy) dialAltQuic(
 		ptSettings := policy.packetTranslationSettings()
 		ptSettings.Log = self.settings.ConnectSettings.Log
 		ptSettings.DnsTlds = [][]byte{tld}
-		wrap = func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
-			// the cleanup owns the translation; keep its encoder alive while
-			// cancellation closes quic gracefully, exactly as the platform
-			// dns carrier does
-			return NewPacketTranslation(
-				context.WithoutCancel(attemptCtx),
-				PacketTranslationModeDns,
-				packetConn,
-				ptSettings,
-			)
-		}
+		wrap = altWhodisPacketConnWrapper(ptSettings)
 	}
 	dial := func(attemptCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 		return dialAltQuicAttempt(
@@ -172,11 +165,21 @@ func (self *ClientStrategy) dialAltQuic(
 			policy,
 		)
 	}
+	// whodis races its ports and families as a dns carrier does: no attempt
+	// hearing from alt is ended for the next (quic_dial_race.go)
+	schedule := quicDialRaceSchedule{stagger: self.settings.AltH3RaceStagger}
+	if whodis {
+		schedule = quicDialRaceSchedule{
+			stagger:      self.settings.AltWhodisRaceStagger,
+			whodis:       true,
+			stallTimeout: self.settings.AltWhodisRaceStallTimeout,
+		}
+	}
 	var attempt *h3DialAttempt
 	if len(candidates) == 1 && source == nil {
 		attempt, err = dial(ctx, candidates[0])
 	} else {
-		attempt, err = raceAltQuicDialProgressive(ctx, candidates, source, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+		attempt, err = raceAltQuicDialProgressive(ctx, candidates, source, policy, schedule, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 			return dialAltQuicAttemptWithReservation(ctx, &self.settings.ConnectSettings, address, wrap, tlsConfig, quicConfig, policy, claim)
 		})
 	}
@@ -283,6 +286,27 @@ func (self *ClientStrategy) altDialCandidatesWithResolver(
 		return nil, fmt.Errorf("the alt host resolved no address")
 	}
 	return candidates, nil
+}
+
+// The whodis dialer's packet conn: the dns translation over the attempt's
+// socket, reporting what QUIC reads to the receive clock of the race that
+// launched the attempt (quic_dial_race.go).
+func altWhodisPacketConnWrapper(ptSettings *PacketTranslationSettings) h3PacketConnWrapper {
+	return func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
+		// the cleanup owns the translation; keep its encoder alive while
+		// cancellation closes quic gracefully, exactly as the platform dns
+		// carrier does
+		translation, err := NewPacketTranslation(
+			context.WithoutCancel(attemptCtx),
+			PacketTranslationModeDns,
+			packetConn,
+			ptSettings,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return quicDialReceiveClockPacketConn(attemptCtx, translation), nil
+	}
 }
 
 // The encoding tld of the whodis dialer, one at random per dial as the

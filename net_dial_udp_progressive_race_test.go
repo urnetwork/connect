@@ -37,17 +37,17 @@ func runUdpProgressiveTestRace(
 ) (*h3DialAttempt, error) {
 	switch kind {
 	case "plain":
-		return raceH3DialProgressive(ctx, candidates, source, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
+		return raceH3DialProgressive(ctx, candidates, source, testingDirectRaceSchedule, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 			return dial(ctx, address, nil)
 		})
 	case "memory":
-		return raceH3DialWithMemoryProgressive(ctx, candidates, source, budget, 4096, 0,
+		return raceH3DialWithMemoryProgressive(ctx, candidates, source, budget, 4096, 0, testingDirectRaceSchedule,
 			func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 				return dial(ctx, address, nil)
 			})
 	case "alt":
 		return raceAltQuicDialProgressive(ctx, candidates, source,
-			extenderQuicMemoryPolicy{budget: budget, byteCount: 4096, usesSlot: true}, dial)
+			extenderQuicMemoryPolicy{budget: budget, byteCount: 4096, usesSlot: true}, testingDirectRaceSchedule, dial)
 	default:
 		return nil, errors.New("invalid synthetic scheduler")
 	}
@@ -263,7 +263,7 @@ func checkUdpProgressiveBudgetFallback(t *testing.T, kind string) {
 		synctest.Wait()
 		// This advances the scheduler's specified positive timer; readiness
 		// and cleanup assertions use barriers, not a short negative sleep.
-		time.Sleep(platformH3FamilyRaceStagger)
+		time.Sleep(testingDirectRaceSchedule.stagger)
 		synctest.Wait()
 		select {
 		case <-firstCanceled:

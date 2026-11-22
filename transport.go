@@ -662,6 +662,27 @@ type PlatformTransportSettings struct {
 	H3BudgetFallbackTimeout time.Duration
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
+	// H3RaceStagger is the Happy Eyeballs delay between the candidate
+	// addresses of a direct H3 dial (raceH3Dial): the next candidate launches
+	// when the attempts out have neither connected nor failed within it, and
+	// at once when they have all failed. 250 ms, a few round trips of a QUIC
+	// handshake. Non-positive launches every candidate at once.
+	H3RaceStagger time.Duration
+	// H3DnsRaceStagger is that delay for the dns carriers (h3dns, h3dnspump),
+	// whose whodis handshake takes about 0.4 to 1 s (quic_dial_race.go). One
+	// second, so a healthy handshake on 53 is done before 4053 is tried. A
+	// candidate the budget cannot admit at the stagger never ends an attempt
+	// that is hearing from alt. Non-positive launches every candidate at once
+	// that the budget admits.
+	H3DnsRaceStagger time.Duration
+	// H3DnsRaceStallTimeout is how long a dns carrier attempt may hear nothing
+	// from alt before it gives up its claim to a candidate the budget
+	// refused. Two seconds: a healthy whodis handshake hears alt within a
+	// round trip of its ClientHello and then every few paced responses, so
+	// only a blackholed port or family stays silent that long. Non-positive
+	// never ends an attempt for its silence: a refused candidate waits for an
+	// attempt to fail.
+	H3DnsRaceStallTimeout time.Duration
 	// ModePreferences configures the enabled Auto modes and their priorities.
 	// Lower values are preferred and every healthy mode tied at the best live
 	// priority remains active. Nil selects DefaultTransportModePreferences.
@@ -942,6 +963,9 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
 		ModeInitialDelay:          2 * time.Second,
+		H3RaceStagger:             250 * time.Millisecond,
+		H3DnsRaceStagger:          1 * time.Second,
+		H3DnsRaceStallTimeout:     2 * time.Second,
 		H3BudgetFallbackTimeout:   2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
@@ -3816,11 +3840,11 @@ func (self *PlatformTransport) runH3(
 					extraByteCount = self.h3BudgetByteCount()
 				}
 				nestedByteCount := self.h3NestedBudget.Stats().TotalByteCount
-				attempt, err = raceH3DialWithMemoryProgressive(attemptCtx, candidates, source, budget, extraByteCount, nestedByteCount, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialWithMemoryProgressive(attemptCtx, candidates, source, budget, extraByteCount, nestedByteCount, self.h3DialRaceSchedule(ptMode), func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			} else {
-				attempt, err = raceH3DialProgressive(attemptCtx, candidates, source, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialProgressive(attemptCtx, candidates, source, self.h3DialRaceSchedule(ptMode), func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			}

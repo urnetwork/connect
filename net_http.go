@@ -57,6 +57,10 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		DohSettings: DefaultDohSettings(),
 		DnsTlds:     [][]byte{[]byte(DefaultExtenderDnsTld)},
 
+		AltH3RaceStagger:          250 * time.Millisecond,
+		AltWhodisRaceStagger:      1 * time.Second,
+		AltWhodisRaceStallTimeout: 2 * time.Second,
+
 		HelloRetryTimeout: 5 * time.Second,
 		// API calls return JSON/control data rather than streamed payloads;
 		// larger payloads must use an explicitly streaming transport
@@ -199,6 +203,27 @@ type ClientStrategySettings struct {
 	// The encoding tlds of the alt whodis dialer, one picked at random per
 	// dial. Empty takes `DefaultExtenderDnsTld`.
 	DnsTlds [][]byte
+	// AltH3RaceStagger is the Happy Eyeballs delay between the candidate
+	// addresses of the alt h3 dialer (raceAltQuicDial): the next candidate
+	// launches when the attempts out have neither connected nor failed within
+	// it. 250 ms, a few round trips of a QUIC handshake. A candidate the
+	// budget cannot admit at the stagger ends the attempts out. Non-positive
+	// launches every candidate the budget admits at once.
+	AltH3RaceStagger time.Duration
+	// AltWhodisRaceStagger is that delay for the alt whodis dialer, between 53
+	// and 4053 and the families, whose handshake takes about 0.4 to 1 s
+	// (quic_dial_race.go). One second, so a healthy handshake on 53 is done
+	// before 4053 is tried. A candidate the budget cannot admit at the stagger
+	// never ends an attempt that is hearing from alt. Non-positive launches
+	// every candidate the budget admits at once.
+	AltWhodisRaceStagger time.Duration
+	// AltWhodisRaceStallTimeout is how long an alt whodis attempt may hear
+	// nothing from alt before it gives up its claim to a candidate the budget
+	// refused. Two seconds: a healthy handshake hears alt within a round trip
+	// of its ClientHello and then every few paced responses. Non-positive
+	// never ends an attempt for its silence: a refused candidate waits for an
+	// attempt to fail.
+	AltWhodisRaceStallTimeout time.Duration
 
 	DohSettings *DohSettings
 	// Refuses DoH servers other than the built-in ones, whatever path they

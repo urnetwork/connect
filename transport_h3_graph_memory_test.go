@@ -191,8 +191,9 @@ func TestPlatformH3ExtenderGraphAdmissionWithPendingSibling(t *testing.T) {
 }
 
 // The second port must reserve both its speculative QUIC state and its own
-// translation. When only the former fits, explicitly cancel/join the first
-// attempt and let the second reuse the complete base graph.
+// translation. When only the former fits, cancel/join the first attempt once
+// it has stalled (a dns carrier's whodis race) and let the second reuse the
+// complete base graph.
 func TestPlatformDnsGraphRaceAdmitsCompleteFallback(t *testing.T) {
 	for _, concurrent := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
@@ -214,6 +215,7 @@ func TestPlatformDnsGraphRaceAdmitsCompleteFallback(t *testing.T) {
 			candidates := []*net.UDPAddr{{IP: net.ParseIP("192.0.2.53"), Port: 53}, {IP: net.ParseIP("192.0.2.53"), Port: 4053}}
 			var live, peak atomic.Int32
 			winner, err := raceH3DialWithMemory(ctx, candidates, budget, testingH3DialTransientByteCount, nestedBytes,
+				testingWhodisRaceSchedule,
 				func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 					claim, err := transport.acquireH3TranslationMemory(ctx)
 					if err != nil {

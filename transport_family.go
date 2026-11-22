@@ -1067,11 +1067,6 @@ func (self *PlatformTransport) noteKick() {
 	}
 }
 
-// platformH3FamilyRaceStagger is the Happy Eyeballs delay between candidate
-// addresses of a family-agnostic H3 dial. A definitive failure launches the
-// next candidate immediately.
-const platformH3FamilyRaceStagger = 250 * time.Millisecond
-
 // resolveControlUDPAddrs is the multi-address form of resolveControlUDPAddr.
 // It applies the same protected-domain, custom-resolver and egress-bound
 // policy, then returns every usable address for the requested family, or for
@@ -1330,17 +1325,19 @@ func (self *PlatformTransport) openH3PacketConn(
 }
 
 // raceH3Dial is Happy Eyeballs for QUIC: candidates launch in order, each
-// after platformH3FamilyRaceStagger or immediately after the previous one
-// fails definitively, and the first confirmed handshake wins. Losers are
-// cancelled and closed, including any that complete after the winner. The
-// returned error when nothing wins is the first candidate's error, which
-// names the preferred family's failure.
+// after the schedule's stagger or immediately after the previous one fails
+// definitively, and the first confirmed handshake wins. Losers are cancelled
+// and closed, including any that complete after the winner. The returned
+// error when nothing wins is the first candidate's error, which names the
+// preferred family's failure. Nothing here refuses a launch, so a whodis
+// schedule differs only by its longer stagger (quic_dial_race.go).
 func raceH3Dial(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
+	schedule quicDialRaceSchedule,
 	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
-	return raceH3DialProgressive(ctx, candidates, nil, dial)
+	return raceH3DialProgressive(ctx, candidates, nil, schedule, dial)
 }
 
 // The first family starts the existing confirmed-handshake race. DNS workers
@@ -1349,6 +1346,7 @@ func raceH3DialProgressive(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
 	source *udpDialCandidateSource,
+	schedule quicDialRaceSchedule,
 	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	defer source.close()
@@ -1391,7 +1389,7 @@ func raceH3DialProgressive(
 	pending := 1
 	var firstErr error
 	staggerReady := false
-	stagger := time.NewTimer(platformH3FamilyRaceStagger)
+	stagger := time.NewTimer(schedule.stagger)
 	defer stagger.Stop()
 	for {
 		select {
@@ -1408,7 +1406,7 @@ func raceH3DialProgressive(
 				launch()
 				pending += 1
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
 			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
@@ -1418,7 +1416,7 @@ func raceH3DialProgressive(
 				launch()
 				pending += 1
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
 			}
 		case resolved := <-resolution:
 			candidates = source.appendReady(candidates, resolved)
@@ -1427,7 +1425,7 @@ func raceH3DialProgressive(
 				launch()
 				pending++
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				stagger.Reset(schedule.stagger)
 			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
@@ -2095,10 +2093,13 @@ func (self *PlatformTransport) h3DialCandidatesWithResolver(
 				}
 				return nil, err
 			}
+			// what QUIC reads reports to the receive clock of the race
+			// attempt, if any (quic_dial_race.go)
 			if preadmitted {
-				return translation, nil
+				return quicDialReceiveClockPacketConn(attemptCtx, translation), nil
 			}
-			return &extenderBudgetPacketConn{PacketConn: translation, reservation: claim}, nil
+			return quicDialReceiveClockPacketConn(attemptCtx,
+				&extenderBudgetPacketConn{PacketConn: translation, reservation: claim}), nil
 		}
 	}
 	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
@@ -2213,6 +2214,19 @@ func (self *PlatformTransport) resolveDnsCarrierAddrs(
 		})
 	}
 	return udpAddrs, nil
+}
+
+// How one H3 dial of the mode races its candidates: a dns carrier's is a
+// whodis race (quic_dial_race.go).
+func (self *PlatformTransport) h3DialRaceSchedule(ptMode TransportMode) quicDialRaceSchedule {
+	if ptMode == TransportModeH3Dns || ptMode == TransportModeH3DnsPump {
+		return quicDialRaceSchedule{
+			stagger:      self.settings.H3DnsRaceStagger,
+			whodis:       true,
+			stallTimeout: self.settings.H3DnsRaceStallTimeout,
+		}
+	}
+	return quicDialRaceSchedule{stagger: self.settings.H3RaceStagger}
 }
 
 // dialH3 opens the socket for one address and completes the QUIC dial on it.
