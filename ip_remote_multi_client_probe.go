@@ -541,9 +541,9 @@ func (self *RemoteUserNatMultiClient) registerProbeFlow(
 
 		switch version {
 		case 4:
-			self.ip4PathUpdates[ipPath.ToIp4Path()] = update
+			self.setIp4PathUpdateWithLock(ipPath.ToIp4Path(), update)
 		case 6:
-			self.ip6PathUpdates[ipPath.ToIp6Path()] = update
+			self.setIp6PathUpdateWithLock(ipPath.ToIp6Path(), update)
 		}
 		// note: no clientUpdates entry, no affinity join, no flowOpened, and no
 		// idle-reaper goroutine -- see the comment above.
@@ -583,13 +583,13 @@ func (self *RemoteUserNatMultiClient) unregisterProbeFlows(probes []*probeFlow) 
 			case 4:
 				key := probe.ipPath.ToIp4Path()
 				if update, ok := self.ip4PathUpdates[key]; ok && update.probe == probe {
-					delete(self.ip4PathUpdates, key)
+					self.deleteIp4PathUpdateWithLock(key)
 					removed = append(removed, update)
 				}
 			case 6:
 				key := probe.ipPath.ToIp6Path()
 				if update, ok := self.ip6PathUpdates[key]; ok && update.probe == probe {
-					delete(self.ip6PathUpdates, key)
+					self.deleteIp6PathUpdateWithLock(key)
 					removed = append(removed, update)
 				}
 			}
@@ -878,9 +878,9 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 		}
 		switch egressIpPath.Version {
 		case 4:
-			delete(self.ip4PathUpdates, egressIpPath.ToIp4Path())
+			self.deleteIp4PathUpdateWithLock(egressIpPath.ToIp4Path())
 		case 6:
-			delete(self.ip6PathUpdates, egressIpPath.ToIp6Path())
+			self.deleteIp6PathUpdateWithLock(egressIpPath.ToIp6Path())
 		}
 		// removed as it is answered: a retransmitted answer then finds nothing,
 		// is consumed by the unmatched path above, and cannot re-complete or
@@ -1021,13 +1021,13 @@ func (self *RemoteUserNatMultiClient) probeDialFailure(
 			key := egressIpPath.ToIp4Path()
 			if u, ok := self.ip4PathUpdates[key]; ok && u.isProbe() {
 				found = u
-				delete(self.ip4PathUpdates, key)
+				self.deleteIp4PathUpdateWithLock(key)
 			}
 		case 6:
 			key := egressIpPath.ToIp6Path()
 			if u, ok := self.ip6PathUpdates[key]; ok && u.isProbe() {
 				found = u
-				delete(self.ip6PathUpdates, key)
+				self.deleteIp6PathUpdateWithLock(key)
 			}
 		}
 		if found == nil {
@@ -1040,9 +1040,9 @@ func (self *RemoteUserNatMultiClient) probeDialFailure(
 			// put it back; another exit's probe is still live on this key
 			switch egressIpPath.Version {
 			case 4:
-				self.ip4PathUpdates[egressIpPath.ToIp4Path()] = found
+				self.setIp4PathUpdateWithLock(egressIpPath.ToIp4Path(), found)
 			case 6:
-				self.ip6PathUpdates[egressIpPath.ToIp6Path()] = found
+				self.setIp6PathUpdateWithLock(egressIpPath.ToIp6Path(), found)
 			}
 			return
 		}
