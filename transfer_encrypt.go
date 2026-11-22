@@ -556,6 +556,15 @@ const (
 	// persistence failure, not cryptographic evidence against the peer. The
 	// session withholds Cipher and does not set KeyIdentityRejected.
 	EncryptionEventKeyIdentityStoreUnavailable
+	// The peer holds no session with this client, as its unknown-wrap nack
+	// naming no epoch showed: it restarted, or lost its session state. This
+	// client demoted its established epoch with the peer and is re-handshaking
+	// (see `handleUnknownWrapNack`). State a caller keeps for the peer's
+	// earlier session, a handshake of its own protocol over it among them, is
+	// gone at the peer too. Fired once per admitted demotion, which
+	// `EncryptionSettings.UnknownWrapNackRestartCooldown` paces, forged nacks
+	// included.
+	EncryptionEventPeerSessionLost
 )
 
 // EncryptionEvent is a per-peer encryption lifecycle notification. Events are
@@ -4965,70 +4974,82 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 // (`dropStaleHandshakeRecords`). Once the recovery seals, the backlog's resend
 // carries the new epoch, its oldest Pack promoted to the sequence's head.
 func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	if self.role != sequenceTlsRoleClient {
-		return
-	}
-	if self.establishedEpoch == nil {
-		// pre-establishment retries are owned by the initial-retry machinery
-		return
-	}
-	if nackEpochId != (Id{}) {
-		// The peer reports a REAL readable epoch. Whether it matches our
-		// established epoch (corruption in flight / stale-or-forged nack) or
-		// is an older client-minted generation (the peer is transiently
-		// lagging an in-flight rekey), the peer is alive and on a generation
-		// we minted, and the new epoch's ClientHello is already riding the
-		// reliable EncryptedControl sequence toward it — convergence is
-		// guaranteed without our intervention. Demoting here is not just
-		// redundant, it MOVES THE TARGET: it tears down the healthy new
-		// epoch and starts a newer one, so the peer's in-flight catch-up is
-		// now itself stale. Under a slow transport (QUIC-over-DNS) that
-		// oscillates into repeated rehandshakes and occasionally overruns a
-		// first-attempt deadline (the Dns*Encrypted Required retry pattern).
-		// Only an EMPTY nacked epoch — the peer has NO established epoch, so
-		// no ClientHello is coming and it cannot converge on its own — earns
-		// a demote-and-rehandshake below.
-		return
-	}
-	now := time.Now()
-	if now.Before(self.nextUnknownWrapNackRestartTime) {
-		// a recovery is (still) in progress; give it the full cooldown
-		// before escalating with a fresh demote+handshake
-		return
-	}
-	self.nextUnknownWrapNackRestartTime = now.Add(self.unknownWrapNackRestartCooldown())
-	if self.client != nil && self.client.log.V(1).Enabled() {
-		self.client.log.Infof(
-			"[tls]%s unknown-wrap nack (peer epoch %s vs established %s): demoting dead epoch and re-handshaking\n",
-			self.logTag, nackEpochId, self.establishedEpoch.epochId,
-		)
-	}
-	// demote everything the peer provably cannot read; the peer lost (or
-	// never had) the state to decrypt these epochs, so their decrypt
-	// direction is equally dead
-	if self.epoch != nil && self.epoch != self.establishedEpoch {
-		self.epoch.cancel()
-	}
-	if self.priorEstablishedEpoch != nil {
-		self.priorEstablishedEpoch.cancel()
-		self.priorEstablishedEpoch = nil
-	}
-	demotedEpoch := self.epoch
-	self.establishedEpoch.cancel()
-	self.establishedEpoch = nil
-	self.buildAndStartEpochWithLock()
-	// Every attempt minted before the new one is dropped, so are its handshake
-	// records still queued or retransmittable: a peer that lost its session
-	// would answer a stale ClientHello, and meet a stale second flight or proof
-	// with no ClientHello of it, before the new ClientHello reached it.
-	if self.epoch != demotedEpoch && self.epoch != nil && self.epoch.epochId != (Id{}) {
-		self.staleHandshakeRecordsBefore = self.epoch.epochId
-		self.staleHandshakeRecordsSet.Store(true)
-		if self.staleHandshakeRecordsForTest != nil {
-			self.staleHandshakeRecordsForTest(self.epoch.epochId)
+	demoted := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.role != sequenceTlsRoleClient {
+			return false
 		}
+		if self.establishedEpoch == nil {
+			// pre-establishment retries are owned by the initial-retry machinery
+			return false
+		}
+		if nackEpochId != (Id{}) {
+			// The peer reports a REAL readable epoch. Whether it matches our
+			// established epoch (corruption in flight / stale-or-forged nack) or
+			// is an older client-minted generation (the peer is transiently
+			// lagging an in-flight rekey), the peer is alive and on a generation
+			// we minted, and the new epoch's ClientHello is already riding the
+			// reliable EncryptedControl sequence toward it — convergence is
+			// guaranteed without our intervention. Demoting here is not just
+			// redundant, it MOVES THE TARGET: it tears down the healthy new
+			// epoch and starts a newer one, so the peer's in-flight catch-up is
+			// now itself stale. Under a slow transport (QUIC-over-DNS) that
+			// oscillates into repeated rehandshakes and occasionally overruns a
+			// first-attempt deadline (the Dns*Encrypted Required retry pattern).
+			// Only an EMPTY nacked epoch — the peer has NO established epoch, so
+			// no ClientHello is coming and it cannot converge on its own — earns
+			// a demote-and-rehandshake below.
+			return false
+		}
+		now := time.Now()
+		if now.Before(self.nextUnknownWrapNackRestartTime) {
+			// a recovery is (still) in progress; give it the full cooldown
+			// before escalating with a fresh demote+handshake
+			return false
+		}
+		self.nextUnknownWrapNackRestartTime = now.Add(self.unknownWrapNackRestartCooldown())
+		if self.client != nil && self.client.log.V(1).Enabled() {
+			self.client.log.Infof(
+				"[tls]%s unknown-wrap nack (peer epoch %s vs established %s): demoting dead epoch and re-handshaking\n",
+				self.logTag, nackEpochId, self.establishedEpoch.epochId,
+			)
+		}
+		// demote everything the peer provably cannot read; the peer lost (or
+		// never had) the state to decrypt these epochs, so their decrypt
+		// direction is equally dead
+		if self.epoch != nil && self.epoch != self.establishedEpoch {
+			self.epoch.cancel()
+		}
+		if self.priorEstablishedEpoch != nil {
+			self.priorEstablishedEpoch.cancel()
+			self.priorEstablishedEpoch = nil
+		}
+		demotedEpoch := self.epoch
+		self.establishedEpoch.cancel()
+		self.establishedEpoch = nil
+		self.buildAndStartEpochWithLock()
+		// Every attempt minted before the new one is dropped, so are its handshake
+		// records still queued or retransmittable: a peer that lost its session
+		// would answer a stale ClientHello, and meet a stale second flight or proof
+		// with no ClientHello of it, before the new ClientHello reached it.
+		if self.epoch != demotedEpoch && self.epoch != nil && self.epoch.epochId != (Id{}) {
+			self.staleHandshakeRecordsBefore = self.epoch.epochId
+			self.staleHandshakeRecordsSet.Store(true)
+			if self.staleHandshakeRecordsForTest != nil {
+				self.staleHandshakeRecordsForTest(self.epoch.epochId)
+			}
+		}
+		return true
+	}()
+	// The peer holds no session with this client: it restarted, or lost its
+	// state. Reported outside the session lock, as every event is.
+	if demoted && self.manager != nil {
+		self.manager.encryptionEvent(&EncryptionEvent{
+			PeerId: self.peerId,
+			Type:   EncryptionEventPeerSessionLost,
+			Reason: "the peer holds no session with this client",
+		})
 	}
 }
 

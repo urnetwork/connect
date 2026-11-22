@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -1988,5 +1990,52 @@ func TestStaleHandshakeRecordsLeaveTheirPack(t *testing.T) {
 		MessagePoolReturn(item.transferFrameBytes)
 		MessagePoolReturn(emptied.transferFrameBytes)
 		MessagePoolReturn(untouched.transferFrameBytes)
+	}
+}
+
+// A nack demotion reports the peer's lost session once (QD-1185), for a caller
+// to end what it keeps for the peer's earlier session; a nack naming a real
+// epoch, and one inside the restart cooldown, demote nothing and report
+// nothing.
+func TestNackDemotionReportsThePeerSessionLost(t *testing.T) {
+	sess, cleanup := newTestEncryptionSessionWithMode(t, sequenceTlsRoleClient, EncryptionModeRequired)
+	defer cleanup()
+	var lostLock sync.Mutex
+	var lostPeerIds []Id
+	remove := sess.manager.AddEncryptionEventCallback(func(event *EncryptionEvent) {
+		if event.Type == EncryptionEventPeerSessionLost {
+			lostLock.Lock()
+			defer lostLock.Unlock()
+			lostPeerIds = append(lostPeerIds, event.PeerId)
+		}
+	})
+	defer remove()
+	lost := func() []Id {
+		lostLock.Lock()
+		defer lostLock.Unlock()
+		return slices.Clone(lostPeerIds)
+	}
+	established := injectTestAttemptEpoch(sess, NewId(), nil, true, nil)
+	sess.stateLock.Lock()
+	sess.establishedEpoch = established
+	sess.stateLock.Unlock()
+
+	sess.handleUnknownWrapNack(established.epochId)
+	if got := lost(); len(got) != 0 {
+		t.Fatalf("a nack naming the established epoch reported %d lost sessions", len(got))
+	}
+	sess.handleUnknownWrapNack(Id{})
+	if got := lost(); len(got) != 1 || got[0] != sess.peerId {
+		t.Fatalf("the demotion reported %v, want the peer once", got)
+	}
+
+	// a second empty nack inside the cooldown, against the recovery's epoch once it establishes
+	recovery := injectTestAttemptEpoch(sess, NewId(), nil, true, nil)
+	sess.stateLock.Lock()
+	sess.establishedEpoch = recovery
+	sess.stateLock.Unlock()
+	sess.handleUnknownWrapNack(Id{})
+	if got := lost(); len(got) != 1 {
+		t.Fatalf("a nack inside the restart cooldown reported %d lost sessions in all, want 1", len(got))
 	}
 }
