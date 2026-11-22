@@ -796,7 +796,12 @@ func extenderStreamRequest(
 // The udp carriers: one QUIC connection with ALPN h3 straight to the extender
 // ip, the dns carrier over the packet translation first, then one H3 request
 // stream that becomes the byte stream. It dials Profile.Port alone; the dns
-// carrier's ports are raced over it by dialExtenderDns.
+// carrier's ports are raced over it by dialExtenderDns, and the dns carrier's
+// translation reports what QUIC reads to the receive clock the context
+// carries. The handshake is bounded by its idle timeout (ConnectTimeout,
+// TlsTimeout and HandshakeTimeout, and twice that in all) and ends at once on
+// a cancel; the request after it is bounded by ConnectTimeout, which a cancel
+// does not cut short. The context's deadline bounds both.
 func dialExtenderQuic(
 	ctx context.Context,
 	connectSettings *ConnectSettings,
@@ -868,8 +873,11 @@ func dialExtenderQuic(
 		if err != nil {
 			return nil, nil, err
 		}
-		packetConn = translation
 		closers = append(closers, func() { translation.Close() })
+		// what QUIC reads reports to the receive clock of the port race's
+		// attempt, which tells a dial hearing the extender from a blackholed
+		// port (net_extender_dns_ports.go)
+		packetConn = quicDialReceiveClockPacketConn(ctx, translation)
 	}
 
 	quicTransport := &quic.Transport{

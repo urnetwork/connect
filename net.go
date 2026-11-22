@@ -104,6 +104,9 @@ func DefaultConnectSettings() *ConnectSettings {
 
 		QuicVersionPolicy: QuicVersionPolicyPreferV2,
 
+		ExtenderDnsRaceStagger:      1 * time.Second,
+		ExtenderDnsRaceStallTimeout: 2 * time.Second,
+
 		TlsConfig:                 tlsConfig,
 		TlsClientHelloFingerprint: TlsClientHelloFingerprintChrome,
 	}
@@ -181,6 +184,25 @@ type ConnectSettings struct {
 	// dialers offer (A13, net_quic_version.go). The zero value and an unknown
 	// value offer version 2 first with version 1 behind it.
 	QuicVersionPolicy QuicVersionPolicy
+
+	// ExtenderDnsRaceStagger is the delay between the ports one dial of an
+	// extender's dns carrier races, 53 and 4053 in the order the extender's
+	// record gives (EXTENDER.md L2, net_extender_dns_ports.go): the next port
+	// launches one stagger after the last launch, beside the attempts out,
+	// when the memory budget admits its claim. One second, as alt's whodis
+	// races take (quic_dial_race.go): a dns carried handshake and the
+	// extender's answer take about 0.2 to 1 s, so a healthy dial on the first
+	// port is done before the next port is tried. A port the budget refuses
+	// at the stagger never ends an attempt that is hearing from the extender.
+	// Non-positive launches every port the budget admits at once.
+	ExtenderDnsRaceStagger time.Duration
+	// ExtenderDnsRaceStallTimeout is how long an attempt of that race may hear
+	// nothing from the extender before it gives up its claim to a port the
+	// budget refused. Two seconds: a healthy attempt hears the extender within
+	// a round trip of its ClientHello and then every few paced responses, so
+	// only a blackholed port stays silent that long. Non-positive never ends
+	// an attempt for its silence: a refused port waits for an attempt to fail.
+	ExtenderDnsRaceStallTimeout time.Duration
 
 	// WebRtcExtenderCarrier, when set, is the dial side of the peer-to-peer
 	// webrtc extender carrier (EXTENDER.md S, net_extender_webrtc.go): it

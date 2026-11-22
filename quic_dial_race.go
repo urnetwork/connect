@@ -9,11 +9,13 @@ import (
 )
 
 // quic_dial_race.go -- what the candidate races of a QUIC dial share
-// (raceH3Dial, raceH3DialWithMemory, raceAltQuicDial): how a race paces its
-// candidates and, for a whodis race, when an attempt has stalled.
+// (raceH3Dial, raceH3DialWithMemory, raceAltQuicDial, raceExtenderDnsPorts):
+// how a race paces its candidates and, for a whodis race, when an attempt has
+// stalled.
 //
 // A whodis race is a dns carrier's: the platform's h3dns and h3dnspump modes
-// and the api's alt whodis dialer, 53 before 4053 on each family (L2). A
+// and the api's alt whodis dialer, 53 before 4053 on each family, and an
+// extender's dns carrier, over its ports in its record's order (L2). A
 // whodis handshake takes about 0.4 to 1 s: a ClientHello of about twenty dns
 // queries, about sixteen paced dns responses, about ten more queries for the
 // Finished, and a round trip and a half. The direct H3 rule, a 250 ms stagger
