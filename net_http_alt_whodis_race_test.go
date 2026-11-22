@@ -297,7 +297,7 @@ func TestWhodisDialsFeedTheRaceReceiveClock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	checkClock := func(description string, dial func(context.Context) (*h3DialAttempt, error)) {
-		clock := newQuicDialReceiveClock()
+		clock := newQuicDialReceiveClock(nil)
 		attempt, err := dial(withQuicDialReceiveClock(ctx, clock))
 		if err != nil {
 			t.Fatalf("%s: %v", description, err)
@@ -319,7 +319,7 @@ func TestWhodisDialsFeedTheRaceReceiveClock(t *testing.T) {
 		}
 	}
 	checkDirect := func(description string, dial func(context.Context) (*h3DialAttempt, error)) {
-		clock := newQuicDialReceiveClock()
+		clock := newQuicDialReceiveClock(nil)
 		attempt, err := dial(withQuicDialReceiveClock(ctx, clock))
 		if err != nil {
 			t.Fatalf("%s: %v", description, err)

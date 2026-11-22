@@ -30,7 +30,8 @@ import (
 // the bound that keeps a blackholed 53 or v6 from holding the only claim to
 // the request deadline, while a healthy handshake, which hears alt within a
 // round trip of its ClientHello and then every few paced responses, keeps its
-// whole budget.
+// whole budget. The platform's h3 gate holds a dns carrier's dial to the same
+// rule against a better mode waiting for the gate (platform_h3_gate.go).
 //
 // The races run on one goroutine each; only the receive clock is read across
 // goroutines.
@@ -55,21 +56,29 @@ type quicDialRaceSchedule struct {
 // failure of the path, unlike the cancel of a race's loser.
 var errQuicDialStalled = errors.New("quic dial attempt heard nothing from its peer")
 
-// When one race attempt's socket last delivered a packet from its peer, from
-// the attempt's launch until the first. Safe for concurrent use: the socket's
-// reader stores and the race loads.
+// When one dial attempt's socket last delivered a packet from its peer, from
+// the clock's start until the first. A race attempt's clock starts at its
+// launch, and a platform dial's at its gate lease (platform_h3_gate.go),
+// which is also the parent of the clocks of the attempts its race launches.
+// Safe for concurrent use: the socket's reader stores, and the race or the
+// gate loads.
 type quicDialReceiveClock struct {
 	startTime time.Time
 	// the last delivery, as the time since startTime
 	lastReceiveOffset atomic.Int64
+	// moved by every delivery this clock records; nil for none
+	parent *quicDialReceiveClock
 }
 
-func newQuicDialReceiveClock() *quicDialReceiveClock {
-	return &quicDialReceiveClock{startTime: time.Now()}
+func newQuicDialReceiveClock(parent *quicDialReceiveClock) *quicDialReceiveClock {
+	return &quicDialReceiveClock{startTime: time.Now(), parent: parent}
 }
 
 func (self *quicDialReceiveClock) received() {
 	self.lastReceiveOffset.Store(int64(time.Since(self.startTime)))
+	if self.parent != nil {
+		self.parent.received()
+	}
 }
 
 // From when the attempt has heard nothing from its peer.
@@ -93,7 +102,8 @@ func withQuicDialReceiveClock(ctx context.Context, clock *quicDialReceiveClock) 
 
 // The packet conn QUIC reads for one attempt, wrapped to report each packet
 // it delivers to the receive clock its dial context carries (a whodis race's
-// attempt), or packetConn itself when the context carries none. Only the dns translations call it: QUIC reads a translation
+// attempt, or a dns carrier's lease), or packetConn itself when the context
+// carries none. Only the dns translations call it: QUIC reads a translation
 // through ReadFrom either way, where wrapping a UDP socket would cost QUIC
 // its batched and ECN reads.
 func quicDialReceiveClockPacketConn(ctx context.Context, packetConn net.PacketConn) net.PacketConn {
@@ -154,12 +164,13 @@ type quicDialRaceAttempt struct {
 }
 
 // The context of the next attempt, canceled with the race and carrying a
-// whodis race's receive clock, and the attempt's index.
+// whodis race's receive clock, under the dial's own when it has one, and the
+// attempt's index.
 func (self *quicDialRaceAttempts) launch(ctx context.Context) (context.Context, int) {
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	attempt := &quicDialRaceAttempt{cancel: cancel}
 	if self.schedule.whodis {
-		attempt.clock = newQuicDialReceiveClock()
+		attempt.clock = newQuicDialReceiveClock(quicDialReceiveClockFromContext(ctx))
 		attemptCtx = withQuicDialReceiveClock(attemptCtx, attempt.clock)
 	}
 	self.attempts = append(self.attempts, attempt)

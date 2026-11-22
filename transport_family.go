@@ -2093,8 +2093,8 @@ func (self *PlatformTransport) h3DialCandidatesWithResolver(
 				}
 				return nil, err
 			}
-			// what QUIC reads reports to the receive clock of the race
-			// attempt, if any (quic_dial_race.go)
+			// what QUIC reads reports to the dial's receive clock, the
+			// lease's or its race attempt's (quic_dial_race.go)
 			if preadmitted {
 				return quicDialReceiveClockPacketConn(attemptCtx, translation), nil
 			}

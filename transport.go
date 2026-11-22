@@ -3951,7 +3951,9 @@ func (self *PlatformTransport) runH3(
 			// see the h1 loop: admission runs again
 			continue
 		}
-		attemptCtx, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
+		// a better mode waiting for the gate ends this mode's connection, but
+		// its dial only once a dns carrier's has stalled (platform_h3_gate.go)
+		attemptCtx, attemptConnected, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
 		if !acquired {
 			releaseReconnect()
 			cancelConnect()
@@ -4068,6 +4070,9 @@ func (self *PlatformTransport) runH3(
 			afterKick = true
 			continue
 		}
+		// the handshake and the auth are done: from here a better mode
+		// waiting for the gate may end this connection
+		attemptConnected()
 
 		conn := connStream.conn
 		stream := connStream.stream

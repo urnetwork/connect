@@ -83,7 +83,7 @@ func TestQuicDialReceiveClockConnTimesDeliveredPackets(t *testing.T) {
 		if conn := quicDialReceiveClockPacketConn(t.Context(), inner); conn != inner {
 			t.Fatal("a dial outside a whodis race was wrapped")
 		}
-		clock := newQuicDialReceiveClock()
+		clock := newQuicDialReceiveClock(nil)
 		ctx := context.WithValue(t.Context(), quicDialReceiveClockContextKey{}, clock)
 		conn := quicDialReceiveClockPacketConn(ctx, inner)
 		if !clock.silentSince().Equal(clock.startTime) {
@@ -123,6 +123,39 @@ func TestQuicDialReceiveClockConnTimesDeliveredPackets(t *testing.T) {
 		if bare.SetReadBuffer(4096) == nil || bare.SetWriteBuffer(4096) == nil {
 			t.Fatal("a conn with no buffers accepted a size")
 		}
+	})
+}
+
+// A whodis race's attempt clock moves the dial's own clock, which a dns
+// carrier's gate lease carries, with every packet it hears; a direct H3
+// race's attempts carry the dial's clock untouched.
+func TestQuicDialRaceAttemptClocksMoveTheDialClock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dialClock := newQuicDialReceiveClock(nil)
+		ctx := withQuicDialReceiveClock(t.Context(), dialClock)
+		attempts := &quicDialRaceAttempts{schedule: testingWhodisRaceSchedule}
+		attemptCtx, index := attempts.launch(ctx)
+		attemptClock := quicDialReceiveClockFromContext(attemptCtx)
+		if attemptClock == dialClock || attemptClock.parent != dialClock || attempts.attempts[index].clock != attemptClock {
+			t.Fatal("the attempt's clock is not under the dial's")
+		}
+		time.Sleep(time.Second)
+		conn := quicDialReceiveClockPacketConn(attemptCtx, &receiveClockTestConn{})
+		if _, _, err := conn.ReadFrom(make([]byte, 8)); err != nil {
+			t.Fatal(err)
+		}
+		if !attemptClock.silentSince().Equal(attemptClock.startTime.Add(time.Second)) ||
+			!dialClock.silentSince().Equal(dialClock.startTime.Add(time.Second)) {
+			t.Fatal("a packet the attempt heard did not move both clocks")
+		}
+		attempts.cancelAll()
+
+		direct := &quicDialRaceAttempts{schedule: testingDirectRaceSchedule}
+		directCtx, _ := direct.launch(ctx)
+		if quicDialReceiveClockFromContext(directCtx) != dialClock {
+			t.Fatal("a direct H3 attempt lost the dial's clock")
+		}
+		direct.cancelAll()
 	})
 }
 
