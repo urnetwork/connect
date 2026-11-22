@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "golang.org/x/net/proxy"
@@ -416,6 +417,11 @@ type ClientStrategy struct {
 	scores            *networkStrategyScores
 	currentNetworkId  string
 	networkGeneration uint64
+	// The network on which a race's dialers other than the last resort last
+	// failed: there the last-resort dialers race with them, until one of them
+	// wins again (parallelEvalWithRouteHedge). Guarded by mutex.
+	primaryFailedNetworkId  string
+	primaryFailedNetworkSet bool
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -1541,6 +1547,41 @@ func preferredHttpAttemptContext(
 	}
 }
 
+// The current network's private id (net_strategy_score.go).
+func (self *ClientStrategy) networkIdSnapshot() string {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.currentNetworkId
+}
+
+// Whether the dialers other than the last resort last failed on the network,
+// so that the last-resort dialers race with them there.
+func (self *ClientStrategy) primaryDialersFailedOn(networkId string) bool {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	return self.primaryFailedNetworkSet && self.primaryFailedNetworkId == networkId
+}
+
+// The dialers other than the last resort failed on the network, so the
+// last-resort dialers race with them there from now on.
+func (self *ClientStrategy) notePrimaryDialersFailed(networkId string) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	self.primaryFailedNetworkId = networkId
+	self.primaryFailedNetworkSet = true
+}
+
+// A dialer other than the last resort won on the network, which no longer
+// needs the last resort.
+func (self *ClientStrategy) notePrimaryDialerSucceeded(networkId string) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.primaryFailedNetworkSet && self.primaryFailedNetworkId == networkId {
+		self.primaryFailedNetworkId = ""
+		self.primaryFailedNetworkSet = false
+	}
+}
+
 // parallelEval races the dialers of one request. `webSocketOnly` restricts it
 // to the dialers that can carry a websocket, which is what a platform dial
 // needs and an api request does not (L4).
@@ -1565,12 +1606,25 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 	eval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
 	preferredHedgeDelay time.Duration,
-) *evalResult {
+) (selected *evalResult) {
 	// Ordinary ordering (GET can retain the first preferred attempt while
 	// allowing known alternatives to race after its establishment head start):
 	// 1. try all dialers that previously worked sequentially
 	// 2. try dialers that previously failed in parallel blocks
 	// 3. expand the extenders and try new extenders in parallel blocks
+	// 4. run the last-resort dialers alone (alt whodis, L4)
+	//
+	// A last-resort dialer stays out of steps 1 to 3, and so out of the
+	// parallel blocks and the GET hedge, unless the other dialers have failed
+	// on the current network. Its handshake is the slowest (about 0.4 to 1 s
+	// for whodis), and any faster dialer's win ended it, so the server waited
+	// out its idle timeout for nearly every one (lb_alt, 2026-11-21). It runs
+	// in step 4 once every other dialer of a round has failed, which marks the
+	// network; on a marked network it leads the parallel blocks instead, where
+	// only the others failing again or the network recovering can end it, and
+	// a win by another dialer clears the mark. The request's deadline passing
+	// with the other dialers still out and no winner marks the network too, so
+	// a network that blackholes them reaches the last resort on the next try.
 
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	// Every parallel attempt remains owned by this call until its eval stack
@@ -1608,6 +1662,31 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 
 	out := make(chan *evalResult)
 
+	// whether this round evaluated a dialer that is not a last resort
+	var primaryEvaluated atomic.Bool
+	evalDialer := func(evalCtx context.Context, dialer *clientDialer) *evalResult {
+		if !dialer.lastResort {
+			primaryEvaluated.Store(true)
+		}
+		return eval(evalCtx, dialer)
+	}
+	// the current round's network
+	var networkId string
+	defer func() {
+		if selected != nil {
+			if selected.err == nil && selected.dialer != nil && !selected.dialer.lastResort {
+				self.notePrimaryDialerSucceeded(networkId)
+			}
+			return
+		}
+		// the request's own deadline passed with the round's other dialers
+		// out and no winner, not the caller's deadline or the strategy's close
+		if primaryEvaluated.Load() && ctx.Err() == nil && self.ctx.Err() == nil &&
+			errors.Is(handleCtx.Err(), context.DeadlineExceeded) {
+			self.notePrimaryDialersFailed(networkId)
+		}
+	}()
+
 	runWithContext := func(evalCtx context.Context, dialer *clientDialer) {
 		success := false
 		defer func() {
@@ -1618,7 +1697,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 				}
 			}
 		}()
-		result := eval(evalCtx, dialer)
+		result := evalDialer(evalCtx, dialer)
 		if result == nil {
 			return
 		}
@@ -1653,7 +1732,24 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 		// the number of runs with pending out
 		p := 0
 
+		primaryEvaluated.Store(false)
+		networkId = self.networkIdSnapshot()
 		dialerWeights, limitedUntil, dialerGeneration := self.dialerWeightsSnapshot(webSocketOnly)
+		dialerCount := len(dialerWeights)
+		primaryFailed := self.primaryDialersFailedOn(networkId)
+		// out of this round's race unless the others failed on the network
+		lastResortDialers := []*clientDialer{}
+		if !primaryFailed {
+			for dialer := range dialerWeights {
+				if dialer.lastResort {
+					lastResortDialers = append(lastResortDialers, dialer)
+					delete(dialerWeights, dialer)
+				}
+			}
+			slices.SortStableFunc(lastResortDialers, func(a *clientDialer, b *clientDialer) int {
+				return a.priority - b.priority
+			})
+		}
 
 		if 0 < len(dialerWeights) {
 			serialDialers := []*clientDialer{}
@@ -1749,7 +1845,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 					handleCtx,
 					len(serialDialers)-i,
 				)
-				result := eval(attemptCtx, dialer)
+				result := evalDialer(attemptCtx, dialer)
 				if result != nil {
 					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
 					result.dialer = dialer
@@ -1777,6 +1873,19 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 
 			// note parallel dialers is in the original weighted order
 			// WeightedShuffle(parallelDialers, dialerWeights)
+			if primaryFailed {
+				// the others failed on this network: the last resort leads
+				// the first block rather than waiting behind dialers that
+				// may hold it to the deadline
+				slices.SortStableFunc(parallelDialers, func(a *clientDialer, b *clientDialer) int {
+					if a.lastResort == b.lastResort {
+						return 0
+					} else if a.lastResort {
+						return -1
+					}
+					return 1
+				})
+			}
 			n := min(len(parallelDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
@@ -1857,6 +1966,37 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			}
 		}
 
+		if 0 < len(lastResortDialers) {
+			// every other dialer of the round has failed, and none is out:
+			// the network needs the last resort, which runs alone with the
+			// rest of the request's deadline
+			if primaryEvaluated.Load() {
+				self.notePrimaryDialersFailed(networkId)
+			}
+			for _, dialer := range lastResortDialers {
+				select {
+				case <-handleCtx.Done():
+					return nil
+				default:
+				}
+				result := eval(handleCtx, dialer)
+				if result != nil {
+					retiredSnapshot = retiredSnapshot || result.err == errClientDialerRetired
+					result.dialer = dialer
+					if result.Selected().err == nil || result.terminal {
+						if self.log.V(2).Enabled() {
+							self.log.Infof("[net][p]select last resort: %s\n", dialer.String())
+						}
+						return result
+					}
+					if self.log.V(2).Enabled() {
+						self.log.Infof("[net][p]select last resort: %s = %s\n", dialer.String(), result.err)
+					}
+					result.releaseAfterUse(handleCtx)
+				}
+			}
+		}
+
 		if !retirementRefreshed && retiredSnapshot && self.canRefreshRetiredSnapshot(dialerGeneration, webSocketOnly) {
 			retirementRefreshed = true
 			continue
@@ -1869,7 +2009,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 			return nil
 		case <-reconnect.After():
 		}
-		if len(dialerWeights) == 0 && p == 0 && !limitedUntil.IsZero() {
+		if dialerCount == 0 && p == 0 && !limitedUntil.IsZero() {
 			// every dialer there was is a limited extender: nothing is dialed
 			// again before the first backoff passes (A12)
 			select {
@@ -2930,6 +3070,10 @@ type clientDialer struct {
 	minimumWeight float32
 	// 0 is max
 	priority int
+	// A dialer a race runs only after the others have failed on the network:
+	// alt whodis (L4), the slowest path, whose handshake a faster dialer's win
+	// would end. Constant after construction.
+	lastResort bool
 
 	// WebSocket upgrades require HTTP/1.1, while ordinary API requests can
 	// negotiate HTTP/2. Keep protocol-specific TLS dialers so enabling h2 for

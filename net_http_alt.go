@@ -39,7 +39,10 @@ import (
 
 // The dialer priorities of L4: alt h3 runs after the tcp dialers (0 to 50) and
 // before the extender carriers (100, 110, 120); alt whodis runs last, since it
-// is the slowest path and the one that looks least like ordinary traffic.
+// is the slowest path and the one that looks least like ordinary traffic. A
+// race runs whodis only once the other dialers have failed on the network
+// (a last-resort dialer, parallelEvalWithRouteHedge), so a faster dialer's win
+// never ends its handshake.
 const (
 	altH3DialerPriority     = 60
 	altWhodisDialerPriority = 130
@@ -79,6 +82,9 @@ func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySetti
 			createTime:    time.Now(),
 			minimumWeight: altDialerMinimumWeight,
 			priority:      altDialer.priority,
+			// whodis races only where the others have failed
+			// (parallelEvalWithRouteHedge)
+			lastResort: whodis,
 			// no dialTlsContext: there is no websocket over alt from here
 			httpClientFactory: func() *http.Client {
 				return newAltHttpClient(clientStrategy, settings, whodis)
