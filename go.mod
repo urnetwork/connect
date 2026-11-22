@@ -24,11 +24,11 @@ require (
 	github.com/pion/transport/v4 v4.1.0
 	github.com/pion/webrtc/v4 v4.2.18
 	github.com/quic-go/qpack v0.6.0
-	github.com/quic-go/quic-go v0.61.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/rivo/uniseg v0.4.7
 	github.com/theodorsm/covert-dtls v1.5.1
 	github.com/urnetwork/glog v0.0.0
+	github.com/urnetwork/quic-go v0.0.0
 	github.com/wlynxg/anet v0.0.5
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.62.0
@@ -85,6 +85,7 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/quic-go/quic-go v0.61.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/sync v0.24.0 // indirect
@@ -97,6 +98,11 @@ retract [v0.0.1, v1.0.0]
 retract v0.2.0 // retract self
 
 replace github.com/urnetwork/glog => ../glog
+
+// URnetwork's quic-go, its own module (../quic-go/URNETWORK.md).
+// Go ignores a dependency's replacements, so each main module that builds
+// connect selects the sibling checkout, as it does glog.
+replace github.com/urnetwork/quic-go => ../quic-go
 
 replace github.com/pion/sctp => ./sctp
 

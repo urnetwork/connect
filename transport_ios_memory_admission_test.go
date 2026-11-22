@@ -41,7 +41,9 @@ func TestIosMemoryCarrierAdmissionRefusalAndFailure(t *testing.T) {
 					if outer == ExtenderCarrierTcp {
 						want += settings.H1BudgetByteCount
 					} else if outer != "direct" {
-						want += kib(1408)
+						// R20: the outer window and sockets are the
+						// phone's 256, 32 and 16 KiB (1408 KiB before)
+						want += kib(1072)
 						if outer == ExtenderCarrierDns {
 							want += kib(144)
 						}

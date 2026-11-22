@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	quic "github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/qlog"
+	"github.com/urnetwork/quic-go/qlogwriter"
 )
 
 // This is part of the carrier's lease, not another independently spendable
@@ -23,18 +23,57 @@ import (
 const extenderQuicSendMemoryByteCount ByteCount = 256 * 1024
 
 const (
+	// The default limits of a flight (quicSendFlightLimits). A platform H3
+	// connection on a phone sets smaller ones.
 	quicSendFlightFrameLimit = 96
-	// Writers block with a root free for every admitted root. Retransmission
-	// splits a lost root once whenever its packet carries more ACK or control
-	// bytes than the original did (sentFrameLocked), and the table fails
-	// closed when the roots reach quicSendFlightFrameLimit. Even a whole lost
-	// window retransmitted entirely as splits stays below that.
-	quicSendFlightWriteLimit = (quicSendFlightFrameLimit - 1) / 2
-	quicSendFlightPackets    = 256
-	quicSendFlightChunk      = 4096
-	quicSendFlightStreams    = 8
 	quicSendFlightDatagrams  = 32
+	// the default limits' writeLimit
+	quicSendFlightWriteLimit = (quicSendFlightFrameLimit - 1) / 2
+	// the least frame limit with a writeLimit of one: a smaller one would
+	// block every writer
+	quicSendFlightMinFrameLimit = 3
+	quicSendFlightPackets       = 256
+	quicSendFlightChunk         = 4096
+	quicSendFlightStreams       = 8
 )
+
+// quicSendFlightLimits bounds one connection's flight: the STREAM roots it
+// retains until acknowledged, and the DATAGRAM roots it retains queued or
+// sent until acknowledged or lost, which matches quic-go's DATAGRAM send queue
+// length so a full queue never blocks the send (third_party/quic-go
+// URNETWORK.md).
+type quicSendFlightLimits struct {
+	frames    int
+	datagrams int
+}
+
+func defaultQuicSendFlightLimits() quicSendFlightLimits {
+	return quicSendFlightLimits{frames: quicSendFlightFrameLimit, datagrams: quicSendFlightDatagrams}
+}
+
+// normalized is the limits a flight keeps: a limit below one takes its
+// default, and a frame limit below quicSendFlightMinFrameLimit is raised to
+// it. The H3 ledger charges the same (h3SendFlightLimits).
+func (self quicSendFlightLimits) normalized() quicSendFlightLimits {
+	if self.frames < 1 {
+		self.frames = quicSendFlightFrameLimit
+	}
+	self.frames = max(self.frames, quicSendFlightMinFrameLimit)
+	if self.datagrams < 1 {
+		self.datagrams = quicSendFlightDatagrams
+	}
+	return self
+}
+
+// writeLimit is the roots writers may hold before they wait. Writers block
+// with a root free for every admitted root. Retransmission splits a lost root
+// once whenever its packet carries more ACK or control bytes than the
+// original did (sentFrameLocked), and the table fails closed when the roots
+// reach the frame limit. Even a whole lost window retransmitted entirely as
+// splits stays below that.
+func (self quicSendFlightLimits) writeLimit() int {
+	return (self.frames - 1) / 2
+}
 
 var errQuicSendFlight = errors.New("QUIC retained send-flight limit reached")
 var errQuicDatagramFlightFull = errors.New("QUIC retained datagram flight is full")
@@ -80,7 +119,8 @@ type quicSendFlightSnapshot struct {
 type quicSendFlight struct {
 	mutex         sync.Mutex
 	datagramMu    sync.Mutex
-	frames        [quicSendFlightFrameLimit + quicSendFlightDatagrams]quicSendFlightFrame
+	limits        quicSendFlightLimits
+	frames        []quicSendFlightFrame
 	packets       [quicSendFlightPackets]quicSendFlightPacket
 	writers       [quicSendFlightStreams]*quicSendFlightWriter
 	frameCount    int
@@ -105,19 +145,39 @@ type quicSendFlight struct {
 }
 
 func newQuicSendFlight() *quicSendFlight {
-	return &quicSendFlight{notify: make(chan struct{}, 1), failed: make(chan struct{}), latestStream: -1, ackedFin: -1}
+	return newQuicSendFlightWithLimits(defaultQuicSendFlightLimits())
+}
+
+// newQuicSendFlightWithLimits allocates the frame table for its normalized
+// limits once.
+func newQuicSendFlightWithLimits(limits quicSendFlightLimits) *quicSendFlight {
+	limits = limits.normalized()
+	return &quicSendFlight{
+		limits:       limits,
+		frames:       make([]quicSendFlightFrame, limits.frames+limits.datagrams),
+		notify:       make(chan struct{}, 1),
+		failed:       make(chan struct{}),
+		latestStream: -1,
+		ackedFin:     -1,
+	}
 }
 
 // installQuicSendFlight preserves diagnostics and creates a distinct owner
 // for each connection, including each candidate of a happy-eyeballs race.
 func installQuicSendFlight(config *quic.Config) {
+	installQuicSendFlightWithLimits(config, defaultQuicSendFlightLimits())
+}
+
+// installQuicSendFlightWithLimits is installQuicSendFlight for a connection
+// whose flight has its own limits.
+func installQuicSendFlightWithLimits(config *quic.Config, limits quicSendFlightLimits) {
 	previous := config.Tracer
 	config.Tracer = func(ctx context.Context, isClient bool, id quic.ConnectionID) qlogwriter.Trace {
 		var next qlogwriter.Trace
 		if previous != nil {
 			next = previous(ctx, isClient, id)
 		}
-		flight := newQuicSendFlight()
+		flight := newQuicSendFlightWithLimits(limits)
 		flight.mtu = max(1200, int(config.InitialPacketSize))
 		return &quicSendFlightTrace{flight: flight, next: next}
 	}
@@ -179,7 +239,7 @@ func (self *quicSendFlight) cancelFailedWriters() {
 func (self *quicSendFlight) close() {
 	self.mutex.Lock()
 	self.closed = true
-	clear(self.frames[:])
+	clear(self.frames)
 	clear(self.packets[:])
 	clear(self.writers[:])
 	self.frameCount = 0
@@ -251,7 +311,7 @@ func (self *quicSendFlight) wait(ctx context.Context, idle bool, deadline func()
 		if self.closed && err == nil {
 			err = net.ErrClosed
 		}
-		ready := self.frameCount+self.pending < quicSendFlightWriteLimit
+		ready := self.frameCount+self.pending < self.limits.writeLimit()
 		if idle {
 			ready = self.frameCount+self.pending+self.datagrams == 0
 		}
@@ -447,7 +507,7 @@ func (self *quicSendFlight) trySendDatagram(send func([]byte) error, b []byte) e
 		self.mutex.Unlock()
 		return err
 	}
-	if self.datagrams == quicSendFlightDatagrams {
+	if self.datagrams == self.limits.datagrams {
 		self.mutex.Unlock()
 		return errQuicDatagramFlightFull
 	}
@@ -510,7 +570,7 @@ func (self *quicSendFlight) addFrameLocked(frame quicSendFlightFrame) {
 			self.byteCount += frame.end - frame.start
 			self.peakFrames = max(self.peakFrames, self.frameCount)
 			self.peakBytes = max(self.peakBytes, self.byteCount)
-			if self.frameCount == quicSendFlightFrameLimit {
+			if self.frameCount == self.limits.frames {
 				self.failLocked()
 			}
 			return
@@ -789,7 +849,7 @@ func (self *quicSendFlightWriter) Write(b []byte) (int, error) {
 				self.flight.mutex.Lock()
 				defer self.flight.mutex.Unlock()
 				if self.flight.closed || self.flight.err != nil ||
-					self.flight.frameCount+self.flight.pending >= quicSendFlightWriteLimit {
+					self.flight.frameCount+self.flight.pending >= self.flight.limits.writeLimit() {
 					return 0
 				}
 				self.flight.pending++

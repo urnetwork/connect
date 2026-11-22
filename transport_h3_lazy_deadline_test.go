@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Counts the stream deadlines, stream writes and ping timer arms.

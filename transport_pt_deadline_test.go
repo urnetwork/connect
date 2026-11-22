@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // packetTranslationDeadlineTimer exposes the point at which a deadline wait

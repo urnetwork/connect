@@ -198,7 +198,7 @@ func TestPlatformDnsGraphRaceAdmitsCompleteFallback(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			const nestedBytes = ByteCount(144 * 1024)
 			const innerBytes = ByteCount(3 * 1024 * 1024)
-			limit := innerBytes + 2*nestedBytes + platformH3DialTransientByteCount
+			limit := innerBytes + 2*nestedBytes + testingH3DialTransientByteCount
 			if !concurrent {
 				limit--
 			}
@@ -213,7 +213,7 @@ func TestPlatformDnsGraphRaceAdmitsCompleteFallback(t *testing.T) {
 			transport := &PlatformTransport{settings: &PlatformTransportSettings{PlatformTransportBudget: budget}}
 			candidates := []*net.UDPAddr{{IP: net.ParseIP("192.0.2.53"), Port: 53}, {IP: net.ParseIP("192.0.2.53"), Port: 4053}}
 			var live, peak atomic.Int32
-			winner, err := raceH3DialWithMemory(ctx, candidates, budget, platformH3DialTransientByteCount, nestedBytes,
+			winner, err := raceH3DialWithMemory(ctx, candidates, budget, testingH3DialTransientByteCount, nestedBytes,
 				func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 					claim, err := transport.acquireH3TranslationMemory(ctx)
 					if err != nil {

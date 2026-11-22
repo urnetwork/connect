@@ -56,16 +56,19 @@ type clientNetworkQualityState struct {
 	quietInterval             time.Duration
 	notificationRetryInterval time.Duration
 
-	stateLock                    sync.Mutex
-	lastLocalNotification        time.Time
-	lastLocalPathGeneration      uint64
-	localGeneration              uint64
-	pendingLocal                 networkQualityPendingLocal
-	pendingRemotePeerIdAts       map[Id]time.Time
-	pendingPeerNotifications     map[Id]networkQualityPendingPeer
-	observedPeers                map[Id]networkQualityPeer
-	remoteGenerations            map[Id]networkQualityRemoteGeneration
-	removeGlobalListener         func()
+	stateLock                sync.Mutex
+	lastLocalNotification    time.Time
+	lastLocalPathGeneration  uint64
+	localGeneration          uint64
+	pendingLocal             networkQualityPendingLocal
+	pendingRemotePeerIdAts   map[Id]time.Time
+	pendingPeerNotifications map[Id]networkQualityPendingPeer
+	observedPeers            map[Id]networkQualityPeer
+	remoteGenerations        map[Id]networkQualityRemoteGeneration
+	removeGlobalListener     func()
+	// whether this client is in the process-wide listener list
+	// (ClientSettings.SkipNetworkQualityListener)
+	globalListener               bool
 	removeSubprotocolListener    func()
 	closeOnce                    sync.Once
 	beforeApplyForTest           func()
@@ -94,7 +97,12 @@ func newClientNetworkQualityState(client *Client) *clientNetworkQualityState {
 		panic(err)
 	}
 	state.removeSubprotocolListener = removeSubprotocolListener
-	state.removeGlobalListener = AddNetworkQualityChangeListener(client.NetworkQualityChanged)
+	if client.settings.SkipNetworkQualityListener {
+		state.removeGlobalListener = func() {}
+	} else {
+		state.removeGlobalListener = AddNetworkQualityChangeListener(client.NetworkQualityChanged)
+		state.globalListener = true
+	}
 	return state
 }
 

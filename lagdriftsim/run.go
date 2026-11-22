@@ -1046,17 +1046,14 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 	if err == nil && self.config.wideStarts {
 		fit = self.widestFit(obs, fit)
 	}
-	if err != nil || !(fit.MajorKm <= lagdrift.DefaultMaxSigmaKm) {
+	if err != nil {
+		// no fit at all: low_precision, as Decide gives a nil fit
 		for i := range confidences {
 			v.verdicts[i] = lagdrift.VerdictInconclusive
 			v.reasons[i] = lagdrift.ReasonLowPrecision
 		}
 		v.v11Verdict = lagdrift.VerdictInconclusive
 		v.v11K = self.k11
-		if err == nil {
-			// no region test: D is +Inf, as Judge gives with no country
-			v.recordFit(fit, self.spec.truth, math.Inf(1))
-		}
 		return v
 	}
 	self.checkFit(key, obs, fit)
@@ -1080,6 +1077,9 @@ func (self *visitorSim) verdict(key string, windowObs [][]lagdrift.Observation) 
 			return lagdrift.VerdictAgree, lagdrift.ReasonInsideIpCountry
 		case overlaps:
 			return lagdrift.VerdictAgree, lagdrift.ReasonRegionOverlaps
+		case !(fit.MajorKm <= lagdrift.DefaultMaxSigmaKm):
+			// max σ_major bounds rejection only
+			return lagdrift.VerdictInconclusive, lagdrift.ReasonLowPrecision
 		default:
 			return lagdrift.VerdictDisagree, lagdrift.ReasonRegionOutside
 		}

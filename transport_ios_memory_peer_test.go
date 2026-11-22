@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
 	"github.com/urnetwork/connect/protocol"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Marking expected client shutdown only classifies terminal peer reads; it

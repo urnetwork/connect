@@ -102,19 +102,19 @@ func TestMemoryBudgetScaledSettings(t *testing.T) {
 	}
 	AssertEqual(t, platformSettings.H1BudgetByteCount, kib(256))
 	// With no explicit owner, the process target selects the 32-MiB H3
-	// profile: 4 MiB of receive credit plus 1600 KiB of retained owners.
-	// An explicit 20-MiB DeviceLocal uses its separate 3-MiB inner claim.
-	AssertEqual(t, platformSettings.H3BudgetByteCount, kib(5696))
-	AssertEqual(t, platformSettings.H3SocketReadBufferByteCount, kib(64))
-	AssertEqual(t, platformSettings.H3SocketWriteBufferByteCount, kib(64))
+	// profile: since R20 the phone sizes, 256 KiB of receive credit plus
+	// what the carrier's queues and buffers bound, so nine fit the 8-MiB
+	// budget.
+	AssertEqual(t, platformSettings.H3BudgetByteCount, ByteCount(923532))
+	AssertEqual(t, platformSettings.H3SocketReadBufferByteCount, kib(32))
+	AssertEqual(t, platformSettings.H3SocketWriteBufferByteCount, kib(16))
 	quicConfig := newPlatformQuicConfig(platformSettings, 1)
-	AssertEqual(t, ByteCount(quicConfig.MaxConnectionReceiveWindow), mib(4))
-	AssertEqual(t, ByteCount(quicConfig.MaxStreamReceiveWindow), mib(3))
+	AssertEqual(t, ByteCount(quicConfig.MaxConnectionReceiveWindow), kib(256))
+	AssertEqual(t, ByteCount(quicConfig.MaxStreamReceiveWindow), kib(192))
 	AssertEqual(t, ByteCount(quicConfig.InitialConnectionReceiveWindow), kib(256))
 	AssertEqual(t, ByteCount(quicConfig.InitialStreamReceiveWindow), kib(128))
-	AssertEqual(t, platformH3FixedMemoryByteCount(), kib(1600))
 	AssertEqual(t, platformSettings.H3BudgetByteCount,
-		ByteCount(quicConfig.MaxConnectionReceiveWindow)+platformH3FixedMemoryByteCount())
+		ByteCount(quicConfig.MaxConnectionReceiveWindow)+platformSettings.h3FixedMemoryByteCount())
 	if !platformSettings.h3RetainedByteAccounting || quicConfig.Allow0RTT {
 		t.Fatal("finite H3 defaults bypassed retained-send accounting")
 	}
@@ -155,15 +155,17 @@ func TestMemoryBudgetFloors(t *testing.T) {
 	AssertEqual(t, DefaultTunSettings().TcpReceiveBuffer.Max, int(kib(512)))
 
 	// The smallest supported host target can still admit one explicitly
-	// selected H3 carrier; its aggregate budget and reservation share a floor.
+	// selected H3 carrier: its aggregate budget keeps the 3 MiB floor. Since
+	// R20 the mobile claim is the phone sizes', about 0.88 MiB, so the H1 an
+	// Auto transport requires now fits beside it.
 	SetMemoryBudget(mib(8))
 	legacyPlatformBudget := DefaultPlatformTransportBudget().Stats()
 	legacyPlatformSettings := testingDefaultPlatformTransportSettings()
 	AssertEqual(t, legacyPlatformBudget.TotalByteCount, mib(3))
-	AssertEqual(t, legacyPlatformSettings.H3BudgetByteCount, mib(3))
-	if legacyPlatformSettings.H1BudgetByteCount+legacyPlatformSettings.H3BudgetByteCount <=
-		legacyPlatformBudget.TotalByteCount {
-		t.Fatal("8 MiB Auto budget unexpectedly admitted H1 and H3 together")
+	AssertEqual(t, legacyPlatformSettings.H3BudgetByteCount, ByteCount(923532))
+	if legacyPlatformBudget.TotalByteCount <
+		legacyPlatformSettings.H1BudgetByteCount+legacyPlatformSettings.H3BudgetByteCount {
+		t.Fatal("8 MiB Auto budget cannot admit H1 and H3 together")
 	}
 
 	// budgets above the reference never scale up

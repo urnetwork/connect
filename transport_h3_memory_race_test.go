@@ -20,6 +20,11 @@ func (self *memoryRaceSocket) Close() error {
 	return err
 }
 
+// The race's extra claim for one speculative candidate, where a test only
+// needs some transient larger than nothing; the policy's own transient is
+// PlatformTransportSettings.h3DialTransientByteCount.
+const testingH3DialTransientByteCount = ByteCount(1408 * 1024)
+
 func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testing.T) {
 	old := MemoryBudget()
 	defer SetMemoryBudget(old)
@@ -56,8 +61,8 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 			var peakBytes atomic.Int64
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			winner, err := raceH3DialWithMemory(ctx, candidates, budget, platformH3DialTransientByteCount, 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
-				if address == candidates[1] && budget.Stats().UsedByteCount < settings.H3BudgetByteCount+platformH3DialTransientByteCount {
+			winner, err := raceH3DialWithMemory(ctx, candidates, budget, settings.h3DialTransientByteCount(), 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
+				if address == candidates[1] && budget.Stats().UsedByteCount < settings.H3BudgetByteCount+settings.h3DialTransientByteCount() {
 					t.Error("second socket opened before its transient claim")
 				}
 				network, local := "udp4", "127.0.0.1:0"
@@ -93,7 +98,7 @@ func TestPlatformH3MemoryRaceAdmitsEveryConcurrentSocketAndClosesLoser(t *testin
 			if winner.udpAddr != candidates[1] || peakSockets.Load() != 2 || sockets.Load() != 1 {
 				t.Fatalf("race identity/cleanup: winner=%v peak=%d live=%d", winner.udpAddr, peakSockets.Load(), sockets.Load())
 			}
-			wantPeak := settings.H3BudgetByteCount + platformH3DialTransientByteCount
+			wantPeak := settings.H3BudgetByteCount + settings.h3DialTransientByteCount()
 			wantLive := settings.H3BudgetByteCount
 			if mode == TransportModeH3Dns {
 				wantPeak += 2 * kib(144)
@@ -124,7 +129,7 @@ func TestPlatformH3MemoryRaceFullTransientCancelsBlackholeBeforeFallback(t *test
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	winner, err := raceH3DialWithMemory(ctx, candidates, budget, platformH3DialTransientByteCount, 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
+	winner, err := raceH3DialWithMemory(ctx, candidates, budget, testingH3DialTransientByteCount, 0, func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 		if address == candidates[1] && !firstClosed.Load() {
 			t.Error("fallback reused the base claim before blackhole closed")
 		}
@@ -152,7 +157,7 @@ func TestPlatformH3MemoryRaceFullTransientCancelsBlackholeBeforeFallback(t *test
 	}
 	canceled, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = raceH3DialWithMemory(canceled, candidates[:1], budget, platformH3DialTransientByteCount, 0, func(ctx context.Context, _ *net.UDPAddr) (*h3DialAttempt, error) { return nil, ctx.Err() })
+	_, err = raceH3DialWithMemory(canceled, candidates[:1], budget, testingH3DialTransientByteCount, 0, func(ctx context.Context, _ *net.UDPAddr) (*h3DialAttempt, error) { return nil, ctx.Err() })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled race=%v", err)
 	}

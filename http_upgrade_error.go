@@ -3,7 +3,9 @@
 package connect
 
 // Preserve every actual refusal and its response transport causes. A nil,
-// hard, canceled or incomplete graph prevents a fresh negotiation.
+// hard, canceled or incomplete graph prevents a fresh negotiation, and so
+// does a terminal refusal, a 429 with Retry-After among them, whose wait a
+// fresh negotiation at once would ignore.
 func httpUpgradeFallbackCauses(err error) []*HTTPUpgradeError {
 	causes := flattenHttpRequestCauses(err)
 	if len(causes) == 0 {
@@ -32,8 +34,10 @@ func httpUpgradeFallbackCauses(err error) []*HTTPUpgradeError {
 	return upgradeTs
 }
 
-// Any genuine authorization refusal stops the logical negotiation. Only a
-// complete graph of those refusals can exempt an attempted route from failure.
+// Any genuine authorization refusal stops the logical negotiation, and so
+// does a 429 with Retry-After, which asked the client to wait. Only a
+// complete graph of those refusals can exempt an attempted route from
+// failure.
 func httpUpgradeTerminalCauses(err error) (terminal, refusalOnly bool) {
 	causes := flattenHttpRequestCauses(err)
 	refusalOnly = len(causes) != 0

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
 	"github.com/urnetwork/connect/protocol"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // A real QUIC peer, not an admission mock. The DNS arms decode the actual

@@ -741,8 +741,25 @@ paths:
       summary: Auth Verify
       description: |
         Verify ownership of email or phone number.
+
+        The verification and the session it returns commit together: a
+        refused session (409 `session_limit_reached`, the network's session
+        cap) leaves the code unused and the email or phone unverified.
+
+        No authentication is required. A signed-in caller verifying an email
+        or phone of its own network (adding a sign-in method) sends its
+        network token as the bearer: the verify then renews the caller's own
+        session and `network.by_jwt` is a token of that session, so no new
+        sign-in is listed and the session cap is not reached. Without a bearer,
+        or with one that is not a live network token of the verified network
+        and user (another network's, an ended session's, a client token, an
+        API key), the verify starts a new session, as a sign-in does; such a
+        bearer is never refused here.
       operationId: authVerify
-      security: []
+      # optional auth: anonymous callers sign in, a signed-in caller's own session is renewed
+      security:
+        - {}
+        - BearerAuth: []
       requestBody:
         required: true
         content:
@@ -7761,9 +7778,10 @@ paths:
                     uri: bitcoin:bc1qnpacsprej8hdfqttcwp444pdsxglyfhns4rk9g?amount=0.00054715&label=URnetwork&message=URnetwork%20Pro%20yearly
                     uri_note: ""
                     network: bitcoin
-                    network_warning: "Send BTC on the Bitcoin network to this address, exactly the amount. BTC on another network (Lightning, Base, Ethereum, Solana) is not credited. A payment needs 1 confirmation."
+                    network_warning: "Send BTC on the Bitcoin network to this address, exactly the amount, before the quote expires. BTC on another network (Lightning, Base, Ethereum, Solana) is not credited. A payment needs 1 confirmation, which can take a while: one sent before the quote expires is credited at the quoted price if it confirms within 3 hours of the expiry."
                     quoted_at: "2026-11-10T20:00:00Z"
                     expires_at: "2026-11-10T20:30:00Z"
+                    confirmation_grace_seconds: 10800
                     confirmations_required: 1
                 ethYearly:
                   summary: ETH (a Coinbase deposit address of the invoice's own, in EIP-55 case)
@@ -10877,6 +10895,62 @@ paths:
           description: Every reader slot is busy.
         "502":
           description: The object is unavailable or failed integrity.
+        "503":
+          description: The artifact reader or store is unavailable.
+    head:
+      tags: [Other]
+      summary: Check for one typed attempt object
+      description: |
+        Answer whether one attempt object is stored, with its kind's content
+        type and its exact length, without a body. The object is not read:
+        one bounded listing of its content address answers, so a `200` is not
+        proof of the bytes, which only the GET's full read is. An uploader asks
+        before repeating an upload whose acknowledgement it lost.
+
+        The query is the GET's: exactly `kind` and `hash`, and a `Range` header
+        is refused. The head shares the GET's 16 reader slots, and their `429`
+        with `Retry-After`. An absent object is `404` with
+        `Cache-Control: no-store`, since it may be stored later.
+      operationId: snAttemptArtifactHead
+      security: []
+      parameters:
+        - in: query
+          name: kind
+          required: true
+          schema:
+            type: string
+            enum: [metadata, records, proofs]
+        - in: query
+          name: hash
+          required: true
+          description: Canonical `0x`-prefixed lowercase sha256 of the object.
+          schema:
+            type: string
+            pattern: "^0x[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: |
+            The object is stored. `Content-Type` is the GET's for its kind
+            (`application/json` for `metadata`, `application/x-ndjson` for
+            `records` and `proofs`) and `Content-Length` is the object's exact
+            length. No body.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+        "400":
+          description: The query is not exactly `kind` and `hash`, the identity is not canonical, or a `Range` header was sent.
+        "404":
+          description: No object is stored at the address. Not cacheable.
+        "408":
+          description: The request was cancelled.
+        "429":
+          description: Every reader slot is busy.
+        "502":
+          description: The address could not be listed, or the stored object is outside its kind's byte bound.
         "503":
           description: The artifact reader or store is unavailable.
     post:
@@ -24216,7 +24290,16 @@ components:
           description: the confirmations a payment needs before it is credited (for TAO, ETH and SOL, 1 is a finalized block)
         quote_ttl_seconds:
           type: integer
-          description: how long a quote holds, in seconds
+          description: how long a quote holds, in seconds; the window to send the payment in
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            How long past a quote's expiry a payment sent within it may confirm
+            and still be credited at the quoted price: 10800 (3 hours) for
+            `btc`, whose payments the server sees only once mined. A Bitcoin
+            invoice stays `pending` through the grace and is not re-quoted in
+            it. Left out for every other coin, whose quote ends at its expiry,
+            and by older servers.
         available:
           type: boolean
           description: |
@@ -24403,6 +24486,9 @@ components:
         quote_ttl_seconds:
           type: integer
           description: how long an invoice's quote holds, in seconds
+        confirmation_grace_seconds:
+          type: integer
+          description: as CryptoPaymentAsset's (10800 for `btc`); left out for every other coin
         confirmations_required:
           type: integer
           description: the confirmations a payment needs before it is credited
@@ -24550,11 +24636,18 @@ components:
         confirmations_required:
           type: integer
         expires_at:
-          description: when the quote ends; null for `unknown`
+          description: when the quote ends, the end of the window to send in; null for `unknown`
           oneOf:
             - type: string
               format: date-time
             - type: "null"
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            As CryptoPaymentAsset's: 10800 for `btc`, whose invoice stays
+            `pending` (or `seen`) through this long past `expires_at`, since a
+            payment sent in time may not be mined yet; left out for every
+            other coin.
         credited_at:
           oneOf:
             - type: string
@@ -24676,11 +24769,17 @@ components:
               format: date-time
             - type: "null"
         expires_at:
-          description: when the quote ends
+          description: when the quote ends, the end of the window to send the payment in
           oneOf:
             - type: string
               format: date-time
             - type: "null"
+        confirmation_grace_seconds:
+          type: integer
+          description: |
+            As CryptoPaymentAsset's: 10800 for `btc`, a payment sent before
+            `expires_at` is credited at this quote's price while it is mined
+            within this long after it. Left out for every other coin.
         confirmations_required:
           type: integer
         status:

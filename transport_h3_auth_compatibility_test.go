@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
 	"github.com/urnetwork/connect/protocol"
+	quic "github.com/urnetwork/quic-go"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"

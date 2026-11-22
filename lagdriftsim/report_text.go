@@ -103,9 +103,10 @@ Singapore, Hong Kong). A visitor is within %d km of their city's point, which is
   run with %d such (an interrupted run only if converged or clear held when the silence began, V10), pools the last %d
   counting runs (V7), and judges at the k for the run's confidence and the address's continent (V11): at 95%% %s; at
   99%% %s; k_early KEarly(k) = max(%s, %.4f × k). The parts that diagnose the textbook region judge at its k
-  (2.448, 3.035 and 3.717 at 95%%, 99%% and 99.9%%, which V11 refuses) with k_early %s. Inconclusive for a σ_major
-  above %.0f km or a region that touches the country while the physical check fails, else agree when the region
-  touches the country, else disagree (V6).
+  (2.448, 3.035 and 3.717 at 95%%, 99%% and 99.9%%, which V11 refuses) with k_early %s. Inconclusive for a region
+  that touches the country while the physical check fails, else agree when the region touches the country, however
+  wide; a region wholly outside is inconclusive (low_precision) for a σ_major above %.0f km, which bounds rejection
+  only, else disagree; no fit at all is low_precision (V6).
 
 **Parts.** Every part runs the contract as it stands unless it says otherwise: E2's choice, V10's cadence and stops on
 the usable extenders, the interrupted rule, V11's k with KEarly(k), and far sessions opening late. The main part

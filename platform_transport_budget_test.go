@@ -675,7 +675,7 @@ func TestPlatformTransportBudgetDoesNotPreemptForUnresolvableSlotDeficit(t *test
 	blockedH1 := budget.register(platformTransportBudgetH1, 1, true)
 
 	budget.mutex.Lock()
-	blockedH1.requestPreemptionLocked()
+	blockedH1.requestPreemptionLocked(false)
 	preemptRequested := h3.preemptRequested
 	budget.mutex.Unlock()
 	if preemptRequested {
@@ -766,7 +766,11 @@ func TestPlatformTransportBudgetAutoModesFollowMemoryTarget(t *testing.T) {
 		wantH3Acquire bool
 	}{
 		{name: "iOS target keeps full Auto", memoryTarget: mib(32), wantH3Acquire: true},
-		{name: "legacy low target runs H1 only", memoryTarget: mib(8), wantH3Acquire: false},
+		// R20's 2-MiB mobile claim fits beside H1 in the 8-MiB legacy
+		// target's 3-MiB budget, where the 3-MiB claim before it did not
+		{name: "legacy low target keeps full Auto", memoryTarget: mib(8), wantH3Acquire: true},
+		// a 1-MiB budget holds the claim or H1, not both
+		{name: "target below claim and H1 runs H1 only", memoryTarget: mib(1), wantH3Acquire: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

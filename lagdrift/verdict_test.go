@@ -4,8 +4,10 @@ import (
 	"testing"
 )
 
-// V6's order: unknown country and low precision first, then the physical
-// check where the region touches the country, then the region.
+// V6's order: unknown country and no fit first, then the physical check
+// where the region touches the country, then the region. σ_major above
+// max_sigma_km bounds rejection only: a wide region that touches the country
+// agrees, and one clear of it is inconclusive, never a reject.
 func TestDecide(t *testing.T) {
 	honest := honestObservations(Point{Lat: 1, Lon: 1}, physicalExtenders)
 	// two extenders whose round trips put the visitor near them, far away
@@ -21,7 +23,11 @@ func TestDecide(t *testing.T) {
 		reason  Reason
 	}{
 		{name: "no country", fit: fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), c: nil, obs: honest, verdict: VerdictInconclusive, reason: ReasonIpCountryUnknown},
-		{name: "too wide", fit: fitAt(Point{Lat: 1, Lon: 1}, circleCov(2000)), c: squareCountry, obs: honest, verdict: VerdictInconclusive, reason: ReasonLowPrecision},
+		{name: "no fit", fit: nil, c: squareCountry, obs: honest, verdict: VerdictInconclusive, reason: ReasonLowPrecision},
+		{name: "too wide, inside", fit: fitAt(Point{Lat: 1, Lon: 1}, circleCov(2000)), c: squareCountry, obs: honest, verdict: VerdictAgree, reason: ReasonInsideIpCountry},
+		{name: "too wide, overlapping", fit: fitAt(Point{Lat: 1, Lon: -20}, circleCov(2000)), c: squareCountry, obs: honest, verdict: VerdictAgree, reason: ReasonRegionOverlaps},
+		{name: "too wide, outside", fit: fitAt(Point{Lat: 1, Lon: -120}, circleCov(2000)), c: squareCountry, obs: honest, verdict: VerdictInconclusive, reason: ReasonLowPrecision},
+		{name: "just precise enough, outside", fit: fitAt(Point{Lat: 1, Lon: -120}, circleCov(DefaultMaxSigmaKm)), c: squareCountry, obs: honest, verdict: VerdictDisagree, reason: ReasonRegionOutside},
 		{name: "inside", fit: fitAt(Point{Lat: 1, Lon: 1}, circleCov(30)), c: squareCountry, obs: honest, verdict: VerdictAgree, reason: ReasonInsideIpCountry},
 		{name: "overlapping", fit: fitAt(Point{Lat: 1, Lon: -0.5}, circleCov(30)), c: squareCountry, obs: honest, verdict: VerdictAgree, reason: ReasonRegionOverlaps},
 		{name: "outside", fit: fitAt(Point{Lat: 1, Lon: -3}, circleCov(30)), c: squareCountry, obs: honest, verdict: VerdictDisagree, reason: ReasonRegionOutside},

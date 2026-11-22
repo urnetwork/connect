@@ -265,26 +265,28 @@ func shareTableMemoryPairs() []shareTableMemoryPair {
 			name:          "iOS, a 20 MiB target in the extension's 32 MiB budget",
 			deviceTarget:  mib(20),
 			processBudget: mib(32),
-			// MEMSTEADY: 1104 KiB stream credit after the fixed 1600 KiB
-			// retained-owner envelope, not §51.3's receive-only 1.875 MiB.
-			recordedMbps: 38.2,
+			// R20: 192 KiB stream credit in a claim of about 0.88 MiB, the
+			// phone sizes', so five claims fit the 5-MiB budget. MEMSTEADY's
+			// 1104 KiB stream credit recorded 38.2 here, and one claim fit.
+			recordedMbps: 6.6,
 			exception:    "the packet tunnel provider is killed above 50 MiB and the Go runtime takes about 16 of it (§48.1), so neither number is a choice; the phone pays the continuous collection the collector constraint names and §48.6 step 0a has no memory to give it",
 		},
 		{
 			name:          "historical Android, a 24 MiB target in a 32 MiB budget",
 			deviceTarget:  mib(24),
 			processBudget: mib(32),
-			// The constrained claim branch also has 1104 KiB stream credit.
-			recordedMbps: 38.2,
+			// R20: the same claim and 192 KiB stream credit; six fit.
+			recordedMbps: 6.6,
 			exception:    "Android mirrors the iOS budget by decision rather than by platform limit (§48.6 step 0b), and sits further outside both bounds than iOS does; a raise is the product decision that step names, not a change to this table",
 		},
 		{
 			name:          "Android, a 28 MiB target in a 40 MiB budget",
 			deviceTarget:  mib(28),
 			processBudget: mib(40),
-			// The current Android profile retains 2688 KiB stream credit and
-			// admits the fixed owners in its larger 5184 KiB inner claim.
-			recordedMbps: 93.0,
+			// R20: the same claim and 192 KiB stream credit; seven fit its
+			// 7-MiB budget where one 5184-KiB claim with 2688 KiB of stream
+			// credit, recorded at 93.0, did.
+			recordedMbps: 6.6,
 			exception:    "the normal Android profile is independently fixed at 28/40 MiB; it does not satisfy the historical three-times collector heuristic, and runtime acceptance remains a separate measured gate",
 		},
 		{

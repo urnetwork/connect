@@ -28,7 +28,7 @@ import (
 
 	"math/big"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 
 	"golang.org/x/net/dns/dnsmessage"
 

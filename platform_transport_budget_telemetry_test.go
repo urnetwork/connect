@@ -121,11 +121,13 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	SetMemoryBudget(mib(32))
 	defer SetMemoryBudget(previousMemoryBudget)
 	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(20))
-	root := NewPlatformTransportBudget(mib(8), 16)
-	child := newPlatformTransportBudget(mib(5), 16, root)
+	// R20's phone-sized claim takes more H1 to fill the child, so the
+	// hierarchy keeps slots for them: bytes, not slots, decide every loan
+	root := NewPlatformTransportBudget(mib(8), 32)
+	child := newPlatformTransportBudget(mib(5), 32, root)
 	settings.PlatformTransportBudget = child
 	t.Cleanup(func() { requirePlatformHierarchyBalanced(t, root, child) })
-	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != mib(3) {
+	if settings.H1BudgetByteCount != kib(256) || settings.H3BudgetByteCount != ByteCount(923532) {
 		t.Fatal("regression requires the actual 20/32-MiB carrier profile")
 	}
 	stopObserver, observerDone := make(chan struct{}), make(chan struct{})
@@ -172,7 +174,10 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	oldA, oldB := newH1(), newH1()
 	requirePlatformHierarchyAcquire(t, oldA.h1BudgetReservation)
 	requirePlatformHierarchyAcquire(t, oldB.h1BudgetReservation)
-	fillers := make([]*PlatformTransport, 7)
+	// enough H1 that the first H3 replacement fits the child only on its
+	// loan: 17 H1 claims and the 923,532-byte claim are 133.9 KiB over the
+	// 5 MiB, less than the 256-KiB H1 it replaces
+	fillers := make([]*PlatformTransport, 15)
 	for i := range fillers {
 		fillers[i] = newH1()
 		requirePlatformHierarchyAcquire(t, fillers[i].h1BudgetReservation)
@@ -189,21 +194,24 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 	if child.Stats().ActiveHandoffCount != 1 || root.Stats().ActiveHandoffCount != 0 {
 		t.Fatal("first replacement did not borrow only at the child")
 	}
-	fillers[0].h1BudgetReservation.Release()
-	fillers[1].h1BudgetReservation.Release()
+	for _, filler := range fillers[:5] {
+		filler.h1BudgetReservation.Release()
+	}
 	// These are the actual standalone API/feed QUIC policy claims, not fake
-	// unowned H1 transports: each is 1,664 KiB and never borrows itself.
+	// unowned H1 transports: each is 1,328 KiB and never borrows itself.
+	// With the child's 4,069,260 bytes they leave the root 239,732, less
+	// than the H1 the second replacement needs.
 	ownerlessContext := context.WithValue(t.Context(), platformTransportNestedBudgetContextKey{}, root)
 	policy := newExtenderQuicMemoryPolicy(ownerlessContext, DefaultConnectSettings())
-	for range 2 {
+	for range 3 {
 		claim, err := policy.acquire(ownerlessContext)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(claim.Release)
 	}
-	if root.Stats().UsedByteCount != mib(8) {
-		t.Fatalf("ordinary ownerless pressure did not fill the root: %+v", root.Stats())
+	if policy.byteCount != kib(1328) || root.Stats().UsedByteCount != mib(8)-239732 {
+		t.Fatalf("ordinary ownerless pressure did not fill the root: claim %d, %+v", policy.byteCount, root.Stats())
 	}
 	newB := newH1()
 	secondOld := &FamilyPlatformTransportGroup{standbyTransport: oldB}
@@ -218,7 +226,7 @@ func TestPlatformTransportBudgetStatsWithRootIndependentFamilyHandoffs(t *testin
 		snapshot.RootAdditionalHandoff != snapshot.BudgetHandoff ||
 		snapshot.BudgetAdditionalHandoff != snapshot.RootHandoff ||
 		snapshot.RootHandoff.Owner != "device" || snapshot.BudgetHandoff.Owner != "device" ||
-		snapshot.Root.UsedByteCount != mib(8)+kib(256) || snapshot.Budget.UsedByteCount != mib(5) {
+		snapshot.Root.UsedByteCount != mib(8)-239732+kib(256) || snapshot.Budget.UsedByteCount != 4069260+kib(256) {
 		t.Fatalf("overlapping manager loans lost identity or changed capacity: %+v", snapshot)
 	}
 	select {

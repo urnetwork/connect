@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/testutils/simnet"
+	"github.com/urnetwork/quic-go"
+	"github.com/urnetwork/quic-go/testutils/simnet"
 )
 
 // Holds a successful physical operation past its budget, then proves another

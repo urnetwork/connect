@@ -61,7 +61,7 @@ import (
 	"syscall"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // pinnedIpFamilyContextKey carries a pinned transport's family through the
@@ -988,13 +988,25 @@ func (self *PlatformTransport) noteDialFailure(err error) {
 // (which keeps the old timing) consecutive failures now back off
 // exponentially from ReconnectTimeout to ReconnectMaxTimeout. A successful
 // dial or a network change resets it.
-func (self *PlatformTransport) dialRetryAfter(reconnect *Reconnect) <-chan time.Time {
+//
+// err is the failed dial's: a refusal that asked the client to wait, a 429
+// with Retry-After or the platform's QUIC connection cap close, holds the
+// retry at least that long, on top of either timing
+// (transport_retry_after.go).
+func (self *PlatformTransport) dialRetryAfter(reconnect *Reconnect, err error) <-chan time.Time {
+	return afterDelay(self.dialRetryDelay(reconnect, err))
+}
+
+// The wait dialRetryAfter waits out.
+func (self *PlatformTransport) dialRetryDelay(reconnect *Reconnect, err error) time.Duration {
+	delay := time.Duration(0)
 	if !self.pinned() {
-		if d := self.failBackoff.delay(); 0 < d {
-			return time.After(d)
-		}
+		delay = self.failBackoff.delay()
 	}
-	return reconnect.After()
+	if delay <= 0 {
+		delay = reconnect.delay()
+	}
+	return max(delay, platformDialRefusalWait(err, nil))
 }
 
 // noteDialSuccess clears the transport's own backoff and, for a
@@ -2293,7 +2305,7 @@ func (self *PlatformTransport) dialH3(
 		attemptQuicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
 	}
 	if self.settings.h3RetainedByteAccounting {
-		installQuicSendFlight(attemptQuicConfig)
+		installQuicSendFlightWithLimits(attemptQuicConfig, self.settings.h3SendFlightLimits())
 	}
 	var conn *quic.Conn
 	if self.settings.h3RetainedByteAccounting {

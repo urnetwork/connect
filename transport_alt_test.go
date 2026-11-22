@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // The platform carriers on alt (EXTENDER.md L3, L4): the H3 modes send their

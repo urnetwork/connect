@@ -21,7 +21,7 @@ import (
 	"maps"
 
 	"github.com/gorilla/websocket"
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -616,13 +616,33 @@ type PlatformTransportSettings struct {
 	H3MaxStreamReceiveWindowByteCount         ByteCount
 	H3InitialConnectionReceiveWindowByteCount ByteCount
 	H3MaxConnectionReceiveWindowByteCount     ByteCount
+	// H3MaxUnprocessedPacketCount, H3DatagramSendQueueCount and
+	// H3DatagramReceiveQueueCount bound quic-go's queues on each H3
+	// connection (third_party/quic-go/URNETWORK.md): the received packets its
+	// run loop has not processed yet, each in a 1452-byte packet buffer, and
+	// the DATAGRAM frames queued to send or received and unread, each a copy
+	// of its payload. The send count also bounds the retained-send
+	// controller's DATAGRAM roots, queued or sent until acknowledged or lost.
+	// Non-positive keeps quic-go's 256, 32 and 128. The mobile policy sets
+	// phone sizes and charges what they bound
+	// (ApplyMobilePlatformTransportMemoryPolicy).
+	H3MaxUnprocessedPacketCount int
+	H3DatagramSendQueueCount    int
+	H3DatagramReceiveQueueCount int
+	// H3SendFlightFrameCount bounds the STREAM frames the retained-send
+	// controller lets one H3 connection hold until they are acknowledged,
+	// each in a 1452-byte buffer. Writers hold at most half of them, about a
+	// packet of stream data each, and the rest absorb retransmission splits,
+	// so it bounds the connection's unacknowledged stream upload. It applies
+	// with retained accounting. Non-positive keeps 96, and less than 3 is
+	// raised to 3, the least that admits a writer.
+	H3SendFlightFrameCount int
 	// H3StreamWriteBatchMaxMessageCount and H3StreamWriteBatchMaxByteCount
 	// bound one write on the H3 reliable stream: the writer drains up to this
 	// many ready messages, framed, into one buffer of the byte bound, which it
 	// allocates once the stream carries data. The mobile memory ledger charges
-	// that buffer inside its application row (platformH3ApplicationQueueBytes),
-	// so a larger bound needs a larger row. Non-positive writes one message at
-	// a time.
+	// that buffer in its application row (platformH3Ledger). Non-positive
+	// writes one message at a time.
 	H3StreamWriteBatchMaxMessageCount int
 	H3StreamWriteBatchMaxByteCount    int
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
@@ -630,6 +650,16 @@ type PlatformTransportSettings struct {
 	// the zero value; background/provider transports use the background value.
 	// Explicit H3 ignores this value and always outranks optional Auto H3.
 	PlatformTransportBudgetPriority int
+	// H3BudgetFallbackTimeout is how long a transport whose target is an h3
+	// mode (h3, h3dns, h3dnspump) waits for PlatformTransportBudget to admit
+	// its h3 claim before it carries its client on h1 instead, and returns to
+	// h3 once the budget admits the claim (transport_h3_budget_fallback.go).
+	// Two seconds, like ModeInitialDelay's head start for a preferred mode: a
+	// claim another carrier is releasing, such as a migration's old transport,
+	// is admitted well within it, so a replacement does not detour through h1.
+	// Zero falls back at the first refusal. Negative never falls back: the
+	// transport waits for its h3 claim for as long as it takes.
+	H3BudgetFallbackTimeout time.Duration
 	// it smoothes out the h3 transition to not start/stop h1 if h3 connects in this time
 	ModeInitialDelay time.Duration
 	// ModePreferences configures the enabled Auto modes and their priorities.
@@ -873,6 +903,10 @@ type PlatformTransportSettings struct {
 	// its owner or its pinned family holds the transport, right before it
 	// waits.
 	heldParkForTest func()
+	// Nil outside package tests. Called each time the h1 runner parks because
+	// a strictly better mode is active, right before it waits, with the
+	// runner's context.
+	h1StandDownForTest func(ctx context.Context)
 	// Nil outside package tests. Replaces time.After for the end of a pinned
 	// transport's no-route hold (runFamilyHoldWatcher), given the hold, so a
 	// test decides when the hold runs out.
@@ -908,6 +942,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
 		ModeInitialDelay:          2 * time.Second,
+		H3BudgetFallbackTimeout:   2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
 		// a family with no route sleeps 5, 10, 20, 40 minutes, then hourly,
@@ -1032,9 +1067,12 @@ func DefaultPlatformTransportSettingsWithMemoryTarget(
 // These are THROUGHPUTFIX §43.2's receive-credit fractions. Its old assertion
 // that connection credit must equal the entire reservation did not account
 // for concurrently retained non-receive owners. MEMSTEADY supersedes that
-// assertion on the constrained mobile surface: at a 20 MiB owner target the
-// 3 MiB claim covers 1472 KiB connection credit plus 1600 KiB of fixed owners,
-// with 1104 KiB of stream credit. Larger/server targets keep the base formula.
+// assertion on the constrained mobile surface, where the claim is the
+// connection credit plus what the carrier's configured queues and buffers
+// bound, sized so a phone holds a carrier per peer: a 256-KiB connection and
+// 192-KiB stream credit in a claim of about 0.88 MiB
+// (ApplyMobilePlatformTransportMemoryPolicy). Larger/server targets keep the
+// base formula.
 //
 // Each window keeps its own floor rather than inheriting the reservation's, so
 // the raise reaches no small host (§44.2's third constraint, and the floor case
@@ -1188,6 +1226,10 @@ type PlatformTransport struct {
 	// subdivision of h3BudgetReservation, never from unreserved process space.
 	h3NestedBudget *PlatformTransportBudget
 	h3Gate         *platformH3Gate
+	// Set when the target is an h3 mode with a budget and
+	// H3BudgetFallbackTimeout is not negative: the h1 the transport carries
+	// its client on while the budget cannot admit its h3 claim. Immutable.
+	h3BudgetFallback *platformH3BudgetFallback
 
 	stateLock sync.Mutex
 	// notified when availableModes changes. availableModes is a map, so it
@@ -1346,6 +1388,10 @@ func newPlatformQuicConfig(
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
 		EnableDatagrams:                settings.EnableH3Datagrams,
+		// zero keeps quic-go's own lengths
+		MaxUnprocessedPackets:      settings.H3MaxUnprocessedPacketCount,
+		MaxDatagramSendQueueLen:    settings.H3DatagramSendQueueCount,
+		MaxDatagramReceiveQueueLen: settings.H3DatagramReceiveQueueCount,
 		// version 2 first, so the Initial is not the one the filters decrypt
 		// for its sni (A13)
 		Versions: settings.QuicVersionPolicy.Versions(),
@@ -1479,13 +1525,19 @@ func (self *PlatformTransport) EverConnected() bool {
 
 // IsWaitingForBudget reports whether the reservation required by the selected
 // target mode is currently blocked. Auto's H3 reservation is optional and is
-// therefore not reported once its required H1 path can run. It is diagnostic;
-// policy migration uses CanMakeBeforeBreakFrom for its terminal decision.
+// therefore not reported once its required H1 path can run. An h3 target on
+// its h1 fallback reports that h1's reservation instead, since the h1 is what
+// carries it then. It is diagnostic; policy migration uses
+// CanMakeBeforeBreakFrom for its terminal decision.
 func (self *PlatformTransport) IsWaitingForBudget() bool {
 	switch self.targetMode {
 	case TransportModeH1:
 		return self.h1BudgetReservation.IsWaiting()
 	case TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump:
+		// on its h1 fallback the transport waits only if that h1 does
+		if h1Claim, engaged := self.h3BudgetFallback.h1ClaimIfEngaged(); engaged {
+			return h1Claim.IsWaiting()
+		}
 		return self.h3BudgetReservation.IsWaiting()
 	case TransportModeAuto:
 		return self.h1BudgetReservation.IsWaiting()
@@ -1917,6 +1969,24 @@ func NewPlatformTransportWithTargetMode(
 			(transport.modePreference(TransportModeH3) != modePreferenceNone ||
 				transport.modePreference(TransportModeH3Dns) != modePreferenceNone ||
 				transport.modePreference(TransportModeH3DnsPump) != modePreferenceNone))
+	if isH3TransportMode(targetMode) && settings.PlatformTransportBudget != nil &&
+		0 <= settings.H3BudgetFallbackTimeout {
+		// The h1 fallback ranks below the target, so the target stands down
+		// for nothing and h1 drains once the target carries traffic. Only
+		// these two run; the other offered modes stay offered, behind both.
+		preferences := map[TransportMode]int{
+			targetMode:      1,
+			TransportModeH1: 2,
+		}
+		for mode, preference := range transport.modePreferences {
+			if mode != targetMode && mode != TransportModeH1 {
+				preferences[mode] = 2 + preference
+			}
+		}
+		transport.modePreferences = preferences
+		transport.h1RetainedBudget = newPlatformH1RetainedBudget(settings)
+		transport.h3BudgetFallback = newPlatformH3BudgetFallback(transport, settings.H3BudgetFallbackTimeout)
+	}
 	if settings.PlatformTransportBudget != nil {
 		if h1Enabled {
 			transport.h1BudgetReservation = settings.PlatformTransportBudget.register(
@@ -1934,11 +2004,15 @@ func NewPlatformTransportWithTargetMode(
 			if targetMode == TransportModeAuto {
 				h3BudgetClass = platformTransportBudgetH3Auto
 			}
-			transport.h3BudgetReservation = settings.PlatformTransportBudget.registerWithPriority(
+			// With the fallback, the explicit claim contends only from its
+			// runner's admission (platformH3BudgetFallback.acquire), so a
+			// transport that starts held takes no precedence it cannot use.
+			transport.h3BudgetReservation = settings.PlatformTransportBudget.registerWithPriorityDeferred(
 				h3BudgetClass,
 				transport.h3BudgetByteCount()+nestedByteCount,
 				!h1Enabled,
 				settings.PlatformTransportBudgetPriority,
+				transport.h3BudgetFallback != nil,
 			)
 		}
 	}
@@ -2107,7 +2181,7 @@ func (self *PlatformTransport) modeInitialDelay(mode TransportMode) time.Duratio
 func (self *PlatformTransport) runMode(mode TransportMode, initialDelay time.Duration) {
 	switch mode {
 	case TransportModeH1:
-		self.runH1(initialDelay)
+		self.runH1(self.ctx, initialDelay)
 	case TransportModeH3:
 		self.runH3(self.ctx, TransportModeH3, initialDelay, 1)
 	case TransportModeH3Dns:
@@ -2154,12 +2228,26 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 		if reservation != nil {
 			defer reservation.Release()
 		}
+		// an explicit target that the budget cannot admit carries on h1
+		// meanwhile; Auto runs its own h1 beside its optional lease
+		var fallback *platformH3BudgetFallback
+		if !auto {
+			fallback = self.h3BudgetFallback
+		}
 		for self.ctx.Err() == nil {
 			// a held transport neither dials nor holds an optional lease
 			if !self.waitDialAdmission(self.ctx) {
 				return
 			}
-			if reservation != nil && !reservation.Acquire(self.ctx) {
+			if reservation != nil && fallback != nil {
+				admitted, parked := fallback.acquire(self.ctx, reservation)
+				if parked {
+					continue
+				}
+				if !admitted {
+					return
+				}
+			} else if reservation != nil && !reservation.Acquire(self.ctx) {
 				return
 			}
 
@@ -2511,13 +2599,22 @@ func (self *PlatformTransport) logAuthError(clientId Id, mode TransportMode, err
 	}
 }
 
-func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
+// runH1 carries the transport on h1 until ctx ends. The main runner passes the
+// transport's own context; the h1 fallback of an h3 target passes its own,
+// which it cancels once the target carries traffic
+// (transport_h3_budget_fallback.go). A return while ctx is still live is
+// unexpected and closes the transport, as it always has.
+func (self *PlatformTransport) runH1(ctx context.Context, initialTimeout time.Duration) {
 	// connect and update route manager for this transport
-	defer self.cancel()
+	defer func() {
+		if ctx.Err() == nil {
+			self.cancel()
+		}
+	}()
 
 	if 0 < initialTimeout {
 		select {
-		case <-self.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-time.After(initialTimeout):
 		}
@@ -2544,24 +2641,33 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				if !standDown {
 					return
 				}
+				if self.settings.h1StandDownForTest != nil {
+					self.settings.h1StandDownForTest(ctx)
+				}
 				select {
-				case <-self.ctx.Done():
+				case <-ctx.Done():
 					return
 				case <-notify:
 				}
 			}
 		}()
+		// the stand down ends with ctx too, while the better mode may still
+		// read active: nothing below parks on ctx before the stand down check
+		// sends the loop around again, so without this it would spin
+		if ctx.Err() != nil {
+			return
+		}
 		if !hadConnection {
 			// a mode that was standing down lets the preferred mode take a
 			// new path first; one that was carrying traffic re-dials at once
-			if !self.holdAfterKick(self.ctx, TransportModeH1) {
+			if !self.holdAfterKick(ctx, TransportModeH1) {
 				return
 			}
 			if standDown, _ := self.standDown(TransportModeH1); standDown {
 				continue
 			}
 		}
-		admitted, parked := self.waitDialAdmissionParked(self.ctx)
+		admitted, parked := self.waitDialAdmissionParked(ctx)
 		if !admitted {
 			return
 		}
@@ -2705,7 +2811,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// serializing staircase; see waitDialPacing. The release frees the
 		// fast-path slot as soon as the dial attempt completes, on every exit
 		// path. A pinned transport paces itself.
-		pacing, releaseReconnect, _ := self.waitDialPacing(self.ctx, hadConnection, afterKick, &kickGeneration)
+		pacing, releaseReconnect, _ := self.waitDialPacing(ctx, hadConnection, afterKick, &kickGeneration)
 		hadConnection = false
 		afterKick = false
 		switch pacing {
@@ -2722,7 +2828,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// its deadline there. The connection it produces keeps the context
 		// (the strategy observes delivery through it), so it ends with this
 		// iteration.
-		dialCtx, cancelDial := context.WithCancel(self.ctx)
+		dialCtx, cancelDial := context.WithCancel(ctx)
 		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
 		moveAttempt = self.moveDialAttempt(moveTargetAttempted)
 		var ws H1MessageConn
@@ -2748,7 +2854,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// canceled says nothing about the move target either
 			closing := false
 			select {
-			case <-self.ctx.Done():
+			case <-ctx.Done():
 				closing = true
 			default:
 			}
@@ -2772,7 +2878,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// client.Done. A dial the network change canceled, or left on a
 			// path that went away, says nothing about the backend either, and
 			// neither does one the owner's or the family's hold canceled.
-			if self.ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial {
+			if ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial {
 				self.noteDialFailure(err)
 			}
 			// err here is the strategy's exhaustion, whose own message names
@@ -2788,7 +2894,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:
@@ -2849,7 +2955,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			self.setModeAvailable(TransportModeH1, true)
 			defer self.setModeAvailable(TransportModeH1, false)
 
-			handleCtx, handleCancel := context.WithCancel(self.ctx)
+			handleCtx, handleCancel := context.WithCancel(ctx)
 			defer handleCancel()
 
 			// The connection owns every worker it starts. Registration happens
@@ -3533,7 +3639,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			continue
 		}
 
-		switch self.waitDial(self.ctx, reconnect.After(), kickGeneration) {
+		switch self.waitDial(ctx, reconnect.After(), kickGeneration) {
 		case dialWaitClosed:
 			return
 		case dialWaitKicked:
@@ -3709,7 +3815,7 @@ func (self *PlatformTransport) runH3(
 				if budget == nil {
 					budget = DefaultPlatformTransportBudget()
 				}
-				extraByteCount := platformH3DialTransientByteCount
+				extraByteCount := self.settings.h3DialTransientByteCount()
 				if !self.settings.h3RetainedByteAccounting {
 					extraByteCount = self.h3BudgetByteCount()
 				}
@@ -3918,7 +4024,7 @@ func (self *PlatformTransport) runH3(
 				afterKick = true
 				continue
 			}
-			switch self.waitDial(ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			switch self.waitDial(ctx, self.dialRetryAfter(reconnect, err), kickGeneration) {
 			case dialWaitClosed:
 				return
 			case dialWaitKicked:

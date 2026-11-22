@@ -1,7 +1,7 @@
 package connect
 
 import (
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // net_quic_version.go -- which QUIC versions a carrier offers and accepts

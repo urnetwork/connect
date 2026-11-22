@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	quic "github.com/quic-go/quic-go"
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Preserve any bytes read past the HTTP upgrade while the framed peer takes

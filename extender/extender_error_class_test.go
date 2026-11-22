@@ -16,7 +16,7 @@ import (
 	"testing"
 
 	"github.com/gorilla/websocket"
-	"github.com/quic-go/quic-go"
+	"github.com/urnetwork/quic-go"
 )
 
 // The list in the code, against the one written out for the tests, so an entry for a

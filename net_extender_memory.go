@@ -6,7 +6,7 @@ import (
 	"net"
 	"sync"
 
-	quic "github.com/quic-go/quic-go"
+	quic "github.com/urnetwork/quic-go"
 )
 
 // Extender carriers may run below either H1 or H3. Carry the actual owner's
@@ -132,6 +132,11 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	// the offer is the dial's, not the platform transport's that sized the
 	// windows: an extender carrier crosses the filter in the clear (A13)
 	config.Versions = connectSettings.QuicVersionPolicy.Versions()
+	// The outer carrier keeps quic-go's own queue lengths, which its
+	// control and send envelopes below charge, whatever the inner carrier's.
+	config.MaxUnprocessedPackets = 0
+	config.MaxDatagramSendQueueLen = 0
+	config.MaxDatagramReceiveQueueLen = 0
 	// The outer carrier is one HTTP/3 request stream, never a QUIC DATAGRAM
 	// lane. Keep its flow-control limits explicit even when the inner lane is H1.
 	config.EnableDatagrams = false
