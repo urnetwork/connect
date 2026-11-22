@@ -6107,3 +6107,82 @@ binding (R1) and DialControl.
     socket;
   - a prune's peer exchange is dialed;
   - a stranger peer's address is dialed.
+
+## Design note: the dns carrier's port race keeps a dial that hears the extender (2026-11-22)
+
+The owner approved (2026-11-22) applying the rule of the whodis fix (connect
+b67da3eb: 9357e085, ed4b8590, 5569ea24) to the extender dns carrier's port race
+(L2, `net_extender_dns_ports.go`): a race never ends an attempt that is still
+hearing from the extender.
+
+- **What the old race did.** It launched the next port 250 ms after the last,
+  beside the attempts out. A port the memory budget refused waited for an
+  attempt to end, so the race never ended a hearing attempt at the stagger, but
+  the 250 ms rule still cost two things. A dns carried dial (the QUIC handshake
+  through the translation and the extender's answer) takes 0.2 to 0.4 s on
+  loopback in the new in-process fixture and 0.4 to 0.7 s at 100 to 200 ms of
+  one-way latency, so:
+  - with room for two claims, most dials opened their second port beside a
+    healthy first one, and abandoned that handshake when the first answered;
+  - with room for one claim, as on a phone, a first port the network
+    blackholes held the claim for its whole QUIC handshake bound
+    (`HandshakeIdleTimeout`, 35 s by default, 70 s in all), so the second port
+    was never tried within a request's deadline.
+- **What the race does now.** It is a whodis race (`quic_dial_race.go`):
+  - the next port launches one stagger after the last launch, beside the
+    attempts out, when the budget admits its claim, or at once when every
+    attempt out has failed. The stagger is `ConnectSettings.ExtenderDnsRaceStagger`,
+    1 s;
+  - a port the budget refused waits for an attempt to end or to stall. An
+    attempt has stalled once its socket has delivered nothing from the extender
+    for `ConnectSettings.ExtenderDnsRaceStallTimeout`, 2 s, since its launch or
+    its last packet. Only then, and only to free its claim for the refused
+    port, is it ended, and its dial returns `errQuicDialStalled`;
+  - the dns translation of each attempt reports what QUIC reads to the
+    attempt's receive clock (`dialExtenderQuic`);
+  - the port order (L2), the extender's answers (A4, A12), the memory refusal
+    retry, the joined errors and the loser cleanup are unchanged. The race never
+    holds more claims than the budget admits, because each attempt claims its
+    memory from the budget before it opens a socket, as before.
+- **Bounds.** A healthy attempt keeps its whole budget: its handshake bound, and
+  the request's `ConnectTimeout` after it. A silent one holds a claim that a
+  refused port needs for the stall timeout. The caller's deadline bounds the
+  dial. A cancel ends an attempt's handshake at once but does not cut its
+  request phase short (the request stream has its own deadline), so an attempt
+  ended for silence after its handshake keeps its claim until the extender
+  answers or its request deadline passes. That was already true of a loser's
+  cancel.
+- **The race's clocks are its own.** A platform h3dns dial through an extender
+  carries its gate lease's receive clock (`platform_h3_gate.go`), which times
+  what that dial hears from alt. The race strips it, so the extender carrier's
+  packets never move it: the carrier's keepalive acknowledgements would
+  otherwise hold the gate for a dial whose alt is blackholed beyond the
+  extender.
+- **Why `ConnectSettings`.** Every extender dial receives it: the strategy's
+  dialers, the feed, the probes, the peer pinger and the platform packet path.
+  `ClientStrategySettings` embeds it beside the alt race settings.
+- **Left alone.** The tcp camouflage race (P8) keeps its 250 ms stagger. It
+  takes no memory claim, so nothing waits on it, but it also opens the legacy
+  attempt beside a camouflaged handshake slower than 250 ms. L2's text above
+  still says 250 ms; this note supersedes it.
+- **Tests.** In `net_extender_dns_ports_test.go`, synctest races over a real
+  budget:
+  - a hearing attempt is kept past the stagger and the stall timeout;
+  - a silent one is ended at the stall timeout, counted from its last packet;
+  - a second claim launches beside without ending anything;
+  - the ports launch in their order;
+  - the race never holds more claims than one, two or three;
+  - a hearing attempt keeps its claim to the caller's deadline;
+  - the default schedule and the non-positive settings;
+  - the race's clocks are its own;
+  - the earlier race tests on the new schedule.
+
+  In `net_extender_dns_ports_live_test.go`, against an in-process extender dns
+  carrier through the production dial:
+  - one claim keeps a handshake hearing the extender at 300 ms and 1.2 s of
+    latency;
+  - two claims open one healthy handshake (the old race opened both ports);
+  - one claim ends a blackholed first port for the next, in both orders (the
+    old race failed at the dial's deadline);
+  - the dial feeds the attempt's clock (it did not before);
+  - the caller's clock hears nothing.
