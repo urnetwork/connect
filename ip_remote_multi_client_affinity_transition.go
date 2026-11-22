@@ -122,9 +122,9 @@ func (self *multiClientAffinityTransition) admit() {
 	if parent.ctx.Err() == nil {
 		switch self.next.ipPath.Version {
 		case 4:
-			parent.ip4PathUpdates[self.next.ipPath.ToIp4Path()] = self.next
+			parent.setIp4PathUpdateWithLock(self.next.ipPath.ToIp4Path(), self.next)
 		case 6:
-			parent.ip6PathUpdates[self.next.ipPath.ToIp6Path()] = self.next
+			parent.setIp6PathUpdateWithLock(self.next.ipPath.ToIp6Path(), self.next)
 		}
 		self.next.activityTime = time.Now()
 		if parent.flowUpdates == nil {
@@ -150,31 +150,19 @@ func (self *RemoteUserNatMultiClient) joinRenewedAffinityWithLock(update *multiC
 		paths = []*IpPath{{ServerName: appAffinityName(update.pinAppId)}}
 	}
 	hardAffinity := update.pinned || self.reliabilitySettings().AffinityMaxTime > 0
-	if hardAffinity && self.affinityIp4Paths == nil {
-		self.affinityIp4Paths = map[Ip4Path]map[Ip4Path]time.Time{}
-	}
-	if hardAffinity && self.affinityIp6Paths == nil {
-		self.affinityIp6Paths = map[Ip6Path]map[Ip6Path]time.Time{}
-	}
 	for _, path := range paths {
 		switch update.ipPath.Version {
 		case 4:
 			key := path.ToIp4Path()
 			update.affinityIp4Paths[key] = true
 			if hardAffinity {
-				if self.affinityIp4Paths[key] == nil {
-					self.affinityIp4Paths[key] = map[Ip4Path]time.Time{}
-				}
-				self.affinityIp4Paths[key][update.ipPath.ToIp4Path()] = time.Now()
+				self.joinAffinityIp4WithLock(key, update.ipPath.ToIp4Path(), time.Now())
 			}
 		case 6:
 			key := path.ToIp6Path()
 			update.affinityIp6Paths[key] = true
 			if hardAffinity {
-				if self.affinityIp6Paths[key] == nil {
-					self.affinityIp6Paths[key] = map[Ip6Path]time.Time{}
-				}
-				self.affinityIp6Paths[key][update.ipPath.ToIp6Path()] = time.Now()
+				self.joinAffinityIp6WithLock(key, update.ipPath.ToIp6Path(), time.Now())
 			}
 		}
 	}

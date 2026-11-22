@@ -2185,7 +2185,14 @@ type RemoteUserNatMultiClient struct {
 	flowUpdates      map[*multiClientChannelUpdate]bool
 	affinityIp4Paths map[Ip4Path]map[Ip4Path]time.Time
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
-	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+	// The affinity index entries that no longer name their tuple's current
+	// generation, by group: the entry's writer was replaced or removed, so the
+	// generation the donor scan resolves it to may be newer than the entry
+	// (setIp4PathUpdateWithLock). Always a subset of the group's entries; nil
+	// until an entry goes stale.
+	staleAffinityIp4Paths map[Ip4Path]map[Ip4Path]bool
+	staleAffinityIp6Paths map[Ip6Path]map[Ip6Path]bool
+	clientUpdates         map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 	// At most one live source-offer reservation per exact incumbent tuple.
 	// The synchronous sender owns its finite deadline and always joins it.
 	affinityTransitions map[*multiClientChannelUpdate]*multiClientAffinityTransition
@@ -4147,6 +4154,177 @@ func (self *RemoteUserNatMultiClient) rebuildAffinityDonorIndexesWithLock(includ
 	}
 	self.affinityIp4Paths = ip4
 	self.affinityIp6Paths = ip6
+	// every rebuilt entry names its tuple's current generation
+	self.staleAffinityIp4Paths = nil
+	self.staleAffinityIp6Paths = nil
+}
+
+// The one writer of a tuple's current generation (ip4PathUpdates). Replacing a
+// generation marks every affinity index entry it wrote as stale: the donor
+// scan resolves an entry to the tuple's current generation, which may now be
+// newer than the entry, so a stale entry is always read in full
+// (inheritAffinityGroupClient4WithLock). An entry is unmarked only when the
+// tuple's current generation writes it (joinAffinityIp4WithLock). A generation
+// writes entries only in the groups it records in its affinityIp4Paths.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) setIp4PathUpdateWithLock(path Ip4Path, update *multiClientChannelUpdate) {
+	if previous := self.ip4PathUpdates[path]; previous != nil && previous != update {
+		self.markStaleAffinityIp4WithLock(path, previous)
+	}
+	self.ip4PathUpdates[path] = update
+}
+
+// The one remover of a tuple's current generation; see setIp4PathUpdateWithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) deleteIp4PathUpdateWithLock(path Ip4Path) {
+	if previous := self.ip4PathUpdates[path]; previous != nil {
+		self.markStaleAffinityIp4WithLock(path, previous)
+	}
+	delete(self.ip4PathUpdates, path)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) markStaleAffinityIp4WithLock(path Ip4Path, previous *multiClientChannelUpdate) {
+	for group := range previous.affinityIp4Paths {
+		if _, ok := self.affinityIp4Paths[group][path]; !ok {
+			continue
+		}
+		if self.staleAffinityIp4Paths == nil {
+			self.staleAffinityIp4Paths = map[Ip4Path]map[Ip4Path]bool{}
+		}
+		stalePaths := self.staleAffinityIp4Paths[group]
+		if stalePaths == nil {
+			stalePaths = map[Ip4Path]bool{}
+			self.staleAffinityIp4Paths[group] = stalePaths
+		}
+		stalePaths[path] = true
+	}
+}
+
+// An index entry written by the tuple's current generation.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) joinAffinityIp4WithLock(group Ip4Path, path Ip4Path, joinTime time.Time) {
+	if self.affinityIp4Paths == nil {
+		self.affinityIp4Paths = map[Ip4Path]map[Ip4Path]time.Time{}
+	}
+	paths := self.affinityIp4Paths[group]
+	if paths == nil {
+		paths = map[Ip4Path]time.Time{}
+		self.affinityIp4Paths[group] = paths
+	}
+	paths[path] = joinTime
+	self.unmarkStaleAffinityIp4WithLock(group, path)
+}
+
+// Removes an index entry, and the group once it is empty.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) leaveAffinityIp4WithLock(group Ip4Path, path Ip4Path) {
+	paths, ok := self.affinityIp4Paths[group]
+	if !ok {
+		return
+	}
+	delete(paths, path)
+	if len(paths) == 0 {
+		delete(self.affinityIp4Paths, group)
+	}
+	self.unmarkStaleAffinityIp4WithLock(group, path)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) unmarkStaleAffinityIp4WithLock(group Ip4Path, path Ip4Path) {
+	stalePaths, ok := self.staleAffinityIp4Paths[group]
+	if !ok {
+		return
+	}
+	delete(stalePaths, path)
+	if len(stalePaths) == 0 {
+		delete(self.staleAffinityIp4Paths, group)
+	}
+}
+
+// The v6 twin of setIp4PathUpdateWithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) setIp6PathUpdateWithLock(path Ip6Path, update *multiClientChannelUpdate) {
+	if previous := self.ip6PathUpdates[path]; previous != nil && previous != update {
+		self.markStaleAffinityIp6WithLock(path, previous)
+	}
+	self.ip6PathUpdates[path] = update
+}
+
+// The v6 twin of deleteIp4PathUpdateWithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) deleteIp6PathUpdateWithLock(path Ip6Path) {
+	if previous := self.ip6PathUpdates[path]; previous != nil {
+		self.markStaleAffinityIp6WithLock(path, previous)
+	}
+	delete(self.ip6PathUpdates, path)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) markStaleAffinityIp6WithLock(path Ip6Path, previous *multiClientChannelUpdate) {
+	for group := range previous.affinityIp6Paths {
+		if _, ok := self.affinityIp6Paths[group][path]; !ok {
+			continue
+		}
+		if self.staleAffinityIp6Paths == nil {
+			self.staleAffinityIp6Paths = map[Ip6Path]map[Ip6Path]bool{}
+		}
+		stalePaths := self.staleAffinityIp6Paths[group]
+		if stalePaths == nil {
+			stalePaths = map[Ip6Path]bool{}
+			self.staleAffinityIp6Paths[group] = stalePaths
+		}
+		stalePaths[path] = true
+	}
+}
+
+// The v6 twin of joinAffinityIp4WithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) joinAffinityIp6WithLock(group Ip6Path, path Ip6Path, joinTime time.Time) {
+	if self.affinityIp6Paths == nil {
+		self.affinityIp6Paths = map[Ip6Path]map[Ip6Path]time.Time{}
+	}
+	paths := self.affinityIp6Paths[group]
+	if paths == nil {
+		paths = map[Ip6Path]time.Time{}
+		self.affinityIp6Paths[group] = paths
+	}
+	paths[path] = joinTime
+	self.unmarkStaleAffinityIp6WithLock(group, path)
+}
+
+// The v6 twin of leaveAffinityIp4WithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) leaveAffinityIp6WithLock(group Ip6Path, path Ip6Path) {
+	paths, ok := self.affinityIp6Paths[group]
+	if !ok {
+		return
+	}
+	delete(paths, path)
+	if len(paths) == 0 {
+		delete(self.affinityIp6Paths, group)
+	}
+	self.unmarkStaleAffinityIp6WithLock(group, path)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) unmarkStaleAffinityIp6WithLock(group Ip6Path, path Ip6Path) {
+	stalePaths, ok := self.staleAffinityIp6Paths[group]
+	if !ok {
+		return
+	}
+	delete(stalePaths, path)
+	if len(stalePaths) == 0 {
+		delete(self.staleAffinityIp6Paths, group)
+	}
 }
 
 // scoredPlacementEnabled is the single gate the placement path checks. When
@@ -5015,8 +5193,35 @@ func betterAffinityDonor(
 // placed WITH its group, not scattered (review finding, 2026-08-03). The
 // caller aggregates across all its calls and books one event per flow.
 //
+// The members are read in full: paths need not be an index group.
+//
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) (donorVerdict, bool) {
+	return self.inheritAffinityClient4FromWithLock(update, paths, nil, false)
+}
+
+// The donor scan of one group of the affinity index, with the same result as
+// reading every member (inheritAffinityClient4WithLock). A member is passed
+// over unread once its entry is AffinityMaxTime old, unless the entry is stale
+// or the placement is pinned: an entry that is not stale was written by its
+// tuple's current generation no earlier than that generation's creation, and
+// an affinity origin is never later than its update's creation, so the
+// member's selection is past AffinityMaxTime and selection.eligible refuses
+// it. A busy group holds every flow within its idle timeout, minutes of them,
+// while only the last AffinityMaxTime of them can donate.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityGroupClient4WithLock(update *multiClientChannelUpdate, group Ip4Path) (donorVerdict, bool) {
+	return self.inheritAffinityClient4FromWithLock(update, self.affinityIp4Paths[group], self.staleAffinityIp4Paths[group], true)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityClient4FromWithLock(
+	update *multiClientChannelUpdate,
+	paths map[Ip4Path]time.Time,
+	stalePaths map[Ip4Path]bool,
+	indexed bool,
+) (donorVerdict, bool) {
 	// with AffinityStickyPastCap a donor at the flow cap still donates: the
 	// group's egress ip is worth more than the cap, which continues to gate
 	// every placement that would put a NEW site on the exit
@@ -5044,7 +5249,13 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	var winnerClient *multiClientChannel
 	var winnerSelection *multiClientAffinitySelection
 	winnerVerdict, scattered := donorRefused, false
+	// see inheritAffinityGroupClient4WithLock; the early return above leaves
+	// AffinityMaxTime positive for an unpinned placement
+	passExpired := indexed && !update.pinned
 	for copyIp4Path, createTime := range paths {
+		if passExpired && reliabilitySettings.AffinityMaxTime <= now.Sub(createTime) && !stalePaths[copyIp4Path] {
+			continue
+		}
 		copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]
 		if !ok {
 			continue
@@ -5117,6 +5328,23 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) (donorVerdict, bool) {
+	return self.inheritAffinityClient6FromWithLock(update, paths, nil, false)
+}
+
+// The v6 twin of inheritAffinityGroupClient4WithLock.
+//
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityGroupClient6WithLock(update *multiClientChannelUpdate, group Ip6Path) (donorVerdict, bool) {
+	return self.inheritAffinityClient6FromWithLock(update, self.affinityIp6Paths[group], self.staleAffinityIp6Paths[group], true)
+}
+
+// called with stateLock
+func (self *RemoteUserNatMultiClient) inheritAffinityClient6FromWithLock(
+	update *multiClientChannelUpdate,
+	paths map[Ip6Path]time.Time,
+	stalePaths map[Ip6Path]bool,
+	indexed bool,
+) (donorVerdict, bool) {
 	// see inheritAffinityClient4WithLock for the sticky, follow, pin, and
 	// caller-side-counting rationale
 	reliabilitySettings := self.reliabilitySettings()
@@ -5138,7 +5366,11 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	var winnerClient *multiClientChannel
 	var winnerSelection *multiClientAffinitySelection
 	winnerVerdict, scattered := donorRefused, false
+	passExpired := indexed && !update.pinned
 	for copyIp6Path, createTime := range paths {
+		if passExpired && reliabilitySettings.AffinityMaxTime <= now.Sub(createTime) && !stalePaths[copyIp6Path] {
+			continue
+		}
 		copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]
 		if !ok {
 			continue
@@ -5556,27 +5788,17 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 				// tuple. Remove routing and affinity state only when it is still
 				// ours; client bookkeeping below remains generation-specific.
 				if current := self.ip4PathUpdates[ip4Path]; current == update {
-					delete(self.ip4PathUpdates, ip4Path)
+					self.deleteIp4PathUpdateWithLock(ip4Path)
 					for affinityIp4Path := range update.affinityIp4Paths {
-						if paths, ok := self.affinityIp4Paths[affinityIp4Path]; ok {
-							delete(paths, ip4Path)
-							if len(paths) == 0 {
-								delete(self.affinityIp4Paths, affinityIp4Path)
-							}
-						}
+						self.leaveAffinityIp4WithLock(affinityIp4Path, ip4Path)
 					}
 				}
 			case 6:
 				ip6Path := update.ipPath.ToIp6Path()
 				if current := self.ip6PathUpdates[ip6Path]; current == update {
-					delete(self.ip6PathUpdates, ip6Path)
+					self.deleteIp6PathUpdateWithLock(ip6Path)
 					for affinityIp6Path := range update.affinityIp6Paths {
-						if paths, ok := self.affinityIp6Paths[affinityIp6Path]; ok {
-							delete(paths, ip6Path)
-							if len(paths) == 0 {
-								delete(self.affinityIp6Paths, affinityIp6Path)
-							}
-						}
+						self.leaveAffinityIp6WithLock(affinityIp6Path, ip6Path)
 					}
 				}
 			}
@@ -5775,7 +5997,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			self.reliabilityMetrics.flowOpened()
-			self.ip4PathUpdates[ip4Path] = update
+			self.setIp4PathUpdateWithLock(ip4Path, update)
 			if self.flowUpdates == nil {
 				self.flowUpdates = map[*multiClientChannelUpdate]bool{}
 			}
@@ -5820,15 +6042,10 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					// timestamp while no production decision can read it.
 					continue
 				}
-				paths, ok := self.affinityIp4Paths[affinityIp4Path]
-				if !ok {
-					paths = map[Ip4Path]time.Time{}
-					self.affinityIp4Paths[affinityIp4Path] = paths
-				}
-				paths[ip4Path] = time.Now()
+				self.joinAffinityIp4WithLock(affinityIp4Path, ip4Path, time.Now())
 
 				if update.client.Load() == nil {
-					verdict, scattered := self.inheritAffinityClient4WithLock(update, paths)
+					verdict, scattered := self.inheritAffinityGroupClient4WithLock(update, affinityIp4Path)
 					followWinner = followWinner || verdict == donorQuarantineFollowed
 					sawScatter = sawScatter || scattered
 				}
@@ -5869,8 +6086,8 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						// already joined and scanned above
 						continue
 					}
-					if paths, ok := self.affinityIp4Paths[fallbackIp4Path]; ok {
-						verdict, scattered := self.inheritAffinityClient4WithLock(update, paths)
+					if _, ok := self.affinityIp4Paths[fallbackIp4Path]; ok {
+						verdict, scattered := self.inheritAffinityGroupClient4WithLock(update, fallbackIp4Path)
 						followWinner = followWinner || verdict == donorQuarantineFollowed
 						sawScatter = sawScatter || scattered
 						if update.client.Load() != nil {
@@ -5905,7 +6122,7 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			self.reliabilityMetrics.flowOpened()
-			self.ip6PathUpdates[ip6Path] = update
+			self.setIp6PathUpdateWithLock(ip6Path, update)
 			if self.flowUpdates == nil {
 				self.flowUpdates = map[*multiClientChannelUpdate]bool{}
 			}
@@ -5935,15 +6152,10 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 				if !hardAffinity {
 					continue
 				}
-				paths, ok := self.affinityIp6Paths[affinityIp6Path]
-				if !ok {
-					paths = map[Ip6Path]time.Time{}
-					self.affinityIp6Paths[affinityIp6Path] = paths
-				}
-				paths[ip6Path] = time.Now()
+				self.joinAffinityIp6WithLock(affinityIp6Path, ip6Path, time.Now())
 
 				if update.client.Load() == nil {
-					verdict, scattered := self.inheritAffinityClient6WithLock(update, paths)
+					verdict, scattered := self.inheritAffinityGroupClient6WithLock(update, affinityIp6Path)
 					followWinner = followWinner || verdict == donorQuarantineFollowed
 					sawScatter = sawScatter || scattered
 				}
@@ -5975,8 +6187,8 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 						// already joined and scanned above
 						continue
 					}
-					if paths, ok := self.affinityIp6Paths[fallbackIp6Path]; ok {
-						verdict, scattered := self.inheritAffinityClient6WithLock(update, paths)
+					if _, ok := self.affinityIp6Paths[fallbackIp6Path]; ok {
+						verdict, scattered := self.inheritAffinityGroupClient6WithLock(update, fallbackIp6Path)
 						followWinner = followWinner || verdict == donorQuarantineFollowed
 						sawScatter = sawScatter || scattered
 						if update.client.Load() != nil {
@@ -6429,29 +6641,19 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				case 4:
 					path := update.ipPath.ToIp4Path()
 					for affinityPath := range update.affinityIp4Paths {
-						if paths := self.affinityIp4Paths[affinityPath]; paths != nil {
-							if _, found := paths[path]; found {
-								delete(paths, path)
-								affinityInvalidations += 1
-							}
-							if len(paths) == 0 {
-								delete(self.affinityIp4Paths, affinityPath)
-							}
+						if _, found := self.affinityIp4Paths[affinityPath][path]; found {
+							affinityInvalidations += 1
 						}
+						self.leaveAffinityIp4WithLock(affinityPath, path)
 						delete(update.affinityIp4Paths, affinityPath)
 					}
 				case 6:
 					path := update.ipPath.ToIp6Path()
 					for affinityPath := range update.affinityIp6Paths {
-						if paths := self.affinityIp6Paths[affinityPath]; paths != nil {
-							if _, found := paths[path]; found {
-								delete(paths, path)
-								affinityInvalidations += 1
-							}
-							if len(paths) == 0 {
-								delete(self.affinityIp6Paths, affinityPath)
-							}
+						if _, found := self.affinityIp6Paths[affinityPath][path]; found {
+							affinityInvalidations += 1
 						}
+						self.leaveAffinityIp6WithLock(affinityPath, path)
 						delete(update.affinityIp6Paths, affinityPath)
 					}
 				}
@@ -6481,12 +6683,12 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				case 4:
 					path := update.ipPath.ToIp4Path()
 					if self.ip4PathUpdates[path] == update {
-						delete(self.ip4PathUpdates, path)
+						self.deleteIp4PathUpdateWithLock(path)
 					}
 				case 6:
 					path := update.ipPath.ToIp6Path()
 					if self.ip6PathUpdates[path] == update {
-						delete(self.ip6PathUpdates, path)
+						self.deleteIp6PathUpdateWithLock(path)
 					}
 				}
 				delete(self.flowUpdates, update)
@@ -11429,6 +11631,8 @@ func (self *RemoteUserNatMultiClient) Close() {
 		clear(self.ip6PathUpdates)
 		clear(self.affinityIp4Paths)
 		clear(self.affinityIp6Paths)
+		clear(self.staleAffinityIp4Paths)
+		clear(self.staleAffinityIp6Paths)
 		clear(self.destinationServiceFailures)
 		clear(self.dnsExitHints)
 		clear(self.dnsAddressExitHints)
@@ -12584,12 +12788,12 @@ func (self *multiClientChannelUpdate) IsDone() bool {
 	if self == nil || self.ctx == nil {
 		return false
 	}
-	select {
-	case <-self.ctx.Done():
-		return true
-	default:
-		return false
-	}
+	// Err answers as a receive from Done would: non-nil exactly once the
+	// context is canceled, and its done channel is closed when it returns.
+	// The flow reaper asks every live flow on each pass, and Err of a live
+	// cancel context is one atomic load, where Done makes the context's
+	// channel on first use and the receive reads it.
+	return self.ctx.Err() != nil
 }
 
 func (self *multiClientChannelUpdate) Close() {
