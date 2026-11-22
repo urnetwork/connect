@@ -298,7 +298,7 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 		method string
 		guards []string
 	}{
-		{method: "runH1", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{method: "runH1", guards: []string{"ctx.Err() == nil", "refusal == 0"}},
 		{method: "runH3", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
 	} {
 		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
