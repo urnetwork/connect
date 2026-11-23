@@ -15,14 +15,14 @@ require (
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/multiformats/go-multiaddr-fmt v0.1.0
 	github.com/multiformats/go-multistream v0.6.1
-	github.com/pion/datachannel v1.6.4
-	github.com/pion/dtls/v3 v3.1.16
-	github.com/pion/ice/v4 v4.4.9
+	github.com/pion/datachannel v1.6.2
+	github.com/pion/dtls/v3 v3.1.8
+	github.com/pion/ice/v4 v4.4.2
 	github.com/pion/logging v0.2.4
-	github.com/pion/rtp v1.10.6
-	github.com/pion/sctp v1.12.1
-	github.com/pion/transport/v4 v4.1.3
-	github.com/pion/webrtc/v4 v4.2.29
+	github.com/pion/rtp v1.10.5
+	github.com/pion/sctp v1.11.1
+	github.com/pion/transport/v4 v4.1.0
+	github.com/pion/webrtc/v4 v4.2.20
 	github.com/quic-go/qpack v0.6.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/rivo/uniseg v0.4.7
@@ -73,16 +73,15 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pandatix/go-abnf v0.5.5 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
-	github.com/pion/interceptor v0.1.51 // indirect
-	github.com/pion/mdns/v2 v2.2.2 // indirect
+	github.com/pion/interceptor v0.1.48 // indirect
+	github.com/pion/mdns/v2 v2.2.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/rtcp v1.2.20 // indirect
-	github.com/pion/sdp/v3 v3.0.20 // indirect
-	github.com/pion/srtp/v3 v3.1.3 // indirect
+	github.com/pion/rtcp v1.2.17 // indirect
+	github.com/pion/sdp/v3 v3.0.19 // indirect
+	github.com/pion/srtp/v3 v3.0.13 // indirect
 	github.com/pion/stun/v3 v3.1.7 // indirect
-	github.com/pion/stun/v4 v4.0.1 // indirect
-	github.com/pion/transport/v5 v5.1.6 // indirect
-	github.com/pion/turn/v5 v5.1.3 // indirect
+	github.com/pion/stun/v4 v4.0.0 // indirect
+	github.com/pion/turn/v5 v5.1.0 // indirect
 	github.com/prometheus/client_golang v1.25.0 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.74.0 // indirect
