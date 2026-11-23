@@ -24,6 +24,29 @@ func waitForStreamLifecycleSignal(t *testing.T, signal <-chan struct{}, message 
 	}
 }
 
+// Waits until sequence teardowns bring the published sequences to want. Each
+// teardown signals removed, a one-slot coalescing channel, after its sequence
+// leaves both indexes, so a removal between the read and the wait is kept.
+func waitForStreamLifecycleLiveCount(t *testing.T, streamBuffer *StreamBuffer, removed <-chan struct{}, want int, message string) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		streamBuffer.mutex.Lock()
+		liveCount := len(streamBuffer.streamSequencesByStreamId)
+		indexedCount := len(streamBuffer.streamSequences)
+		streamBuffer.mutex.Unlock()
+		if liveCount == want && indexedCount == want {
+			return
+		}
+		select {
+		case <-removed:
+		case <-timer.C:
+			t.Fatalf("%s: live=%d indexed=%d want %d", message, liveCount, indexedCount, want)
+		}
+	}
+}
+
 // waitForStreamLifecycleIdSignal waits for one exact processed-stream event.
 func waitForStreamLifecycleIdSignal(t *testing.T, signal <-chan Id, message string) Id {
 	t.Helper()
@@ -916,8 +939,13 @@ func TestCurrentActivationFailureRetriesFreshSequence(t *testing.T) {
 	streamBuffer.CloseStream(streamId)
 }
 
-// TestManagedStreamOpenRegistrySurvivesSequentialUniqueChurn proves terminal
-// worker requests leave both bounded registries instead of exhausting them.
+// Terminal worker requests leave both bounded open registries, and each
+// sequence one leaves published is deregistered by its own teardown, so
+// sequential unique churn exhausts no bound. Each open joins that teardown
+// before the next: a canceled sequence keeps its live slot until its teardown
+// goroutine runs, and inside the whole package, with every other P busy, the
+// loop outran those goroutines until all 1024 live slots were held
+// (TestManagedStreamOpenChurnHoldsLiveSlotsUntilTeardown).
 func TestManagedStreamOpenRegistrySurvivesSequentialUniqueChurn(t *testing.T) {
 	client, cancel := streamLifecycleTestClient(t)
 	defer cancel()
@@ -929,6 +957,13 @@ func TestManagedStreamOpenRegistrySurvivesSequentialUniqueChurn(t *testing.T) {
 	processedStreamIds := make(chan Id, 1)
 	streamBuffer.afterStreamOpenProcessedForTest = func(request *streamOpenRequest) {
 		processedStreamIds <- request.streamId
+	}
+	removed := make(chan struct{}, 1)
+	streamBuffer.afterStreamSequenceRemoveForTest = func(*StreamSequence) {
+		select {
+		case removed <- struct{}{}:
+		default:
+		}
 	}
 
 	for index := 0; index < maxManagedStreamOpenRequests+1; index += 1 {
@@ -956,7 +991,119 @@ func TestManagedStreamOpenRegistrySurvivesSequentialUniqueChurn(t *testing.T) {
 				pendingCount,
 			)
 		}
+		waitForStreamLifecycleLiveCount(t, streamBuffer, removed, 0, "terminal open's sequence kept its live slot")
 	}
+}
+
+// A terminal open leaves the managed registry once its worker finishes, but
+// the canceled sequence it leaves published holds a live slot until that
+// sequence's own teardown deregisters it. With those teardowns held,
+// sequential unique churn fills the live bound while the managed registry
+// stays empty, so the next unique open is refused, and released teardowns
+// free the bound for a new open. This is the state the churn test above met
+// when it did not join teardown.
+func TestManagedStreamOpenChurnHoldsLiveSlotsUntilTeardown(t *testing.T) {
+	client, cancel := streamLifecycleTestClient(t)
+	defer cancel()
+	defer client.Close()
+	streamBuffer := client.streamManager.streamBuffer
+
+	// One release per sequence. The worker joins a sequence it retires
+	// itself, so that one is released at the join; the sequence it leaves
+	// published stays held until the test releases it.
+	releaseStateLock := sync.Mutex{}
+	sequenceReleases := map[*StreamSequence]chan struct{}{}
+	release := func(sequence *StreamSequence) {
+		releaseStateLock.Lock()
+		defer releaseStateLock.Unlock()
+		if sequenceRelease, ok := sequenceReleases[sequence]; ok {
+			close(sequenceRelease)
+			delete(sequenceReleases, sequence)
+		}
+	}
+	releaseAll := func() {
+		releaseStateLock.Lock()
+		defer releaseStateLock.Unlock()
+		for sequence, sequenceRelease := range sequenceReleases {
+			close(sequenceRelease)
+			delete(sequenceReleases, sequence)
+		}
+	}
+	defer releaseAll()
+	streamBuffer.configureStreamSequenceForTest = func(sequence *StreamSequence) {
+		sequenceRelease := make(chan struct{})
+		releaseStateLock.Lock()
+		sequenceReleases[sequence] = sequenceRelease
+		releaseStateLock.Unlock()
+		sequence.exitBarrierForTest = func() {
+			<-sequenceRelease
+		}
+		sequence.Cancel()
+	}
+	streamBuffer.beforeRetiredStreamJoinForTest = release
+	processedStreamIds := make(chan Id, 1)
+	streamBuffer.afterStreamOpenProcessedForTest = func(request *streamOpenRequest) {
+		processedStreamIds <- request.streamId
+	}
+	removed := make(chan struct{}, 1)
+	streamBuffer.afterStreamSequenceRemoveForTest = func(*StreamSequence) {
+		select {
+		case removed <- struct{}{}:
+		default:
+		}
+	}
+	openTerminal := func(index int) {
+		t.Helper()
+		streamId := NewId()
+		adjacentId := NewId()
+		if _, err := streamBuffer.OpenStream(nil, &adjacentId, streamId); err != nil {
+			t.Fatalf("sequential open %d: %v", index, err)
+		}
+		processedStreamId := waitForStreamLifecycleIdSignal(
+			t,
+			processedStreamIds,
+			"terminal open did not finish",
+		)
+		if processedStreamId != streamId {
+			t.Fatalf("processed stream %s, expected %s", processedStreamId, streamId)
+		}
+		streamBuffer.managementStateLock.Lock()
+		managedCount := len(streamBuffer.managedOpenRequests)
+		pendingCount := len(streamBuffer.pendingOpenRequests)
+		streamBuffer.managementStateLock.Unlock()
+		streamBuffer.mutex.Lock()
+		liveCount := len(streamBuffer.streamSequencesByStreamId)
+		streamBuffer.mutex.Unlock()
+		if managedCount != 0 || pendingCount != 0 || liveCount != index+1 {
+			t.Fatalf(
+				"open %d with teardowns held: managed=%d pending=%d live=%d, want 0/0/%d",
+				index,
+				managedCount,
+				pendingCount,
+				liveCount,
+				index+1,
+			)
+		}
+	}
+
+	for index := 0; index < maxLiveStreamSequences; index += 1 {
+		openTerminal(index)
+	}
+	adjacentId := NewId()
+	opened, err := streamBuffer.OpenStream(nil, &adjacentId, NewId())
+	if opened || err == nil || err.Error() != "Live stream limit reached." {
+		t.Fatalf("open past held teardowns: opened=%t err=%v", opened, err)
+	}
+	streamBuffer.managementStateLock.Lock()
+	managedCount := len(streamBuffer.managedOpenRequests)
+	streamBuffer.managementStateLock.Unlock()
+	if managedCount != 0 {
+		t.Fatalf("refused open entered the managed registry: managed=%d", managedCount)
+	}
+
+	releaseAll()
+	waitForStreamLifecycleLiveCount(t, streamBuffer, removed, 0, "released teardowns did not free the live bound")
+	openTerminal(0)
 }
 
 // TestStalledReplacementDoesNotBlockUnrelatedOpen proves lifecycle joins are
