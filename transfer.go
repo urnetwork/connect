@@ -7966,12 +7966,14 @@ type sendPackWait struct {
 }
 
 // Fires at deadline. The call's timer is created at its first wait and
-// re-armed only for a different deadline.
+// re-armed only for a different deadline, a Reset the timer census counts.
 func (self *sendPackWait) until(deadline time.Time) <-chan time.Time {
 	if self.timer == nil {
 		self.timer = time.NewTimer(time.Until(deadline))
 	} else if !deadline.Equal(self.armedDeadline) {
-		self.timer.Reset(time.Until(deadline))
+		timeout := time.Until(deadline)
+		self.timer.Reset(timeout)
+		censusTimerReset(TimerCensusSitePackWaitTimer, timeout)
 	}
 	self.armedDeadline = deadline
 	return self.timer.C
@@ -10139,9 +10141,15 @@ func (self *sequenceDeadlineTimer) armBy(deadline time.Time) bool {
 		return false
 	}
 	self.armedDeadline = deadline
-	if self.timer != nil && !self.timer.Stop() {
-		self.timer.Reset(time.Until(deadline))
-		return true
+	if self.timer != nil {
+		if !self.timer.Stop() {
+			self.timer.Reset(time.Until(deadline))
+			return true
+		}
+		// the stopped pending timer waits in its P's heap until its time or a
+		// walk, which the timer census counts; the Reset above meets a timer
+		// that fired, in no heap, an insert it does not count
+		censusTimerStop(TimerCensusSiteSequenceDeadlineTimer)
 	}
 	wake := self.wake
 	self.timer = time.AfterFunc(time.Until(deadline), func() {
@@ -10160,8 +10168,8 @@ func (self *sequenceDeadlineTimer) woke() {
 }
 
 func (self *sequenceDeadlineTimer) stop() {
-	if self.timer != nil {
-		self.timer.Stop()
+	if self.timer != nil && self.timer.Stop() {
+		censusTimerStop(TimerCensusSiteSequenceDeadlineTimer)
 	}
 }
 
@@ -17409,7 +17417,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	self.client.receivePackHandoffWaitCount.Add(1)
 	var timeoutChan <-chan time.Time
 	if 0 < timeout {
-		timeoutChan = resetOrCreateTimer(&self.packTimer, timeout)
+		timeoutChan = resetOrCreateCensusTimer(&self.packTimer, timeout, TimerCensusSiteReceiveHandoffTimer)
 	}
 	stopTimer := func() {
 		if self.packTimer != nil {
@@ -17892,7 +17900,9 @@ func (self *ReceiveSequence) Run() {
 		ackCompressTimerDeadline := time.Time{}
 		armAckCompressTimer := func(deadline time.Time) <-chan time.Time {
 			if !deadline.Equal(ackCompressTimerDeadline) {
-				ackCompressTimer.Reset(time.Until(deadline))
+				timeout := time.Until(deadline)
+				ackCompressTimer.Reset(timeout)
+				censusTimerReset(TimerCensusSiteAckCompressTimer, timeout)
 				ackCompressTimerDeadline = deadline
 				if self.receiveBufferSettings.afterAckCompressTimerArmForTest != nil {
 					self.receiveBufferSettings.afterAckCompressTimerArmForTest(self.id())
@@ -18475,7 +18485,7 @@ func (self *ReceiveSequence) Run() {
 		}
 		if self.deliveryQueue != nil && (deliveryBlocked || self.deliveryQueue.pending() ||
 			self.immediateDeliveryQueue != nil && self.immediateDeliveryQueue.pending()) {
-			pack, ok, shouldExit := self.waitDelivery(resetOrCreateTimer(&deliveryTimer, timeout))
+			pack, ok, shouldExit := self.waitDelivery(resetOrCreateCensusTimer(&deliveryTimer, timeout, TimerCensusSiteReceiveDeliveryTimer))
 			if pack != nil {
 				if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
 					hook(self, pack.decodedOwner, "delivery_wait_pack")
