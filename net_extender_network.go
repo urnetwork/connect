@@ -1158,7 +1158,11 @@ func (self *ExtenderNetworkClient) feedCandidates() ([]*ExtenderCandidate, time.
 // Tries the carriers of one candidate in order -- tcp, then quic, then dns --
 // and runs the feed on the first that answers. `candidateRootKeySet` is the
 // root keys the candidate was chosen under: once other keys are in force, no
-// carrier is dialed, and nothing is held against the candidate for it.
+// carrier is dialed, and nothing is held against the candidate for it. Nor is
+// anything held against it for a dial this client's close ended, which says
+// nothing about the extender: a settings change that replaces the client
+// (K6) would otherwise hold the extender the old client was dialing, and the
+// replacement would neither probe nor offer it until the hold passed.
 func (self *ExtenderNetworkClient) sampleCandidate(
 	candidate *ExtenderCandidate,
 	candidateRootKeySet *ExtenderRootKeySet,
@@ -1189,6 +1193,11 @@ func (self *ExtenderNetworkClient) sampleCandidate(
 		sampled, err := self.runFeed(connectSettings, extenderConfig, candidateRootKeySet)
 		if sampled {
 			return true, nil
+		}
+		// as the probe, the strategy's dialers and the platform transports
+		// record nothing for a dial their owner canceled
+		if self.ctx.Err() != nil {
+			return false, nil
 		}
 		var limitedErr *ExtenderLimitedError
 		if errors.As(err, &limitedErr) {
