@@ -793,6 +793,31 @@ type EncryptionSettings struct {
 	// to the default.
 	UnknownWrapNackRestartCooldown time.Duration
 
+	// Paces the named ClientHellos a responder session that requires
+	// encryption and holds no established epoch takes from the receive loop
+	// (`optimisticallyDeliverClientHelloForEpoch`): once EarlyClientHelloBurst
+	// of them have opened attempts back to back, the session takes one more
+	// each interval. That path runs before any contract check, so every new
+	// attempt a source names there would start a TLS server handshake; the pace
+	// bounds how many a source can make the responder run back to back. The
+	// session runs one at a time either way, each new attempt ending the one
+	// before it. An initiator recovering a restarted responder opens one
+	// attempt, or a few while records of the attempts it dropped are still on
+	// the wire; it opens another only once its attempt in flight has ended, or
+	// on a nack, no sooner than UnknownWrapNackRestartCooldown after the last.
+	// An early ClientHello over the bound is dropped, as a retransmit is: the
+	// ordered receive sequence still delivers its copy, past the contract
+	// checks, which the pace does not cover. A retransmitted
+	// ClientHello of an attempt already answered, and the one second
+	// ClientHello of a HelloRetryRequest, open nothing and spend nothing. Zero
+	// or negative falls back to the default.
+	EarlyClientHelloMinInterval time.Duration
+	// How many early ClientHellos (see EarlyClientHelloMinInterval) a session
+	// takes back to back before the interval paces them, a whole burst again
+	// once it has taken none for that many intervals. Zero or negative falls
+	// back to the default.
+	EarlyClientHelloBurst int
+
 	// EncryptionControlUseCompanion, when true (default), sends
 	// EncryptedControl handshake packs as companion-contract traffic.
 	// This is required for asymmetric contract setups where the TLS
@@ -843,6 +868,12 @@ type EncryptionSettings struct {
 
 	// Nil test barrier pauses the actual certificate publisher after readiness.
 	beforeEncryptedKeyPublishForTest func()
+	// Nil test clock the early ClientHello pace reads in place of time.Now.
+	earlyClientHelloNowForTest func() time.Time
+	// Nil test observer sees each early ClientHello the pace judged: the source,
+	// the attempt it names, and whether the session took it. Called outside the
+	// session lock.
+	earlyClientHelloPacedForTest func(peerId Id, epochId Id, taken bool)
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -878,6 +909,13 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		// other's pacing.
 		UnknownWrapNackMinInterval:     1 * time.Second,
 		UnknownWrapNackRestartCooldown: 5 * time.Second,
+		// Early ClientHello pace: the burst takes a recovering initiator's few
+		// attempts at once, its recovery handshake reaching a restarted
+		// responder in well under a second, and past it a source makes a
+		// responder start at most one TLS server handshake a second per session
+		// through the path that runs before contract checks.
+		EarlyClientHelloMinInterval: 1 * time.Second,
+		EarlyClientHelloBurst:       4,
 		// 0 reaps a standalone session immediately at refs==0 (<0 keeps it
 		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
 		// overrides this with max(send-sequence idle, receive-sequence idle) so
@@ -1256,6 +1294,15 @@ type peerEncryptionSession struct {
 	// on the sealing side. Guarded by stateLock.
 	lastUnknownWrapNackTime        time.Time
 	nextUnknownWrapNackRestartTime time.Time
+	// The early ClientHello pace (`EncryptionSettings.EarlyClientHelloMinInterval`):
+	// when the session's burst is whole again, zero for a session that took
+	// none. Each early ClientHello that opens an attempt moves it one interval
+	// later, from now at the earliest, and the session takes one only while it
+	// is at most a burst less one interval ahead of now. A session reaped before
+	// its pace is whole hands it to the next session of its key
+	// (`EncryptionSessionManager.earlyClientHelloWholeTimes`). Guarded by
+	// stateLock.
+	earlyClientHelloWholeTime time.Time
 	// The attempt the latest nack demotion started (see
 	// `handleUnknownWrapNack`). Every attempt this session minted before it was
 	// dropped there, and their handshake records still queued or retransmittable
@@ -2520,7 +2567,7 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 // What follows is the initiator's path, and a pre-epoch peer's.
 func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) {
 	if self.role == sequenceTlsRoleServer && epochId != (Id{}) {
-		self.deliverAttemptHandshake(payload, epochId)
+		self.deliverAttemptHandshake(payload, epochId, false)
 		return
 	}
 	// A control naming a DIFFERENT generation than the epoch we hold is the
@@ -2614,20 +2661,37 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 //     superseded one.
 //   - A record of an older attempt than the current epoch's is a straggler.
 //
+// An early control, the receive loop's (`optimisticallyDeliverClientHelloForEpoch`),
+// reaches only a session with no established epoch, and opens an attempt only
+// within the session's early ClientHello pace
+// (`EncryptionSettings.EarlyClientHelloMinInterval`); one over it is dropped,
+// and the ordered path's copy opens the attempt when it arrives.
+//
 // Safe to call from the receive loop: it starts epoch workers and appends to
 // a transport's inbox, and never blocks.
-func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epochId Id) {
+func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epochId Id, early bool) {
 	clientHello := isClientHelloRecord(payload)
 	var digest [sha256.Size]byte
 	if clientHello {
 		digest = sha256.Sum256(payload)
 	}
+	var now time.Time
+	if early {
+		now = self.earlyClientHelloNow()
+	}
 	var feed *tlsHandshakeEpoch
 	opened := false
+	paced := false
+	taken := false
 	dropReason := ""
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		if early && self.establishedEpoch != nil {
+			// an established session keeps the ordered path alone; this one
+			// established since the caller looked
+			return
+		}
 		e := self.epoch
 		if e != nil && e.epochId != (Id{}) && e.epochId != epochId &&
 			!e.epochId.LessThan(epochId) {
@@ -2639,6 +2703,14 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 			if !clientHello {
 				dropReason = "no epoch answered its attempt"
 				return
+			}
+			if early {
+				paced = true
+				taken = self.takeEarlyClientHelloWithLock(now)
+				if !taken {
+					dropReason = "over the early ClientHello pace"
+					return
+				}
 			}
 			self.buildAndStartEpochWithLock()
 			if self.epoch == e {
@@ -2684,6 +2756,9 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 		}
 		feed = e
 	}()
+	if paced && self.settings != nil && self.settings.earlyClientHelloPacedForTest != nil {
+		self.settings.earlyClientHelloPacedForTest(self.peerId, epochId, taken)
+	}
 	if dropReason != "" {
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof(
@@ -2724,6 +2799,13 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 // plaintext, which is Required's rule; under Opportunistic the initiator resends
 // them in plaintext, they fill the gap, and the ClientHello arrives in order
 // behind them, as it always has. Sessions run in one mode on both ends.
+//
+// This path runs before any contract check, so any source can name new attempts
+// here, and each would start a TLS server handshake. The session's early
+// ClientHello pace bounds them (`EncryptionSettings.EarlyClientHelloMinInterval`):
+// a burst back to back, which a recovering initiator's few attempts fit, then
+// one an interval. A ClientHello over the pace is dropped, as a retransmit is,
+// and reaches the session in order, past the contract checks.
 func (self *peerEncryptionSession) optimisticallyDeliverClientHelloForEpoch(payload []byte, epochId Id) {
 	if self.role != sequenceTlsRoleServer || epochId == (Id{}) || !isClientHelloRecord(payload) ||
 		!self.RequireEncryption() {
@@ -2737,7 +2819,57 @@ func (self *peerEncryptionSession) optimisticallyDeliverClientHelloForEpoch(payl
 	if established {
 		return
 	}
-	self.deliverAttemptHandshake(payload, epochId)
+	self.deliverAttemptHandshake(payload, epochId, true)
+}
+
+// Whether the session's early ClientHello pace takes one more ClientHello that
+// opens an attempt at now, spending it when it does: a whole burst takes
+// EarlyClientHelloBurst back to back, and after that one each
+// EarlyClientHelloMinInterval (see `earlyClientHelloWholeTime`). Caller holds
+// stateLock.
+func (self *peerEncryptionSession) takeEarlyClientHelloWithLock(now time.Time) bool {
+	interval := self.earlyClientHelloMinInterval()
+	burst := self.earlyClientHelloBurst()
+	wholeTime := self.earlyClientHelloWholeTime
+	if wholeTime.Before(now) {
+		wholeTime = now
+	}
+	// over the pace when the spent part reaches past burst-1 intervals ahead,
+	// compared in whole intervals so that no product of the settings overflows
+	ahead := wholeTime.Sub(now)
+	aheadIntervals := int64(ahead / interval)
+	spendable := int64(burst - 1)
+	if spendable < aheadIntervals || (spendable == aheadIntervals && 0 < ahead%interval) {
+		return false
+	}
+	self.earlyClientHelloWholeTime = wholeTime.Add(interval)
+	return true
+}
+
+// The settings' early ClientHello interval, the default's when it is not
+// positive.
+func (self *peerEncryptionSession) earlyClientHelloMinInterval() time.Duration {
+	if self.settings != nil && 0 < self.settings.EarlyClientHelloMinInterval {
+		return self.settings.EarlyClientHelloMinInterval
+	}
+	return DefaultEncryptionSettings().EarlyClientHelloMinInterval
+}
+
+// The settings' early ClientHello burst, the default's when it is not positive.
+func (self *peerEncryptionSession) earlyClientHelloBurst() int {
+	if self.settings != nil && 0 < self.settings.EarlyClientHelloBurst {
+		return self.settings.EarlyClientHelloBurst
+	}
+	return DefaultEncryptionSettings().EarlyClientHelloBurst
+}
+
+// The time the early ClientHello pace reads: the settings' test clock when one
+// is set.
+func (self *peerEncryptionSession) earlyClientHelloNow() time.Time {
+	if self.settings != nil && self.settings.earlyClientHelloNowForTest != nil {
+		return self.settings.earlyClientHelloNowForTest()
+	}
+	return time.Now()
 }
 
 // receivePeerIdentityProof buffers the peer's identity-proof payload
@@ -3557,6 +3689,7 @@ func (self *peerEncryptionSession) Release() {
 		key := sessionKey{peerId: self.peerId, companion: self.companion, role: self.role}
 		if self.manager.sessions[key] == self {
 			delete(self.manager.sessions, key)
+			self.manager.keepEarlyClientHelloPaceWithLock(key, self.earlyClientHelloWholeTime, self.earlyClientHelloNow())
 		}
 		return true
 	}()
@@ -3630,6 +3763,7 @@ func (self *peerEncryptionSession) CancelIfIdle() bool {
 		key := sessionKey{peerId: self.peerId, companion: self.companion, role: self.role}
 		if self.manager.sessions[key] == self {
 			delete(self.manager.sessions, key)
+			self.manager.keepEarlyClientHelloPaceWithLock(key, self.earlyClientHelloWholeTime, self.earlyClientHelloNow())
 		}
 		return true
 	}()
@@ -3716,7 +3850,18 @@ type EncryptionSessionManager struct {
 	// The size at which the next new peer sweeps the latches. Doubling it keeps
 	// the sweep amortized constant per peer and the map within twice what is live.
 	stickyRequiredSweepCount int
-	workers                  *lifecycleAdmission
+	// The early ClientHello paces of sessions reaped while their pace was not
+	// whole, by key (see `peerEncryptionSession.earlyClientHelloWholeTime`). The
+	// next session of the key takes up the pace where the last left it, so a
+	// source cannot win a whole burst by getting its session reaped: one with no
+	// references is reaped as its handshake fails when IdleTimeout is zero. A
+	// pace is whole again within a burst of intervals, after which its entry
+	// goes at the next sweep.
+	earlyClientHelloWholeTimes map[sessionKey]time.Time
+	// The size at which the next kept pace sweeps the whole ones out, doubled
+	// as stickyRequiredSweepCount is.
+	earlyClientHelloSweepCount int
+	workers                    *lifecycleAdmission
 	// Nil test barrier pauses a publisher or session supervisor after cleanup
 	// and before joined completion.
 	beforeWorkerDoneForTest func(string)
@@ -3740,6 +3885,8 @@ func NewEncryptionSessionManager(ctx context.Context, client *Client, clientKeyM
 		workers:          newLifecycleAdmission(),
 
 		stickyRequiredPeers: map[Id]*stickyRequiredPeer{},
+
+		earlyClientHelloWholeTimes: map[sessionKey]time.Time{},
 
 		peerIdentityChangeCallbacks: NewCallbackList[func()](),
 		encryptionEventCallbacks:    NewCallbackList[func(*EncryptionEvent)](),
@@ -4183,6 +4330,12 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 	}
 	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
 	s.stickyRequired = self.stickyRequiredPeerWithLock(peerId)
+	// takes up the early ClientHello pace the key's last session left; s is
+	// not published yet
+	if wholeTime, ok := self.earlyClientHelloWholeTimes[key]; ok {
+		s.earlyClientHelloWholeTime = wholeTime
+		delete(self.earlyClientHelloWholeTimes, key)
+	}
 	if !self.workers.start() {
 		s.close()
 		return nil
@@ -4243,6 +4396,28 @@ func (self *EncryptionSessionManager) sweepStickyRequiredPeersWithLock() {
 		}
 	}
 	self.stickyRequiredSweepCount = 2 * len(self.stickyRequiredPeers)
+}
+
+// Keeps the early ClientHello pace of a session leaving the registry while the
+// pace is not whole at now, for the next session of its key (see
+// `earlyClientHelloWholeTimes`). wholeTime is the session's
+// `earlyClientHelloWholeTime`, read under its stateLock. Caller holds stateLock.
+func (self *EncryptionSessionManager) keepEarlyClientHelloPaceWithLock(key sessionKey, wholeTime time.Time, now time.Time) {
+	if !now.Before(wholeTime) {
+		return
+	}
+	if self.earlyClientHelloWholeTimes == nil {
+		self.earlyClientHelloWholeTimes = map[sessionKey]time.Time{}
+	}
+	if self.earlyClientHelloSweepCount <= len(self.earlyClientHelloWholeTimes) {
+		for k, t := range self.earlyClientHelloWholeTimes {
+			if !now.Before(t) {
+				delete(self.earlyClientHelloWholeTimes, k)
+			}
+		}
+		self.earlyClientHelloSweepCount = 2 * len(self.earlyClientHelloWholeTimes)
+	}
+	self.earlyClientHelloWholeTimes[key] = wholeTime
 }
 
 // Whether any of the peer's sessions is registered. Caller holds stateLock.
