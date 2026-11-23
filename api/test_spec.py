@@ -571,10 +571,11 @@ class GkmRoutesTest(unittest.TestCase):
         self.assertIn("bare ciphertext", responses["200"]["description"])
 
     def test_statuses_are_the_designs(self):
-        # a wrap's own 201, 412 and 409 ride its batch's 200
+        # a wrap's own 201, 412 and 409 ride its batch's 200, and a claim in a
+        # group a re-form closed answers 409 (QD-1186)
         for path, want in {
             "/gkm/groups/{group_id}/epochs/{n}": {"200", "403", "409", "429"},
-            "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "412", "429"},
+            "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "409", "412", "429"},
             "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"200", "403", "429"},
             "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"200", "403", "429"},
         }.items():
@@ -589,6 +590,37 @@ class GkmRoutesTest(unittest.TestCase):
             with self.subTest(path=path):
                 response = self.spec["paths"][path]["post"]["responses"][status]
                 self.assertIn("application/octet-stream", response["content"])
+
+    def test_a_closed_group_answers_with_its_closing_marker(self):
+        # QD-1186: once a re-form's closing marker stands in the group it
+        # re-forms, a claim or a commit there answers 409 with the marker, the
+        # re-form's GroupForm, as another re-form does, and each delivery or
+        # recovery wrap that stands answers 409 in its batch's 200. QD-1187: a
+        # re-form whose group a claim moved past answers 409 with that
+        # generation's GenRotate
+        def response(path, status):
+            response = self.spec["paths"][path]["post"]["responses"][status]
+            return response, " ".join(response["description"].split())
+
+        for path in (
+            "/gkm/groups/{group_id}/gen/{g}",
+            "/gkm/groups/{group_id}/epochs/{n}",
+            "/gkm/repos/{repo_id}/forms",
+        ):
+            with self.subTest(path=path):
+                conflict, description = response(path, "409")
+                self.assertIn("application/octet-stream", conflict["content"])
+                self.assertIn("`Signed` `GroupForm`", description)
+        _, description = response("/gkm/repos/{repo_id}/forms", "409")
+        self.assertIn("`Signed` `GenRotate` of the generation past the form's", description)
+        for path in (
+            "/gkm/groups/{group_id}/wraps/{g}/{c8}",
+            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}",
+        ):
+            with self.subTest(path=path):
+                _, description = response(path, "200")
+                self.assertIn("a re-form closed", description)
+                self.assertIn("409 with no winner", description)
 
     def test_check_routes_says_when_it_could_not_read_the_table(self):
         result = self.check_routes()

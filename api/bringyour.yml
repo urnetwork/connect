@@ -9895,9 +9895,10 @@ paths:
       description: |
         A `GkmGenerationsReply`: the newest `GenRotate` of the group the repo's
         newest GroupForm names, up to 64 after `since`, so a depositor, which
-        cannot read the group's id, needs none. A depositor checks them itself
-        before it seals. The only route `deposit` reaches, which `r`, `rw` and
-        `admin` also reach.
+        cannot read the group's id, needs none. A group a re-form has closed
+        serves none past the closing form's generation. A depositor checks them
+        itself before it seals. The only route `deposit` reaches, which `r`,
+        `rw` and `admin` also reach.
       operationId: gkmDropKey
       security:
         - ServiceTokenAuth: []
@@ -9964,11 +9965,22 @@ paths:
         network admin's outside those. `POST /gkm/groups` files a new group's
         first form, and this one the form that re-forms it, after a site loss,
         for a stalled group or for an IANA renumbering of its suite. Writes the
-        GroupForm, then epoch 0, each only if absent, so a retry of equal bytes
-        answers 200 and a crash resumes where it stopped. The ladder route then
-        carries the old generations, and the wraps routes the first wraps. A
-        repo re-seeded as deleted takes this route and the ladder's, in re-seed
-        mode, and no other gkm write. Needs `admin`.
+        new group's owner marker, then closes the group the form re-forms where
+        gkm holds it, then writes the GroupForm, then epoch 0, each only if
+        absent, so a retry of equal bytes answers 200 and a crash resumes where
+        it stopped. Closing writes the old group's closing marker, the form's
+        bytes, after which that group takes no claim, wrap or commit and serves
+        no generation past the form's. A closing comes to one answer, recorded
+        once, which every try of the request follows: it stands and the form is
+        filed, unless a claim has moved the old group past the form's
+        generation, when the marker is emptied, the group takes writes again
+        and the form is refused. Another re-form's closing gives way to this
+        one only once it has come to nothing, once a claim has moved the group
+        past its form, or, when this form's generation is at least its own,
+        once it has had no answer for 10 minutes. The ladder route then carries
+        the old generations, and the wraps routes the first wraps. A repo
+        re-seeded as deleted takes this route and the ladder's, in re-seed mode,
+        and no other gkm write. Needs `admin`.
       operationId: gkmRepoForm
       security:
         - ServiceTokenAuth: []
@@ -9991,7 +10003,25 @@ paths:
         "403":
           description: Out of scope, the signer may not form this repo's group, or the repo is deleted outside re-seed mode.
         "409":
-          description: That form's place, or the new group's epoch 0, holds other bytes.
+          description: |
+            The form is not filed. With no body, another repo's group holds the
+            new group's id, and nothing is written: the re-former draws another.
+            Otherwise the body is one of these: the repo's newest form, when this
+            one does not re-form the group that form names or a form of the repo
+            already names its group; the other bytes that hold the form's place
+            or the new group's epoch 0; another re-form's `Signed` `GroupForm`,
+            whose closing of the old group stands, is under way, or took over
+            this one's as stalled, so the re-former drops its draft and adopts
+            that group at its next sync; or the old group's `Signed` `GenRotate`
+            of the generation past the form's, which a claim wrote and the form
+            does not carry: the closing came to nothing, the old group takes
+            writes again, and the re-former takes that generation before it
+            forms again.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
         "429":
           description: Past a rate, or queued out by the write budget.
 
@@ -10041,8 +10071,9 @@ paths:
         commit's PublicMessage, whose `authenticated_data` holds a
         `GkmCommitHeader`, the only part of it gkm reads. The first commit of an
         epoch wins, once the epoch before it exists. gkm sees no proposal, so
-        members refuse what its committer may not commit. Takes `r`, `rw` or
-        `admin`, from a member device reading the repo.
+        members refuse what its committer may not commit. A group a re-form has
+        closed takes no commit. Takes `r`, `rw` or `admin`, from a member device
+        reading the repo.
       operationId: gkmEpochCommit
       security:
         - ServiceTokenAuth: []
@@ -10062,7 +10093,12 @@ paths:
         "403":
           description: Out of scope, or the header fails the epoch check.
         "409":
-          description: Another commit won the epoch. The body is the winner, a `GkmEpochObject`.
+          description: |
+            Another commit won the epoch: the body is the winner, a
+            `GkmEpochObject`. Or a re-form closed the group, whose closing marker
+            gkm reads just before the commit's write, and nothing is written: the
+            body is the marker, the re-form's `Signed` `GroupForm`, naming the
+            new group. Either way the committer discards its commit.
           content:
             application/octet-stream:
               schema:
@@ -10081,7 +10117,8 @@ paths:
       description: |
         A `GkmGenerationsReply`: the `Signed` `GenRotate` of each generation after
         `since`, in order. An answer stops at gkm's bound, so ask again after its
-        last generation until none comes. Needs `r`, `rw` or `admin`.
+        last generation until none comes. A group a re-form has closed serves
+        none past the closing form's generation. Needs `r`, `rw` or `admin`.
       operationId: gkmGenerations
       security:
         - ServiceTokenAuth: []
@@ -10115,8 +10152,9 @@ paths:
         place a generation exists, so a rotator stages every delivery first. It
         must chain from generation `g` - 1, its auth pin must not fall and must
         match the projection at that version, and its time must be within 10
-        minutes of gkm's clock. Needs `rw`, never a read-only device's, or in the
-        config group a member device's `rw`.
+        minutes of gkm's clock. A group a re-form has closed takes no claim.
+        Needs `rw`, never a read-only device's, or in the config group a member
+        device's `rw`.
       operationId: gkmGenerationClaim
       security:
         - ServiceTokenAuth: []
@@ -10135,6 +10173,22 @@ paths:
           description: Claimed.
         "403":
           description: Out of scope, or the claim fails its checks.
+        "409":
+          description: |
+            A re-form closed the group: its closing marker stands, read before
+            the claim's write and again after it, and the claim is refused
+            whatever that write left; a generation a refused claim wrote is
+            served to no one while the marker stands. The body is the marker,
+            the re-form's `Signed` `GroupForm`, naming the new group and the
+            newest generation its ladder carries; the rotator follows that form
+            at its next sync. With no body, a member's current recovery binding
+            holds no RecoveryWrap staged for the claim's generation and
+            commitment, and nothing is claimed.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
         "412":
           description: Already claimed. The body is the winner, a `Signed` `GenRotate`.
           content:
@@ -10206,8 +10260,9 @@ paths:
         while generation `g` is unclaimed, or of generation 1 by its signer while
         the repo is `keying`. Late only once `g` is the newest and carries the
         body's commitment. Each runs through these checks alone, so a batch of one
-        behaves as one delivery would, and a retry is safe. Takes `r`, `rw` or
-        `admin`, from a sidecar that is not read-only.
+        behaves as one delivery would, and a retry is safe. A group a re-form has
+        closed takes none. Takes `r`, `rw` or `admin`, from a sidecar that is not
+        read-only.
       operationId: gkmWrapUpload
       security:
         - ServiceTokenAuth: []
@@ -10233,7 +10288,11 @@ paths:
             A `GkmWrapBatchReply`, one result per delivery, in order: 201, 412 with
             the winner, 403, 409 for a stale kind, generation or key, 429 past the
             staged rate or queued out by the write budget, or 0 for one not tried
-            in the time the request has.
+            in the time the request has. In a group a re-form closed, each
+            delivery that stands, 201 or 412, answers 409 with no winner instead,
+            whatever its write left: gkm reads the group's closing marker after the
+            batch's writes, and a read that fails answers those deliveries 0. The
+            rotator then follows the form.
           content:
             application/octet-stream:
               schema:
@@ -10276,7 +10335,12 @@ paths:
               format: binary
       responses:
         "200":
-          description: One result per wrap, in order, as the wraps route answers, though a 412's winner is the stored RecoveryWrap's bare ciphertext, which nothing signs.
+          description: |
+            One result per wrap, in order, as the wraps route answers, though a
+            412's winner is the stored RecoveryWrap's bare ciphertext, which
+            nothing signs. A wrap to a binding that is not its member's current
+            one answers 409, and in a group a re-form closed each wrap that
+            stands answers 409 with no winner, as a delivery does there.
           content:
             application/octet-stream:
               schema:
