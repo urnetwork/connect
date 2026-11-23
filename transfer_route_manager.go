@@ -3231,7 +3231,7 @@ func (self *MultiRouteSelector) writeDetailedWithRoutePolicyGeneration(
 		if remainingTimeout <= 0 {
 			return nil, true
 		}
-		return resetOrCreateTimer(&self.writeTimer, remainingTimeout), false
+		return resetOrCreateCensusTimer(&self.writeTimer, remainingTimeout, TimerCensusSiteRouteWriteTimer), false
 	}
 	for {
 		// read the active routes and the transport-update channel from the

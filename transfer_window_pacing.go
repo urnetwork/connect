@@ -547,7 +547,10 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 			if self.timer == nil {
 				self.timer = time.NewTimer(0)
 			}
-			self.timer.Reset(time.Until(wake))
+			// every pass re-arms, a Reset the timer census counts
+			timeout := time.Until(wake)
+			self.timer.Reset(timeout)
+			censusTimerReset(TimerCensusSiteWindowPacingTimer, timeout)
 			timer = self.timer.C
 		}
 		select {

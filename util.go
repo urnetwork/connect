@@ -25,12 +25,21 @@ type Monitor struct {
 // resetOrCreateTimer lazily creates a timer and otherwise reuses it. Go 1.23+
 // guarantees Reset cannot expose a stale value from the previous setting, so
 // callers only need to serialize access to the timer and Stop it when a
-// non-timer select arm wins.
+// non-timer select arm wins. A Reset is counted in the timer census under the
+// generic site.
 func resetOrCreateTimer(timer **time.Timer, timeout time.Duration) <-chan time.Time {
+	return resetOrCreateCensusTimer(timer, timeout, TimerCensusSiteTimer)
+}
+
+// resetOrCreateTimer for a caller with a timer census site of its own. The
+// census counts the Reset, which moves the timer if it is pending or still in
+// its P's heap; the create is an insert and is not counted.
+func resetOrCreateCensusTimer(timer **time.Timer, timeout time.Duration, site TimerCensusSite) <-chan time.Time {
 	if *timer == nil {
 		*timer = time.NewTimer(timeout)
 	} else {
 		(*timer).Reset(timeout)
+		censusTimerReset(site, timeout)
 	}
 	return (*timer).C
 }
