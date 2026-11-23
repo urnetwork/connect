@@ -91,6 +91,59 @@ func affinityGroupScanTestCheckIndex(t *testing.T, parent *RemoteUserNatMultiCli
 			}
 		}
 	}
+	now := time.Now()
+	maxTime := parent.reliabilitySettings().AffinityMaxTime
+	affinityJoinLogTestCheckGroups(t, fmt.Sprintf("step %d v4", step), parent.affinityIp4Paths, parent.affinityIp4JoinLogs, now, maxTime)
+	affinityJoinLogTestCheckGroups(t, fmt.Sprintf("step %d v6", step), parent.affinityIp6Paths, parent.affinityIp6JoinLogs, now, maxTime)
+}
+
+// Each group written through the production writers has a log that covers it
+// at now: its records are in join time order, and every entry younger than
+// maxTime has exactly one record of its tuple and join time. No log outlives
+// its group.
+func affinityJoinLogTestCheckGroups[P comparable](
+	t *testing.T,
+	at string,
+	groupPaths map[P]map[P]time.Time,
+	joinLogs map[P]*affinityJoinLog[P],
+	now time.Time,
+	maxTime time.Duration,
+) {
+	t.Helper()
+	for group := range joinLogs {
+		if _, ok := groupPaths[group]; !ok {
+			t.Fatalf("%s: a join log outlives its group", at)
+		}
+	}
+	for group, paths := range groupPaths {
+		joinLog := joinLogs[group]
+		if joinLog == nil {
+			t.Fatalf("%s: a group has no join log", at)
+		}
+		if !joinLog.covers(paths, now, maxTime) {
+			t.Fatalf("%s: a group's join log does not cover it (entries %d, counted %d)", at, len(paths), joinLog.entryCount)
+		}
+		live := joinLog.joins[joinLog.headIndex:]
+		for i := 1; i < len(live); i += 1 {
+			if live[i].joinTime.Before(live[i-1].joinTime) {
+				t.Fatalf("%s: join log records out of join time order", at)
+			}
+		}
+		for path, joinTime := range paths {
+			if maxTime <= now.Sub(joinTime) {
+				continue
+			}
+			matches := 0
+			for _, join := range live {
+				if join.path == path && join.joinTime.Equal(joinTime) {
+					matches += 1
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("%s: a young entry has %d records", at, matches)
+			}
+		}
+	}
 }
 
 // Through the production writers only (sendUpdate, the reaper, generation
@@ -318,9 +371,11 @@ func TestIpPathUpdatesHaveCanonicalWriters(t *testing.T) {
 }
 
 // One placement into a group of a busy hosted device: memberCount members
-// older than AffinityMaxTime (their updates bound to an exit) and one fresh
-// donor. The full scan reads every member's update; the indexed scan reads
-// the fresh one.
+// whose entries are minutes old (their updates bound to an exit) and 50 young
+// ones, written through the production writers. The full scan reads every
+// member's update; the read of the whole group, as before the join log,
+// iterates every member and reads the young ones' updates; the log scan reads
+// the young ones from the newest end of the group's join log.
 func BenchmarkAffinityGroupScan(b *testing.B) {
 	for _, memberCount := range []int{100, 1000, 5000} {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -333,36 +388,40 @@ func BenchmarkAffinityGroupScan(b *testing.B) {
 		exit := affinityGroupScanTestDonor(parent)
 		group := (&IpPath{Version: 4, DestinationIp: affinityTimeTestPath(4, 0).DestinationIp, DestinationPort: 443}).ToIp4Path()
 		old := time.Now().Add(-5 * time.Minute)
-		parent.affinityIp4Paths[group] = map[Ip4Path]time.Time{}
-		for i := range memberCount + 1 {
+		parent.stateLock.Lock()
+		for i := range memberCount + 50 {
 			path := affinityTimeTestPath(4, 10000+i)
 			update := newMultiClientChannelUpdate(ctx, path)
 			joinTime := time.Now()
 			if i < memberCount {
 				// an old member: its origin and its entry are both minutes old
-				update.client.originTime = old
-				update.openTime = old
-				joinTime = old
+				joinTime = old.Add(time.Duration(i) * time.Millisecond)
+				update.client.originTime = joinTime
+				update.openTime = joinTime
 			}
 			update.selectAffinityClient(exit)
-			parent.ip4PathUpdates[path.ToIp4Path()] = update
-			parent.affinityIp4Paths[group][path.ToIp4Path()] = joinTime
+			parent.setIp4PathUpdateWithLock(path.ToIp4Path(), update)
+			parent.joinAffinityIp4WithLock(group, path.ToIp4Path(), joinTime)
 		}
+		parent.stateLock.Unlock()
 		fresh := newMultiClientChannelUpdate(ctx, affinityTimeTestPath(4, 60000))
-		for _, scan := range []string{"full", "indexed"} {
+		for _, scan := range []string{"full", "group", "log"} {
 			b.Run(fmt.Sprintf("members%d/%s", memberCount, scan), func(b *testing.B) {
 				parent.stateLock.Lock()
 				defer parent.stateLock.Unlock()
 				for b.Loop() {
 					fresh.client.Store(nil)
 					var verdict donorVerdict
-					if scan == "full" {
+					switch scan {
+					case "full":
 						verdict, _ = parent.inheritAffinityClient4WithLock(fresh, parent.affinityIp4Paths[group])
-					} else {
+					case "group":
+						verdict, _ = parent.inheritAffinityClient4FromWithLock(fresh, parent.affinityIp4Paths[group], parent.staleAffinityIp4Paths[group], nil, true)
+					default:
 						verdict, _ = parent.inheritAffinityGroupClient4WithLock(fresh, group)
 					}
 					if verdict == donorRefused {
-						b.Fatal("the fresh member did not donate")
+						b.Fatal("a young member did not donate")
 					}
 				}
 			})

@@ -49,6 +49,9 @@ type FramedMessageConn struct {
 	delayFramer *Framer
 	delayWrite  *transportDelayWriteLane
 	delayRead   *transportDelayReadLane
+	// the reader's delay header: a local array would escape through the
+	// connection and allocate on every frame
+	readDelayHeader transportDelayHeader
 }
 
 func NewFramedMessageConn(conn net.Conn, protocol string, maximum int, stats *H1PlusStats) (*FramedMessageConn, error) {
@@ -135,9 +138,9 @@ func (c *FramedMessageConn) NextReader() (int, io.Reader, error) {
 		err = errors.New("framed stream message limit exceeded")
 	}
 	if err == nil && 0 < headerLen {
-		var header transportDelayHeader
-		if _, err = io.ReadFull(c.Conn, header[:]); err == nil {
-			c.delayRead.receive(header[:], 4+length)
+		header := c.readDelayHeader[:]
+		if _, err = io.ReadFull(c.Conn, header); err == nil {
+			c.delayRead.receive(header, 4+length)
 		}
 	}
 	if err != nil {
