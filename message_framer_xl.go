@@ -46,7 +46,8 @@ func DefaultFramerXlSettings(maxMessageLen int) *FramerXlSettings {
 // FramerXl preserves message boundaries on a stream using a four-byte uint32
 // payload length. One reader and one writer may operate concurrently, with a
 // single owner in each direction. Concurrent reads or concurrent writes are
-// unsupported. FramerXl retains no payload, scratch buffer, or stream reference.
+// unsupported. FramerXl retains no payload, scratch buffer, or stream
+// reference; its read side keeps the four header bytes it reads.
 // Settings are snapshotted at construction and must not be mutated concurrently
 // with construction. Per-direction in-flight and queue budgets remain the
 // endpoint's responsibility.
@@ -55,6 +56,10 @@ type FramerXl struct {
 	maxBatchLen   int
 	settingsErr   error
 	log           Logger
+
+	// the read side's header: a local array would escape through the reader
+	// and allocate on every frame
+	readHeader [framerXlHeaderLen]byte
 }
 
 // NewFramerXl snapshots settings. Invalid settings make every operation fail
@@ -87,11 +92,11 @@ func (f *FramerXl) ReadHeader(r io.Reader) (int, error) {
 	if f.settingsErr != nil {
 		return 0, f.settingsErr
 	}
-	var header [framerXlHeaderLen]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
+	header := f.readHeader[:]
+	if _, err := io.ReadFull(r, header); err != nil {
 		return 0, err
 	}
-	wireLen := binary.BigEndian.Uint32(header[:])
+	wireLen := binary.BigEndian.Uint32(header)
 	// Compare before converting to int, including on 32-bit platforms.
 	if uint64(wireLen) > uint64(f.maxMessageLen) {
 		if f.log != nil {

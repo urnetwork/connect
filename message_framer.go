@@ -54,6 +54,8 @@ func DefaultFramerSettings(maxMessageLen int) *FramerSettings {
 
 // One reader and one writer may use a Framer concurrently. Each direction must
 // have a single owner: simultaneous reads or simultaneous writes are unsupported.
+// The read side keeps the buffers of the bytes it reads before a message, so a
+// frame read allocates nothing but its message.
 type Framer struct {
 	// maxFrameLen is the maximum on-wire frame length the framer reads or
 	// writes: the configured max message (payload) length plus the 4-byte
@@ -61,22 +63,33 @@ type Framer struct {
 	maxFrameLen int
 	settings    *FramerSettings
 	log         Logger
+
+	// the read side's length prefix
+	readPrefix [4]byte
+	// the read side's HeaderByteCount bytes of a header frame
+	readFrameHeader []byte
 }
 
 func NewFramer(settings *FramerSettings) *Framer {
-	return &Framer{
+	framer := &Framer{
 		maxFrameLen: settings.MaxMessageLen + 4 + max(0, settings.HeaderByteCount),
 		settings:    settings,
 		log:         loggerOrDefault(settings.Log),
 	}
+	if 0 < settings.HeaderByteCount {
+		framer.readFrameHeader = make([]byte, settings.HeaderByteCount)
+	}
+	return framer
 }
 
 // ReadHeader validates the next payload length before allocation. It is also
 // used by streaming message carriers, whose caller consumes exactly this many
 // bytes before requesting the next frame. The legacy split hint is ignored.
+// The prefix is read into the read side's buffer: a local array would escape
+// through the reader and allocate on every frame.
 func (self *Framer) ReadHeader(r io.Reader) (int, error) {
-	var h [4]byte
-	if _, err := io.ReadFull(r, h[:]); err != nil {
+	h := self.readPrefix[:]
+	if _, err := io.ReadFull(r, h); err != nil {
 		return 0, err
 	}
 
@@ -413,13 +426,8 @@ func (self *Framer) ReadWithHeader(r io.Reader, header []byte) ([]byte, error) {
 	if bodyLen < headerLen {
 		return nil, fmt.Errorf("Framer frame shorter than its header (%d<%d)", bodyLen, headerLen)
 	}
-	var stackHeader [64]byte
-	var frameHeader []byte
-	if headerLen <= len(stackHeader) {
-		frameHeader = stackHeader[:headerLen]
-	} else {
-		frameHeader = make([]byte, headerLen)
-	}
+	// the read side's buffer, sized by HeaderByteCount at construction
+	frameHeader := self.readFrameHeader[:headerLen]
 	if _, err := io.ReadFull(r, frameHeader); err != nil {
 		return nil, err
 	}
