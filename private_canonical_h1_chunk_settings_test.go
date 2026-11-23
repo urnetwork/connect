@@ -134,7 +134,11 @@ func TestCanonicalH1ChunkSettingsRealOwnersStayIndependent(t *testing.T) {
 				}
 			})
 		}
-		owners[0].chunks, owners[1].chunks, owners[2].chunks, owners[3].chunks = []int{7, 1}, []int{3, 3, 2}, []int{3, 3, 2}, []int{2, 2, 2, 2}
+		// At the product MTU1280 the default owner's first Pack carries six raw
+		// packets beside the full proof head, the 16 KiB H1 envelope's bound
+		// (TestCanonicalH1FullProofEnvelopeSignedWireBoundary), and its last two
+		// follow. The other owners' lower caps bind below that envelope.
+		owners[0].chunks, owners[1].chunks, owners[2].chunks, owners[3].chunks = []int{6, 2}, []int{3, 3, 2}, []int{3, 3, 2}, []int{2, 2, 2, 2}
 		for index := range owners {
 			row := &owners[index]
 			accepted, err := row.fixture.sender.sendGroupWithTimeoutDetailed(row.pack.Frames, row.fixture.receiver.ClientId(), func(err error) { row.result <- err }, time.Second)
