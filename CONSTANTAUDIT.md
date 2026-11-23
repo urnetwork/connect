@@ -25,6 +25,20 @@ Migrated 2026-11-17, with `DohCache.ForwardDnssec` (QD-702): net_http_doh.go's
 `dohSeedMaxScore` → `ServerSeedMaxScore`. `dohWarmDomain`, the name a warm query asks,
 stays a constant: an identifier, not a limit.
 
+Migrated 2026-11-23, with the early ClientHello pace (QD-702): transfer_encrypt.go's
+inline limits. The identity proof resends' 60 s window without a TlsTimeout →
+`EncryptionSettings.IdentityProofResendWindow`; the identity key fetch's 1 s interval →
+`PeerClientPublicKeyFetchMinInterval`; a generated sequence certificate's hour of backdate
+and day of validity → `GeneratedTlsCertificateBackdate` and `GeneratedTlsCertificateLifetime`;
+the V(2) peer certificate watch's 2 s → `PeerCertificateReadLogThreshold`. The fallbacks of
+`RequiredCipherPollInterval`, `UnknownWrapNackMinInterval` and `UnknownWrapNackRestartCooldown`
+for a value that is not positive now read `DefaultEncryptionSettings()` rather than a second
+copy of the number; the restart cooldown's copy was 2 s where the default is 5 s. The pace
+itself was introduced directly as `EarlyClientHelloMinInterval` and `EarlyClientHelloBurst`.
+The identity proof resends' doubling, the doubling of the kept paces' and the sticky
+latches' sweep sizes, and the 63 doublings that cap the initial-retry failure count (a
+duration's bits) stay: the shape of a backoff or an amortized sweep, not a limit.
+
 ---
 
 ## A. Wire / protocol / ABI constants — stay fixed (compatibility-bearing)
