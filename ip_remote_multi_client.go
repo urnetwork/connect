@@ -9580,12 +9580,15 @@ func (self *RemoteUserNatMultiClient) uplinkLastIngress() time.Time {
 // one at a time with nothing else held. The channel stateLock must never nest
 // under the parent stateLock (see clientDialFailure), and consequently this
 // must never be called while holding a channel or per-flow leaf lock.
+//
+// The snapshot fills an array on this call's stack, which holds the channels
+// of any window, so a sweep allocates only past them.
 func (self *RemoteUserNatMultiClient) sendingChannelCount() int {
-	var clients []*multiClientChannel
+	var clientArray [64]*multiClientChannel
+	clients := clientArray[:0]
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		clients = make([]*multiClientChannel, 0, len(self.clientUpdates))
 		for client := range self.clientUpdates {
 			clients = append(clients, client)
 		}
@@ -9632,15 +9635,16 @@ func (self *RemoteUserNatMultiClient) comparativeReceiveWindow() time.Duration {
 // sendingChannelCount and keeps this to one map iteration: a channel carrying
 // return traffic is a channel with flows bound to it, so the approximation errs
 // only toward undercounting -- which errs toward the patient full timeout,
-// the safe direction for a bar that shortens a removal.
+// the safe direction for a bar that shortens a removal. The snapshot fills a
+// stack array, as sendingChannelCount's does.
 func (self *RemoteUserNatMultiClient) receivingChannelCount(exclude *multiClientChannel) int {
 	window := self.comparativeReceiveWindow()
 
-	var clients []*multiClientChannel
+	var clientArray [64]*multiClientChannel
+	clients := clientArray[:0]
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		clients = make([]*multiClientChannel, 0, len(self.clientUpdates))
 		for client := range self.clientUpdates {
 			if client == exclude {
 				continue
