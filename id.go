@@ -166,6 +166,22 @@ func parseUuid(src string) (dst [16]byte, err error) {
 	return dst, err
 }
 
+// The canonical text form, lowercase hex in 8-4-4-4-12 groups, as fmt's
+// %x-%x-%x-%x-%x of the five byte ranges writes it. Encoded in place, it
+// allocates only the string. Id.String reaches it, and through it every id a
+// server process formats: through fmt it boxed each of the five slices and
+// ran fmt's printer for every id (server CPUOPT7.md §10.5 C2, after the sdk's
+// twin in §4.3).
 func encodeUuid(src [16]byte) string {
-	return fmt.Sprintf("%x-%x-%x-%x-%x", src[0:4], src[4:6], src[6:8], src[8:10], src[10:16])
+	var dst [36]byte
+	hex.Encode(dst[0:8], src[0:4])
+	dst[8] = '-'
+	hex.Encode(dst[9:13], src[4:6])
+	dst[13] = '-'
+	hex.Encode(dst[14:18], src[6:8])
+	dst[18] = '-'
+	hex.Encode(dst[19:23], src[8:10])
+	dst[23] = '-'
+	hex.Encode(dst[24:36], src[10:16])
+	return string(dst[:])
 }
