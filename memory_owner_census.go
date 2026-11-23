@@ -194,6 +194,7 @@ type MultiClientOwnerCensus struct {
 	PathEntries           int64               `json:"path_entries"`
 	AffinityGroups        int64               `json:"affinity_groups"`
 	AffinityPaths         int64               `json:"affinity_paths"`
+	AffinityJoins         int64               `json:"affinity_joins"`
 	DnsHints              int64               `json:"dns_hints"`
 	QualificationEntries  int64               `json:"qualification_entries"`
 	ServiceFailureEntries int64               `json:"service_failure_entries"`
@@ -273,6 +274,12 @@ func (self *RemoteUserNatMultiClient) MemoryOwnerCensus() MultiClientOwnerCensus
 	}
 	for _, paths := range self.affinityIp6Paths {
 		out.AffinityPaths += int64(len(paths))
+	}
+	for _, joinLog := range self.affinityIp4JoinLogs {
+		out.AffinityJoins += int64(joinLog.recordCount())
+	}
+	for _, joinLog := range self.affinityIp6JoinLogs {
+		out.AffinityJoins += int64(joinLog.recordCount())
 	}
 	out.DnsHints = int64(len(self.dnsExitHints) + len(self.dnsAddressExitHints))
 	out.QualificationEntries = int64(len(self.qualification))

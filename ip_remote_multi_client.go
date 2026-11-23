@@ -2192,7 +2192,12 @@ type RemoteUserNatMultiClient struct {
 	// until an entry goes stale.
 	staleAffinityIp4Paths map[Ip4Path]map[Ip4Path]bool
 	staleAffinityIp6Paths map[Ip6Path]map[Ip6Path]bool
-	clientUpdates         map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+	// Each group's entry writes in join time order, for the donor scan
+	// (ip_remote_multi_client_affinity_join_log.go). Written with the entries;
+	// nil until an entry is written.
+	affinityIp4JoinLogs map[Ip4Path]*affinityJoinLog[Ip4Path]
+	affinityIp6JoinLogs map[Ip6Path]*affinityJoinLog[Ip6Path]
+	clientUpdates       map[*multiClientChannel]map[*multiClientChannelUpdate]bool
 	// At most one live source-offer reservation per exact incumbent tuple.
 	// The synchronous sender owns its finite deadline and always joins it.
 	affinityTransitions map[*multiClientChannelUpdate]*multiClientAffinityTransition
@@ -4157,6 +4162,8 @@ func (self *RemoteUserNatMultiClient) rebuildAffinityDonorIndexesWithLock(includ
 	// every rebuilt entry names its tuple's current generation
 	self.staleAffinityIp4Paths = nil
 	self.staleAffinityIp6Paths = nil
+	self.affinityIp4JoinLogs = affinityJoinLogsOf(ip4)
+	self.affinityIp6JoinLogs = affinityJoinLogsOf(ip6)
 }
 
 // The one writer of a tuple's current generation (ip4PathUpdates). Replacing a
@@ -4203,7 +4210,8 @@ func (self *RemoteUserNatMultiClient) markStaleAffinityIp4WithLock(path Ip4Path,
 	}
 }
 
-// An index entry written by the tuple's current generation.
+// An index entry written by the tuple's current generation, and its record in
+// the group's join log.
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) joinAffinityIp4WithLock(group Ip4Path, path Ip4Path, joinTime time.Time) {
@@ -4215,11 +4223,21 @@ func (self *RemoteUserNatMultiClient) joinAffinityIp4WithLock(group Ip4Path, pat
 		paths = map[Ip4Path]time.Time{}
 		self.affinityIp4Paths[group] = paths
 	}
+	_, joined := paths[path]
 	paths[path] = joinTime
 	self.unmarkStaleAffinityIp4WithLock(group, path)
+	if self.affinityIp4JoinLogs == nil {
+		self.affinityIp4JoinLogs = map[Ip4Path]*affinityJoinLog[Ip4Path]{}
+	}
+	joinLog := self.affinityIp4JoinLogs[group]
+	if joinLog == nil {
+		joinLog = &affinityJoinLog[Ip4Path]{}
+		self.affinityIp4JoinLogs[group] = joinLog
+	}
+	joinLog.record(path, joinTime, !joined, self.reliabilitySettings().AffinityMaxTime)
 }
 
-// Removes an index entry, and the group once it is empty.
+// Removes an index entry, and the group with its join log once it is empty.
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) leaveAffinityIp4WithLock(group Ip4Path, path Ip4Path) {
@@ -4227,9 +4245,15 @@ func (self *RemoteUserNatMultiClient) leaveAffinityIp4WithLock(group Ip4Path, pa
 	if !ok {
 		return
 	}
-	delete(paths, path)
+	if _, joined := paths[path]; joined {
+		delete(paths, path)
+		if joinLog := self.affinityIp4JoinLogs[group]; joinLog != nil {
+			joinLog.entryCount -= 1
+		}
+	}
 	if len(paths) == 0 {
 		delete(self.affinityIp4Paths, group)
+		delete(self.affinityIp4JoinLogs, group)
 	}
 	self.unmarkStaleAffinityIp4WithLock(group, path)
 }
@@ -4296,8 +4320,18 @@ func (self *RemoteUserNatMultiClient) joinAffinityIp6WithLock(group Ip6Path, pat
 		paths = map[Ip6Path]time.Time{}
 		self.affinityIp6Paths[group] = paths
 	}
+	_, joined := paths[path]
 	paths[path] = joinTime
 	self.unmarkStaleAffinityIp6WithLock(group, path)
+	if self.affinityIp6JoinLogs == nil {
+		self.affinityIp6JoinLogs = map[Ip6Path]*affinityJoinLog[Ip6Path]{}
+	}
+	joinLog := self.affinityIp6JoinLogs[group]
+	if joinLog == nil {
+		joinLog = &affinityJoinLog[Ip6Path]{}
+		self.affinityIp6JoinLogs[group] = joinLog
+	}
+	joinLog.record(path, joinTime, !joined, self.reliabilitySettings().AffinityMaxTime)
 }
 
 // The v6 twin of leaveAffinityIp4WithLock.
@@ -4308,9 +4342,15 @@ func (self *RemoteUserNatMultiClient) leaveAffinityIp6WithLock(group Ip6Path, pa
 	if !ok {
 		return
 	}
-	delete(paths, path)
+	if _, joined := paths[path]; joined {
+		delete(paths, path)
+		if joinLog := self.affinityIp6JoinLogs[group]; joinLog != nil {
+			joinLog.entryCount -= 1
+		}
+	}
 	if len(paths) == 0 {
 		delete(self.affinityIp6Paths, group)
+		delete(self.affinityIp6JoinLogs, group)
 	}
 	self.unmarkStaleAffinityIp6WithLock(group, path)
 }
@@ -5197,7 +5237,7 @@ func betterAffinityDonor(
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *multiClientChannelUpdate, paths map[Ip4Path]time.Time) (donorVerdict, bool) {
-	return self.inheritAffinityClient4FromWithLock(update, paths, nil, false)
+	return self.inheritAffinityClient4FromWithLock(update, paths, nil, nil, false)
 }
 
 // The donor scan of one group of the affinity index, with the same result as
@@ -5208,11 +5248,19 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 // an affinity origin is never later than its update's creation, so the
 // member's selection is past AffinityMaxTime and selection.eligible refuses
 // it. A busy group holds every flow within its idle timeout, minutes of them,
-// while only the last AffinityMaxTime of them can donate.
+// while only the last AffinityMaxTime of them can donate, so the young
+// members are read from the newest end of the group's join log
+// (affinityDonorMembers).
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityGroupClient4WithLock(update *multiClientChannelUpdate, group Ip4Path) (donorVerdict, bool) {
-	return self.inheritAffinityClient4FromWithLock(update, self.affinityIp4Paths[group], self.staleAffinityIp4Paths[group], true)
+	return self.inheritAffinityClient4FromWithLock(
+		update,
+		self.affinityIp4Paths[group],
+		self.staleAffinityIp4Paths[group],
+		self.affinityIp4JoinLogs[group],
+		true,
+	)
 }
 
 // called with stateLock
@@ -5220,6 +5268,7 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4FromWithLock(
 	update *multiClientChannelUpdate,
 	paths map[Ip4Path]time.Time,
 	stalePaths map[Ip4Path]bool,
+	joinLog *affinityJoinLog[Ip4Path],
 	indexed bool,
 ) (donorVerdict, bool) {
 	// with AffinityStickyPastCap a donor at the flow cap still donates: the
@@ -5252,10 +5301,8 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4FromWithLock(
 	// see inheritAffinityGroupClient4WithLock; the early return above leaves
 	// AffinityMaxTime positive for an unpinned placement
 	passExpired := indexed && !update.pinned
-	for copyIp4Path, createTime := range paths {
-		if passExpired && reliabilitySettings.AffinityMaxTime <= now.Sub(createTime) && !stalePaths[copyIp4Path] {
-			continue
-		}
+	members := affinityDonorMembers(paths, stalePaths, joinLog, !passExpired, now, reliabilitySettings.AffinityMaxTime)
+	for copyIp4Path, createTime := range members {
 		copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]
 		if !ok {
 			continue
@@ -5328,14 +5375,20 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4FromWithLock(
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *multiClientChannelUpdate, paths map[Ip6Path]time.Time) (donorVerdict, bool) {
-	return self.inheritAffinityClient6FromWithLock(update, paths, nil, false)
+	return self.inheritAffinityClient6FromWithLock(update, paths, nil, nil, false)
 }
 
 // The v6 twin of inheritAffinityGroupClient4WithLock.
 //
 // called with stateLock
 func (self *RemoteUserNatMultiClient) inheritAffinityGroupClient6WithLock(update *multiClientChannelUpdate, group Ip6Path) (donorVerdict, bool) {
-	return self.inheritAffinityClient6FromWithLock(update, self.affinityIp6Paths[group], self.staleAffinityIp6Paths[group], true)
+	return self.inheritAffinityClient6FromWithLock(
+		update,
+		self.affinityIp6Paths[group],
+		self.staleAffinityIp6Paths[group],
+		self.affinityIp6JoinLogs[group],
+		true,
+	)
 }
 
 // called with stateLock
@@ -5343,6 +5396,7 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6FromWithLock(
 	update *multiClientChannelUpdate,
 	paths map[Ip6Path]time.Time,
 	stalePaths map[Ip6Path]bool,
+	joinLog *affinityJoinLog[Ip6Path],
 	indexed bool,
 ) (donorVerdict, bool) {
 	// see inheritAffinityClient4WithLock for the sticky, follow, pin, and
@@ -5367,10 +5421,8 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6FromWithLock(
 	var winnerSelection *multiClientAffinitySelection
 	winnerVerdict, scattered := donorRefused, false
 	passExpired := indexed && !update.pinned
-	for copyIp6Path, createTime := range paths {
-		if passExpired && reliabilitySettings.AffinityMaxTime <= now.Sub(createTime) && !stalePaths[copyIp6Path] {
-			continue
-		}
+	members := affinityDonorMembers(paths, stalePaths, joinLog, !passExpired, now, reliabilitySettings.AffinityMaxTime)
+	for copyIp6Path, createTime := range members {
 		copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]
 		if !ok {
 			continue
@@ -11633,6 +11685,8 @@ func (self *RemoteUserNatMultiClient) Close() {
 		clear(self.affinityIp6Paths)
 		clear(self.staleAffinityIp4Paths)
 		clear(self.staleAffinityIp6Paths)
+		clear(self.affinityIp4JoinLogs)
+		clear(self.affinityIp6JoinLogs)
 		clear(self.destinationServiceFailures)
 		clear(self.dnsExitHints)
 		clear(self.dnsAddressExitHints)
