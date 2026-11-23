@@ -13567,6 +13567,18 @@ paths:
         `signature_owed`, and `admin_set` says whether that statement needs k
         of n. `ur admin members remove` signs it beside this call.
 
+        Every auth key the member's user made in the team is revoked in the
+        same write, so none enrolls again if the same person later joins the
+        team anew: `revoked_auth_key_count` counts them, the account's security
+        notice lists them once, and each records an `auth_key.revoke` admin
+        event before the removal's `member.remove`. Revoking stops a key's
+        bearer only, so when one of them was pre-approved the answer sets
+        `bundle_still_admits` and `note`, which names
+        `ur admin delegations revoke`: a copy of its bundle still admits until
+        its Delegation ends, as `/network/auth-key-revoke` answers. A
+        `MemberRevoke` that lands in the log with no denial before it ends the
+        member's keys the same way.
+
         A member's credential reaches the route only with the members
         permission (`RolePermissionRefused`), and any other caller is refused
         403 "Only the team's Owners and Admins may remove members." A member
@@ -33155,6 +33167,15 @@ components:
         deactivated_client_count:
           description: The member's untagged clients the denial deactivated.
           type: integer
+        revoked_auth_key_count:
+          description: The auth keys the member's user made in the team, which the denial revoked.
+          type: integer
+        bundle_still_admits:
+          description: A revoked key was pre-approved, so a copy of its bundle still admits devices until its Delegation ends.
+          type: boolean
+        note:
+          description: Set with bundle_still_admits. What to do about the bundle, naming `ur admin delegations revoke`.
+          type: string
         signature_owed:
           description: Set on every removal. The removal is cryptographic only once an admin device signs the member's MemberRevoke.
           type: boolean
