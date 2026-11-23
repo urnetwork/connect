@@ -98,18 +98,24 @@ func TestWebRtcTestManagersHaveJoiningOwners(t *testing.T) {
 	if !ok {
 		t.Fatal("locate WebRTC test owner helper")
 	}
-	directory := filepath.Dir(helperPath)
-	entries, err := os.ReadDir(directory)
+	// go test runs in the package directory. Under -trimpath the caller's file
+	// is a module path that names no directory on disk, so the scan reads the
+	// working directory and knows the helper by its file name.
+	helperName := filepath.Base(helperPath)
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
+	helperFound := false
 	rawConstructorCount := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
 		}
-		path := filepath.Join(directory, entry.Name())
-		file, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if entry.Name() == helperName {
+			helperFound = true
+		}
+		file, parseErr := parser.ParseFile(token.NewFileSet(), entry.Name(), nil, 0)
 		if parseErr != nil {
 			t.Errorf("parse %s: %v", entry.Name(), parseErr)
 			continue
@@ -124,11 +130,14 @@ func TestWebRtcTestManagersHaveJoiningOwners(t *testing.T) {
 				return true
 			}
 			rawConstructorCount++
-			if path != helperPath {
+			if entry.Name() != helperName {
 				t.Errorf("%s constructs a test WebRTC manager without a joining owner", entry.Name())
 			}
 			return true
 		})
+	}
+	if !helperFound {
+		t.Fatalf("the working directory holds no %s; run from the package directory", helperName)
 	}
 	if rawConstructorCount != 1 {
 		t.Fatalf("raw test WebRTC manager constructors = %d, want only the joining helper", rawConstructorCount)
