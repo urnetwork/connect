@@ -12424,9 +12424,12 @@ paths:
         their secrets, which only their hash stores. A key's tags are opaque tag
         ids, never names.
 
-        In a team, the Owners and Admins list them (`RolePermissionKeys`);
-        any other member is refused by the role gate
-        (`RolePermissionRefused`).
+        In a team every member lists keys, whatever its role
+        (`RolePermissionOwnDevices`): the Owners and Admins every key of the
+        network (`RolePermissionKeys`), and any other member only the keys it
+        created, never another member's. A member whose role cannot be read is
+        refused 403. A credential's scopes cut its role: only `auth_keys` and
+        `all` reach this route.
       operationId: networkAuthKeys
       security:
         - BearerAuth: []
@@ -12458,11 +12461,23 @@ paths:
 
         In a team every member creates keys for its own devices, whatever its
         role (`RolePermissionOwnDevices`): an untagged key that is not
-        pre-approved, which enrolls a device the member owns. A tagged or a
+        pre-approved, which enrolls a device the member owns. Any tagged or
         pre-approved key takes the keys permission, an Owner's or an Admin's
-        role; any other member's is refused 403 and creates nothing, as is
-        every key of a member whose role cannot be read. A credential's scopes
-        cut its role: only `auth_keys` and `all` reach this route.
+        role. A Network admin's keys for owned tags (`RolePermissionOwnedTagKeys`)
+        take a tagged key, pre-approved or not, whose every tag the network's
+        `tagOwners` name the Network admin an owner of at the newest verified
+        state of the network's log; a tag only another member owns, a tag no
+        state holds and a pre-approved key with no tag are refused. Any other
+        member's tagged or pre-approved key is refused 403 and creates nothing,
+        as is every key of a member whose role cannot be read, and 503 answers
+        a tagged key of a Network admin while the log cannot be read. A
+        credential's scopes cut its role: only `auth_keys` and `all` reach this
+        route.
+
+        Enrollment asks the creator's role again: a tagged or pre-approved key
+        enrolls only while its creator's role still holds the keys permission,
+        or, for a Network admin's tagged key, keys for owned tags while the
+        network's `tagOwners` still name it an owner of every tag of the key.
       operationId: networkAuthKeyCreate
       security:
         - BearerAuth: []
@@ -12494,9 +12509,13 @@ paths:
         `DelegationRevoke` statement from a device.
 
         Revoking a key sends the account's security notice and records an admin
-        event. In a team, the Owners and Admins revoke keys
-        (`RolePermissionKeys`); any other member is refused by the role gate
-        (`RolePermissionRefused`).
+        event. In a team every member revokes keys, whatever its role
+        (`RolePermissionOwnDevices`): the Owners and Admins any key of the
+        network (`RolePermissionKeys`), and any other member only a key it
+        created; another member's key answers `error` as no such key and stays,
+        so the answer tells nothing of whose keys exist. A member whose role
+        cannot be read is refused 403. A credential's scopes cut its role: only
+        `auth_keys` and `all` reach this route.
       operationId: networkAuthKeyRevoke
       security:
         - BearerAuth: []
@@ -17711,13 +17730,14 @@ components:
         The bearer is a team member's credential, and the member's role, cut
         by the credential's scopes, does not hold the permission this route
         asks: Owners hold all but the network's own account; Admins members,
-        settings, devices, policy, keys and reads; Network admins policy and
-        reads; IT admins devices and reads; Billing admins billing and reads;
-        Auditors reads; Members their own credential only. A route no
-        permission maps is the Owner's. The route did nothing. The body is the
-        plain text message "Your role in this network does not permit this
-        route." It is 403, not 401: the credential is good, its role is not
-        enough.
+        settings, devices, policy, keys and reads; Network admins policy, keys
+        for the tags they own and reads; IT admins devices and reads; Billing
+        admins billing and reads; Auditors reads; Members their own credential
+        only; and every role its own auth keys, for its own devices, to list
+        and to revoke. A route no permission maps is the Owner's. The route
+        did nothing. The body is the plain text message "Your role in this
+        network does not permit this route." It is 403, not 401: the
+        credential is good, its role is not enough.
       content:
         text/plain:
           schema:
