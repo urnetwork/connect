@@ -673,40 +673,42 @@ func TestH3ModeGroupHoldJoinsItsRunnersBeforeParking(t *testing.T) {
 
 // A pass of the H3 mode group that panics once its runners started still
 // joins them: its join is deferred, so the transport is not done while a
-// runner still runs. The runners, stopped by the pass's end, are held until
-// the test has seen the transport still running.
+// runner still runs. The transport runs in a synctest bubble, and the runners,
+// stopped by the pass's end, are held until everything else in the bubble is
+// blocked, by which point the panic's recovery would have ended the transport
+// had the pass not waited for them.
 func TestH3ModeGroupPanicInAPassJoinsItsRunners(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	runner := newH3ModeGroupTestRunner()
-	runner.release = make(chan struct{})
-	var releaseOnce sync.Once
-	defer releaseOnce.Do(func() { close(runner.release) })
-	var passCount atomic.Int32
-	transport, labelValue := newH3ModeGroupTestTransport(t, ctx, runner, func(settings *PlatformTransportSettings) {
-		settings.h3ModeGroupWaitForTest = func() {
-			if passCount.Add(1) == 1 {
-				panic("goroutine join test: the H3 mode group's pass panics")
+		runner := newH3ModeGroupTestRunner()
+		runner.release = make(chan struct{})
+		// a failed check still lets the held runners end, so the bubble does
+		releaseRunners := sync.OnceFunc(func() { close(runner.release) })
+		defer releaseRunners()
+		var passCount atomic.Int32
+		transport, labelValue := newH3ModeGroupTestTransport(t, ctx, runner, func(settings *PlatformTransportSettings) {
+			settings.h3ModeGroupWaitForTest = func() {
+				if passCount.Add(1) == 1 {
+					panic("goroutine join test: the H3 mode group's pass panics")
+				}
 			}
+		})
+		runner.wait(t, runner.stopped, 2, "stopped")
+		synctest.Wait()
+		select {
+		case <-transport.Done():
+			t.Fatal("the transport finished while its H3 mode runners still ran")
+		default:
+		}
+
+		releaseRunners()
+		<-transport.Done()
+		if n := goroutineJoinTestFrameCount(t, labelValue, h3ModeGroupTestRunnerFrame); n != 0 {
+			t.Fatalf("%d H3 mode runners left once the transport was done, want 0", n)
 		}
 	})
-	runner.wait(t, runner.stopped, 2, "stopped")
-	select {
-	case <-transport.Done():
-		t.Fatal("the transport finished while its H3 mode runners still ran")
-	default:
-	}
-
-	releaseOnce.Do(func() { close(runner.release) })
-	select {
-	case <-transport.Done():
-	case <-time.After(goroutineJoinTestWait):
-		t.Fatal("the transport did not end after its H3 mode group's pass panicked")
-	}
-	if n := goroutineJoinTestFrameCount(t, labelValue, h3ModeGroupTestRunnerFrame); n != 0 {
-		t.Fatalf("%d H3 mode runners left once the transport was done, want 0", n)
-	}
 }
 
 // Closes only when the test releases it, and reports that its close began.
@@ -776,6 +778,9 @@ func TestRaceH3DialJoinsALoserThatCompletesAfterTheWinner(t *testing.T) {
 			started:      make(chan int, 2),
 			canceled:     make(chan int, 2),
 		}
+		// a failed check still lets the held close end, so the bubble does
+		releaseLoserClose := sync.OnceFunc(func() { close(loserConn.closeRelease) })
+		defer releaseLoserClose()
 		raceDone := make(chan struct{})
 		var winner *h3DialAttempt
 		var raceErr error
@@ -796,7 +801,7 @@ func TestRaceH3DialJoinsALoserThatCompletesAfterTheWinner(t *testing.T) {
 		default:
 		}
 
-		close(loserConn.closeRelease)
+		releaseLoserClose()
 		<-raceDone
 		if raceErr != nil {
 			t.Fatalf("race = %v", raceErr)
@@ -831,6 +836,9 @@ func TestRaceH3DialEndedByItsContextJoinsEveryDial(t *testing.T) {
 			canceled:  make(chan int, 2),
 			release:   make(chan struct{}),
 		}
+		// a failed check still lets the held dials end, so the bubble does
+		releaseDials := sync.OnceFunc(func() { close(dialer.release) })
+		defer releaseDials()
 		raceDone := make(chan struct{})
 		var raceErr error
 		labelValue := goroutineJoinTestLabeled(ctx, func(ctx context.Context) {
@@ -858,7 +866,7 @@ func TestRaceH3DialEndedByItsContextJoinsEveryDial(t *testing.T) {
 		default:
 		}
 
-		close(dialer.release)
+		releaseDials()
 		<-raceDone
 		if !errors.Is(raceErr, context.Canceled) {
 			t.Fatalf("race = %v, want its context's end", raceErr)
