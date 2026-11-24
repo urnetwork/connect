@@ -1210,7 +1210,9 @@ func TestPlatformTransportH3AgnosticRaceSkipsBlackholedFamily(t *testing.T) {
 }
 
 // raceH3Dial launches the next candidate immediately on a definitive failure
-// and closes a loser that completes after the winner.
+// and never closes its winner. A loser that completes after the winner is
+// closed before the race returns, which
+// TestRaceH3DialJoinsALoserThatCompletesAfterTheWinner holds.
 func TestRaceH3DialLaunchesNextOnFailureAndClosesLosers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1259,19 +1261,10 @@ func TestRaceH3DialLaunchesNextOnFailureAndClosesLosers(t *testing.T) {
 	if len(launched) < 2 || launched[0] != 1 || launched[1] != 2 {
 		t.Fatalf("launch order = %v", launched)
 	}
-	// a third candidate may have launched on the stagger; if it completes
-	// late it is closed, and the winner never is
+	// a third candidate launches on the stagger only once it has run, which
+	// the elapsed check rules out; it would have been canceled and joined
+	// before the race returned. The winner is never closed.
 	close(lateRelease)
-	if len(launched) == 3 {
-		select {
-		case port := <-closed:
-			if port != 3 {
-				t.Fatalf("closed port %d, want the late loser 3", port)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("the late loser was not closed")
-		}
-	}
 	select {
 	case port := <-closed:
 		t.Fatalf("unexpected close of port %d", port)

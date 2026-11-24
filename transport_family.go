@@ -983,13 +983,22 @@ func orderControlIPAddrs(addrs []net.IPAddr) []net.IPAddr {
 }
 
 // h3DialAttempt is one QUIC connection in the making: its socket, transport
-// and connection. Ownership is single: close releases all three.
+// and connection. Ownership is single: close releases all three, and returns
+// once the attempt's handshake watch, if it has one, has returned.
 type h3DialAttempt struct {
 	udpAddr       *net.UDPAddr
 	packetConn    net.PacketConn
 	quicTransport *quic.Transport
 	conn          *quic.Conn
-	egressPinned  bool
+	// closes when the goroutine that records the connection's handshake
+	// outcome has returned (dialH3); nil when it has none. It ends with the
+	// connection, which close closes first.
+	handshakeWatchDone chan struct{}
+	// Nil outside package tests: the transport's
+	// h3HandshakeWatchJoinForTest, which close calls right before it waits
+	// for the handshake watch.
+	handshakeWatchJoinForTest func()
+	egressPinned              bool
 	// an extender relays the attempt's datagrams and resolves its destination
 	// name itself
 	relayed bool
@@ -1003,6 +1012,20 @@ func (self *h3DialAttempt) close() {
 	if self == nil {
 		return
 	}
+	// The handshake watch ends when the connection's context does, which
+	// CloseWithError has ended by the time it returns. The join is deferred,
+	// so a close that panics still makes it, and it comes after the releases,
+	// as the watch holds none of them. Nothing the watch runs waits for the
+	// attempt, so the join is never its own.
+	defer func() {
+		if self.handshakeWatchDone == nil {
+			return
+		}
+		if self.handshakeWatchJoinForTest != nil {
+			self.handshakeWatchJoinForTest()
+		}
+		<-self.handshakeWatchDone
+	}()
 	if self.conn != nil {
 		self.conn.CloseWithError(0, "")
 	}
@@ -1092,9 +1115,9 @@ func (self *PlatformTransport) openH3PacketConn(
 // raceH3Dial is Happy Eyeballs for QUIC: candidates launch in order, each
 // after platformH3FamilyRaceStagger or immediately after the previous one
 // fails definitively, and the first confirmed handshake wins. Losers are
-// cancelled and closed, including any that complete after the winner. The
-// returned error when nothing wins is the first candidate's error, which
-// names the preferred family's failure.
+// cancelled and closed, including any that complete after the winner, before
+// the race returns. The returned error when nothing wins is the first
+// candidate's error, which names the preferred family's failure.
 func raceH3Dial(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
@@ -1105,6 +1128,14 @@ func raceH3Dial(
 
 // The first family starts the existing confirmed-handshake race. DNS workers
 // are joined on return; late candidates retain the ordinary fallback stagger.
+//
+// Every dial goroutine the race starts has returned by the time it does, on
+// every path: a deferred finish cancels the attempts still running and takes
+// each one's result, closing every attempt but the winner, so a panic here
+// joins them too. As in raceH3DialWithMemoryProgressive and
+// raceAltQuicDialProgressive, the winner waits for its losers' cleanup, which
+// their cancellation bounds. The race runs nothing a dial waits for, so the
+// join is never a dial's own.
 func raceH3DialProgressive(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
@@ -1123,32 +1154,35 @@ func raceH3DialProgressive(
 	results := make(chan raceResult, len(candidates))
 	cancels := make([]context.CancelFunc, 0, len(candidates))
 	launched := 0
+	// the launched attempts whose result the race has not taken
+	pending := 0
 	launch := func() {
 		attemptCtx, cancel := context.WithCancel(ctx)
 		cancels = append(cancels, cancel)
 		udpAddr := candidates[launched]
 		launched += 1
+		pending += 1
+		// sending its result is the goroutine's last act, so taking the
+		// result joins it
 		go func() {
 			attempt, err := dial(attemptCtx, udpAddr)
 			results <- raceResult{attempt: attempt, err: err}
 		}()
 	}
-	finish := func(pending int) {
+	defer func() {
 		for _, cancel := range cancels {
 			cancel()
 		}
 		// every launched attempt reports exactly once; a loser that completes
 		// after the winner is closed here rather than leaked
-		go func() {
-			for range pending {
-				result := <-results
-				result.attempt.close()
-			}
-		}()
-	}
+		for 0 < pending {
+			result := <-results
+			pending -= 1
+			result.attempt.close()
+		}
+	}()
 
 	launch()
-	pending := 1
 	var firstErr error
 	staggerReady := false
 	stagger := time.NewTimer(platformH3FamilyRaceStagger)
@@ -1158,7 +1192,7 @@ func raceH3DialProgressive(
 		case result := <-results:
 			pending -= 1
 			if result.err == nil {
-				finish(pending)
+				// the deferred finish cancels and closes the losers
 				return result.attempt, nil
 			}
 			if firstErr == nil {
@@ -1166,7 +1200,6 @@ func raceH3DialProgressive(
 			}
 			if launched < len(candidates) {
 				launch()
-				pending += 1
 				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
 			} else if pending == 0 && resolution == nil {
@@ -1176,7 +1209,6 @@ func raceH3DialProgressive(
 			staggerReady = true
 			if launched < len(candidates) {
 				launch()
-				pending += 1
 				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
 			}
@@ -1185,14 +1217,12 @@ func raceH3DialProgressive(
 			resolution = source.resultChannel()
 			if launched < len(candidates) && (pending == 0 || staggerReady) {
 				launch()
-				pending++
 				staggerReady = false
 				stagger.Reset(platformH3FamilyRaceStagger)
 			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
 		case <-ctx.Done():
-			finish(pending)
 			if firstErr != nil {
 				return nil, firstErr
 			}
@@ -1223,6 +1253,9 @@ type FamilyPlatformTransportGroupSettings struct {
 	// Nil outside package tests. Replaces the uniform draw of the release's
 	// spread, given StandbyJitter. Its result is held to [0, StandbyJitter).
 	standbyJitterForTest func(maxJitter time.Duration) time.Duration
+	// Nil outside package tests. Called each time the group's run loop has
+	// evaluated the standby and is about to wait for a change.
+	runWaitForTest func()
 }
 
 func DefaultFamilyPlatformTransportGroupSettings() *FamilyPlatformTransportGroupSettings {
@@ -1256,7 +1289,9 @@ type FamilyPlatformTransportGroup struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
-	done   chan struct{}
+	// closes once the run loop has returned and every transport and owned
+	// strategy has finished
+	done chan struct{}
 
 	settings *FamilyPlatformTransportGroupSettings
 
@@ -1386,6 +1421,23 @@ func NewFamilyPlatformTransportGroup(
 
 	go HandleError(func() {
 		defer close(group.done)
+		// The transports and the owned strategies end with the group's
+		// context, and the group is done only once they have, so Done is one
+		// channel and waits for no goroutine of its own. The join is deferred,
+		// so a panic in run still makes it, and it cancels first, as the
+		// recovery's cancel comes only after it. Nothing a transport or a
+		// strategy runs waits for the group, so this join is never its own.
+		defer func() {
+			cancel()
+			for _, transport := range group.Transports() {
+				<-transport.Done()
+			}
+			for _, strategy := range []*ClientStrategy{group.ipv4Strategy, group.ipv6Strategy} {
+				if strategy != nil && strategy.contextCloseDone != nil {
+					<-strategy.contextCloseDone
+				}
+			}
+		}()
 		group.run()
 	}, cancel)
 	return group
@@ -1400,13 +1452,22 @@ func (self *FamilyPlatformTransportGroup) standbyDelayAfterLoss() time.Duration 
 }
 
 // run drives the standby from the pinned transports' connected state and fans
-// the three connected notifications into one.
+// the three connected notifications into one. The group's transports are set
+// at construction, so it waits on their notifications in one select and
+// starts no goroutine: a transport the group lacks leaves its channel nil,
+// which never fires.
 func (self *FamilyPlatformTransportGroup) run() {
 	for {
-		notifies := []chan struct{}{}
-		for _, transport := range self.Transports() {
-			notifies = append(notifies, transport.connectedMonitor.NotifyChannel())
+		// captured before the state they notify for is read
+		var ipv4Notify <-chan struct{}
+		if self.ipv4Transport != nil {
+			ipv4Notify = self.ipv4Transport.connectedMonitor.NotifyChannel()
 		}
+		var ipv6Notify <-chan struct{}
+		if self.ipv6Transport != nil {
+			ipv6Notify = self.ipv6Transport.connectedMonitor.NotifyChannel()
+		}
+		standbyNotify := self.standbyTransport.connectedMonitor.NotifyChannel()
 
 		var timer <-chan time.Time
 		var stopTimer func()
@@ -1455,31 +1516,22 @@ func (self *FamilyPlatformTransportGroup) run() {
 			}
 		}()
 
-		wake := make(chan struct{})
-		var wakeOnce sync.Once
-		for _, notify := range notifies {
-			go func(notify chan struct{}) {
-				select {
-				case <-notify:
-					wakeOnce.Do(func() { close(wake) })
-				case <-wake:
-				case <-self.ctx.Done():
-				}
-			}(notify)
+		if self.settings.runWaitForTest != nil {
+			self.settings.runWaitForTest()
 		}
 		select {
 		case <-self.ctx.Done():
-			wakeOnce.Do(func() { close(wake) })
 			if stopTimer != nil {
 				stopTimer()
 			}
 			return
-		case <-wake:
-			if stopTimer != nil {
-				stopTimer()
-			}
+		case <-ipv4Notify:
+		case <-ipv6Notify:
+		case <-standbyNotify:
 		case <-timer:
-			wakeOnce.Do(func() { close(wake) })
+		}
+		if stopTimer != nil {
+			stopTimer()
 		}
 	}
 }
@@ -1620,7 +1672,10 @@ func (self *FamilyPlatformTransportGroup) ClientLimitBackoff() *ClientLimitBacko
 	return self.standbyTransport.clientLimitBackoff
 }
 
-// Close stops every transport and the owned strategies. Nonblocking.
+// Close stops every transport and the owned strategies. It waits for no
+// transport's workers, so a callback a transport runs may call it; a strategy's
+// close waits only for its own context goroutine, which waits for nothing the
+// group runs.
 func (self *FamilyPlatformTransportGroup) Close() {
 	self.cancel()
 	for _, transport := range self.Transports() {
@@ -1634,20 +1689,14 @@ func (self *FamilyPlatformTransportGroup) Close() {
 	}
 }
 
-// Done closes after the controller and every transport have finished.
+// Done closes after the controller, every transport and the owned strategies
+// have finished.
 func (self *FamilyPlatformTransportGroup) Done() <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		<-self.done
-		for _, transport := range self.Transports() {
-			<-transport.Done()
-		}
-		close(done)
-	}()
-	return done
+	return self.done
 }
 
-// CloseAndWait closes and joins, bounded by ctx.
+// CloseAndWait closes and joins, bounded by ctx. A callback a transport runs
+// must not call it: the join would wait for that callback.
 func (self *FamilyPlatformTransportGroup) CloseAndWait(ctx context.Context) error {
 	self.Close()
 	select {
@@ -2093,31 +2142,44 @@ func (self *PlatformTransport) dialH3(
 	// the attempt open until QUIC confirms the handshake or the connection
 	// dies; otherwise an Initial blackhole after a 0-RTT dial is falsely
 	// counted as a success and never reaches the no-response signal.
+	//
+	// The watch is the attempt's: it outlives the dial when the handshake
+	// is still open, ends when the connection does, and the attempt's close,
+	// which closes the connection, waits for it.
 	if handshakeAttempt != nil {
-		go func() {
+		watch := func() {
 			handshakeComplete := conn.HandshakeComplete()
 			select {
 			case <-handshakeComplete:
 				handshakeAttempt.finish(true)
 			case <-conn.Context().Done():
-				// If both channels closed together, handshake completion wins.
 				select {
 				case <-handshakeComplete:
+					// If both channels closed together, handshake completion wins.
 					handshakeAttempt.finish(true)
-					return
 				default:
-				}
-				handshakeAttempt.finish(false)
-				if handshakeAttempt.sentWithoutResponse() {
-					self.log.Infof(
-						"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
-						ptMode,
-						handshakeAttempt.sent.Load(),
-						handshakeAttempt.pto.Load(),
-						context.Cause(conn.Context()),
-					)
+					handshakeAttempt.finish(false)
+					if handshakeAttempt.sentWithoutResponse() {
+						self.log.Infof(
+							"[c]h3 handshake no response mode=%s sent_packets=%d pto=%d err=%s\n",
+							ptMode,
+							handshakeAttempt.sent.Load(),
+							handshakeAttempt.pto.Load(),
+							context.Cause(conn.Context()),
+						)
+					}
 				}
 			}
+			if self.settings.h3HandshakeWatchExitForTest != nil {
+				self.settings.h3HandshakeWatchExitForTest()
+			}
+		}
+		handshakeWatchDone := make(chan struct{})
+		attempt.handshakeWatchDone = handshakeWatchDone
+		attempt.handshakeWatchJoinForTest = self.settings.h3HandshakeWatchJoinForTest
+		go func() {
+			defer close(handshakeWatchDone)
+			watch()
 		}()
 	}
 	if confirm {

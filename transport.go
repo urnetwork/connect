@@ -873,6 +873,26 @@ type PlatformTransportSettings struct {
 	// joined run and is about to wait for a pinned transport's family hold
 	// watcher, before done closes.
 	familyHoldWatcherJoinForTest func()
+	// Nil outside package tests. Called each time a pass of the H3 mode group
+	// (startH3ModeGroup) has started its runners and is about to wait for the
+	// transport's close, a preemption or a hold.
+	h3ModeGroupWaitForTest func()
+	// Nil outside package tests. Called once by a dial's kick watch
+	// (cancelOnKick) when it has seen the kick, the dial's end or its stop,
+	// right before it returns, so a test can hold it while the stop goes on.
+	dialKickWatchExitForTest func()
+	// Nil outside package tests. Called once by a dial kick watch's stop when
+	// it has told the watch to stop, right before it waits for the watch.
+	dialKickWatchJoinForTest func()
+	// Nil outside package tests. Called once by an H3 dial attempt's handshake
+	// watch (dialH3) when it has recorded the handshake's outcome, right
+	// before it returns, so a test can hold it while the attempt's close goes
+	// on.
+	h3HandshakeWatchExitForTest func()
+	// Nil outside package tests. Called once by an H3 dial attempt's close
+	// when it has closed the connection, right before it waits for the
+	// attempt's handshake watch.
+	h3HandshakeWatchJoinForTest func()
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -1376,8 +1396,11 @@ func (self *PlatformTransport) kicked(generation uint64) bool {
 }
 
 // cancelOnKick cancels a dial when the transport is kicked after
-// `generation`. The returned stop ends the watch without canceling; call it
-// once the dial returns.
+// `generation`. The returned stop ends the watch without canceling and
+// returns once the watch goroutine has returned; call it once the dial
+// returns, in a defer so a panicking dial still joins the watch. The watch
+// runs only the dial's cancel, which waits for nothing, so a stop never waits
+// for its own caller. A later stop returns once the first one has.
 func (self *PlatformTransport) cancelOnKick(
 	ctx context.Context,
 	generation uint64,
@@ -1385,18 +1408,29 @@ func (self *PlatformTransport) cancelOnKick(
 ) (stop func()) {
 	kick := self.kickedSince(generation)
 	stopped := make(chan struct{})
-	go HandleError(func() {
-		select {
-		case <-kick:
-			cancel()
-		case <-ctx.Done():
-		case <-stopped:
-		}
-	})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		HandleError(func() {
+			select {
+			case <-kick:
+				cancel()
+			case <-ctx.Done():
+			case <-stopped:
+			}
+			if self.settings.dialKickWatchExitForTest != nil {
+				self.settings.dialKickWatchExitForTest()
+			}
+		})
+	}()
 	var stopOnce sync.Once
 	return func() {
 		stopOnce.Do(func() {
 			close(stopped)
+			if self.settings.dialKickWatchJoinForTest != nil {
+				self.settings.dialKickWatchJoinForTest()
+			}
+			<-watchDone
 		})
 	}
 }
@@ -2121,6 +2155,16 @@ func isH3TransportMode(mode TransportMode) bool {
 	}
 }
 
+// startH3ModeGroup runs the H3 modes as one group under the H3 budget lease,
+// stopping and restarting them on a preemption or a hold. Each pass joins the
+// runners it started before it yields the lease or returns, in a deferred join
+// that a panic still makes. The runners wait for nothing of the group, so the
+// join is never their own.
+//
+// The pass waits on the transport's context rather than on its runners'
+// returns: a runner that returns while its group goes on cancels the
+// transport, by its own fail-closed cancel or by its recovery's, so the
+// context ends whenever they all have.
 func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool) {
 	if len(modes) == 0 {
 		return
@@ -2139,61 +2183,61 @@ func (self *PlatformTransport) startH3ModeGroup(modes []TransportMode, auto bool
 				return
 			}
 
-			groupCtx, cancelGroup := context.WithCancel(self.ctx)
-			if self.h3NestedBudget != nil {
-				groupCtx = context.WithValue(groupCtx, platformTransportNestedBudgetContextKey{}, self.h3NestedBudget)
-			}
-			var waitGroup sync.WaitGroup
-			for _, mode := range modes {
-				mode := mode
-				initialDelay := time.Duration(0)
-				if auto {
-					initialDelay = self.modeInitialDelay(mode)
+			preempted, heldNow := func() (bool, bool) {
+				groupCtx, cancelGroup := context.WithCancel(self.ctx)
+				if self.h3NestedBudget != nil {
+					groupCtx = context.WithValue(groupCtx, platformTransportNestedBudgetContextKey{}, self.h3NestedBudget)
 				}
-				waitGroup.Add(1)
-				go HandleError(func() {
-					defer waitGroup.Done()
-					self.runH3Mode(groupCtx, mode, initialDelay)
-					// A carrier runner is normally process-lifetime. Preserve the old
-					// fail-closed behavior for an unexpected return, but not for an
-					// intentional budget preemption of this H3 group.
-					if groupCtx.Err() == nil {
-						self.cancel()
+				var waitGroup sync.WaitGroup
+				defer func() {
+					cancelGroup()
+					waitGroup.Wait()
+				}()
+				for _, mode := range modes {
+					mode := mode
+					initialDelay := time.Duration(0)
+					if auto {
+						initialDelay = self.modeInitialDelay(mode)
 					}
-				}, self.cancel)
-			}
-			groupDone := make(chan struct{})
-			go func() {
-				waitGroup.Wait()
-				close(groupDone)
-			}()
+					waitGroup.Add(1)
+					go HandleError(func() {
+						defer waitGroup.Done()
+						self.runH3Mode(groupCtx, mode, initialDelay)
+						// A carrier runner is normally process-lifetime. Preserve the old
+						// fail-closed behavior for an unexpected return, but not for an
+						// intentional budget preemption of this H3 group.
+						if groupCtx.Err() == nil {
+							self.cancel()
+						}
+					}, self.cancel)
+				}
 
-			var preempt <-chan struct{}
-			if reservation != nil {
-				preempt = reservation.PreemptNotify()
-			}
-			// a hold (the owner disabled the transport, or a pinned family
-			// went away) stops the runners and yields the optional lease
-			// exactly like a preemption, so a parked transport retains no H3
-			// working set. The runners restart when the hold lifts.
-			held, holdNotify := self.heldNotify()
-			if held {
-				closed := make(chan struct{})
-				close(closed)
-				holdNotify = closed
-			}
-			preempted := false
-			heldNow := false
-			select {
-			case <-self.ctx.Done():
-			case <-groupDone:
-			case <-preempt:
-				preempted = true
-			case <-holdNotify:
-				heldNow = true
-			}
-			cancelGroup()
-			waitGroup.Wait()
+				var preempt <-chan struct{}
+				if reservation != nil {
+					preempt = reservation.PreemptNotify()
+				}
+				// a hold (the owner disabled the transport, or a pinned family
+				// went away) stops the runners and yields the optional lease
+				// exactly like a preemption, so a parked transport retains no H3
+				// working set. The runners restart when the hold lifts.
+				held, holdNotify := self.heldNotify()
+				if held {
+					closed := make(chan struct{})
+					close(closed)
+					holdNotify = closed
+				}
+				if self.settings.h3ModeGroupWaitForTest != nil {
+					self.settings.h3ModeGroupWaitForTest()
+				}
+				select {
+				case <-self.ctx.Done():
+					return false, false
+				case <-preempt:
+					return true, false
+				case <-holdNotify:
+					return false, true
+				}
+			}()
 			if self.ctx.Err() != nil || (!preempted && !heldNow) {
 				return
 			}
@@ -2673,18 +2717,18 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// (the strategy observes delivery through it), so it ends with this
 		// iteration.
 		dialCtx, cancelDial := context.WithCancel(self.ctx)
-		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
 		moveAttempt = self.moveDialAttempt(moveTargetAttempted)
-		var ws H1MessageConn
-		var err error
-		if self.log.V(2).Enabled() {
-			ws, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (H1MessageConn, error) {
-				return connect(dialCtx)
-			})
-		} else {
-			ws, err = connect(dialCtx)
-		}
-		stopDialKickWatch()
+		ws, err := func() (H1MessageConn, error) {
+			// the kick watch is joined when the dial returns, and also when
+			// it panics
+			defer self.cancelOnKick(dialCtx, kickGeneration, cancelDial)()
+			if self.log.V(2).Enabled() {
+				return TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (H1MessageConn, error) {
+					return connect(dialCtx)
+				})
+			}
+			return connect(dialCtx)
+		}()
 		releaseReconnect()
 		// a kick during the dial: the attempt was made on the path that changed
 		kickedDuringDial := self.kicked(kickGeneration)
@@ -3795,21 +3839,21 @@ func (self *PlatformTransport) runH3(
 		// a kick cancels the dial, as in the h1 loop; the connection keeps
 		// the context until this iteration ends
 		dialCtx, cancelDial := context.WithCancel(attemptCtx)
-		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
 		moveAttempt = nil
 		if ptMode == TransportModeH3 {
 			moveAttempt = self.moveDialAttempt(moveTargetAttempted)
 		}
-		var connStream *ConnStream
-		var err error
-		if self.log.V(2).Enabled() {
-			connStream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (*ConnStream, error) {
-				return connect(dialCtx)
-			})
-		} else {
-			connStream, err = connect(dialCtx)
-		}
-		stopDialKickWatch()
+		connStream, err := func() (*ConnStream, error) {
+			// the kick watch is joined when the dial returns, and also when
+			// it panics
+			defer self.cancelOnKick(dialCtx, kickGeneration, cancelDial)()
+			if self.log.V(2).Enabled() {
+				return TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (*ConnStream, error) {
+					return connect(dialCtx)
+				})
+			}
+			return connect(dialCtx)
+		}()
 		releaseReconnect()
 		// a kick during the dial: the attempt was made on the path that changed
 		kickedDuringDial := self.kicked(kickGeneration)

@@ -180,6 +180,14 @@ type ClientStrategySettings struct {
 	// and nothing else. The zero address is the ordinary strategy.
 	pinnedExtenderIp netip.Addr
 
+	// Nil outside package tests. Called once by the goroutine that closes the
+	// strategy when its context ends, after that close and right before the
+	// goroutine returns, so a test can hold it while Close goes on.
+	contextCloseExitForTest func()
+	// Nil outside package tests. Called by Close once the strategy is closed,
+	// right before Close waits for that goroutine.
+	contextCloseJoinForTest func()
+
 	// AltUrl enables the two api alt dialers (L4). Only its host and explicit
 	// port are read: the alt host decides where the packets go, while the
 	// request's own host name stays the sni and the certificate is verified
@@ -325,6 +333,10 @@ type ClientStrategy struct {
 	unsubNetworkChange func()
 	unsubMemoryShed    func()
 	log                Logger
+	// closes when the goroutine NewClientStrategy starts, which closes the
+	// strategy once its context ends, has returned. Close waits for it. Nil on
+	// a strategy built without NewClientStrategy, which runs none.
+	contextCloseDone chan struct{}
 
 	settings *ClientStrategySettings
 	// A copy of the settings as the caller passed them, which a direct-only
@@ -642,10 +654,23 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
 	clientStrategy.unsubNetworkChange = unsubNetworkChange
 	clientStrategy.unsubMemoryShed = AddMemoryShedder(clientStrategy.shedMemory)
-	go HandleError(func() {
-		<-strategyCtx.Done()
-		clientStrategy.Close()
-	})
+	// closes the strategy when its context ends, for an owner that ends it by
+	// canceling the context rather than calling Close. Close waits for it, so
+	// it waits for nothing of Close's: only for the close itself, which runs
+	// once (close). The done channel closes outside the recovery, so it closes
+	// last.
+	contextCloseDone := make(chan struct{})
+	clientStrategy.contextCloseDone = contextCloseDone
+	go func() {
+		defer close(contextCloseDone)
+		HandleError(func() {
+			<-strategyCtx.Done()
+			clientStrategy.close()
+			if settings.contextCloseExitForTest != nil {
+				settings.contextCloseExitForTest()
+			}
+		})
+	}()
 	return clientStrategy
 }
 
@@ -683,9 +708,34 @@ func (self *ClientStrategy) shedMemory() {
 	}
 }
 
-// Ends discovery and releases pooled HTTP connections. APIs and transports
-// sharing the strategy must be closed first; repeated calls are safe.
+// Ends discovery and releases pooled HTTP connections, and returns once the
+// goroutine that closes the strategy when its context ends has returned. APIs
+// and transports sharing the strategy must be closed first; repeated calls
+// are safe. That goroutine waits only for the close itself, so Close may be
+// called from any goroutine but one the close runs: its dialers' and DoH
+// resolver's own work.
 func (self *ClientStrategy) Close() {
+	// The join is deferred, so a close that panics still makes it. It cancels
+	// first: the close's own cancel ends the goroutine's wait, and this one
+	// ends it too when the close panicked before it got there.
+	defer func() {
+		if self.contextCloseDone == nil {
+			return
+		}
+		if self.cancel != nil {
+			self.cancel()
+		}
+		if self.settings != nil && self.settings.contextCloseJoinForTest != nil {
+			self.settings.contextCloseJoinForTest()
+		}
+		<-self.contextCloseDone
+	}()
+	self.close()
+}
+
+// The close that Close and the end of the strategy's context share. It runs
+// once; a second caller waits for the first one's to finish.
+func (self *ClientStrategy) close() {
 	self.closeOnce.Do(func() {
 		dialers := func() []*clientDialer {
 			self.mutex.Lock()
