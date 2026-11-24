@@ -1119,3 +1119,73 @@ func TestFamilyPlatformTransportGroupDoneWaitsForItsOwnedStrategies(t *testing.T
 		}
 	}
 }
+
+// The frames the checks count for an alt connection's watch (dialAltQuic):
+// its body, and any of the dial's goroutines.
+const (
+	altConnectionWatchFrame       = "(*ClientStrategy).dialAltQuic.func6"
+	altConnectionWatchFramePrefix = "(*ClientStrategy).dialAltQuic.func"
+)
+
+// The strategy's Close returns only once the watch of an alt connection, which
+// closes its dial attempt when the connection or the strategy ends, has
+// returned. An api GET through the alt h3 dialer leaves its connection pooled
+// and watched; the watch, ended by the close, is held right before it returns
+// until Close waits for it.
+func TestClientStrategyCloseJoinsItsAltConnectionWatches(t *testing.T) {
+	hold := newGoroutineJoinHold(t)
+	altServer := newTestAltServer(t, false)
+	clientStrategy := newTestAltStrategyWithSettings(t, altServer, func(settings *ClientStrategySettings) {
+		settings.altConnectionWatchExitForTest = hold.exit
+		settings.altConnectionWatchJoinForTest = hold.join
+	})
+	dialer := testAltDialer(t, clientStrategy, "alt h3")
+	labelValue := goroutineJoinTestLabeled(context.Background(), func(ctx context.Context) {
+		if body := testAltGetWithContext(t, ctx, dialer); body != testAltBodyText {
+			t.Fatalf("body = %q", body)
+		}
+	})
+	if n := goroutineJoinTestFramePrefixCount(t, labelValue, altConnectionWatchFramePrefix); n != 1 {
+		t.Fatalf("%d alt connection watches before the close, want 1", n)
+	}
+
+	clientStrategy.Close()
+	if n := goroutineJoinTestFrameCount(t, labelValue, altConnectionWatchFrame); n != 0 {
+		t.Fatalf("%d alt connection watches left once Close returned, want 0", n)
+	}
+	hold.requireJoinedOnce(t, "the alt connection watch")
+}
+
+// An alt dial that completes once its strategy is closed starts no watch,
+// which Close could no longer wait for: it closes its attempt and fails.
+func TestClientStrategyClosedAltDialStartsNoWatch(t *testing.T) {
+	altServer := newTestAltServer(t, false)
+	clientStrategy := newTestAltStrategy(t, altServer)
+	clientStrategy.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), goroutineJoinTestWait)
+	defer cancel()
+	var conn *quic.Conn
+	var err error
+	labelValue := goroutineJoinTestLabeled(ctx, func(ctx context.Context) {
+		conn, err = clientStrategy.dialAltQuic(ctx, false, &tls.Config{
+			ServerName: testAltApiHost,
+			RootCAs:    altServer.rootCAs,
+			NextProtos: []string{"h3"},
+			MinVersion: tls.VersionTLS13,
+		}, &quic.Config{})
+	})
+	if err == nil {
+		conn.CloseWithError(0, "")
+		t.Fatal("an alt dial completed on a closed strategy")
+	}
+	// the dial itself completed: the refusal came after it, not before
+	select {
+	case <-altServer.versions:
+	case <-time.After(goroutineJoinTestWait):
+		t.Fatalf("the dial on a closed strategy never reached the alt: %v", err)
+	}
+	if n := goroutineJoinTestFramePrefixCount(t, labelValue, altConnectionWatchFramePrefix); n != 0 {
+		t.Fatalf("%d alt connection watches after a dial on a closed strategy, want 0", n)
+	}
+}

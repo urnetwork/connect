@@ -107,7 +107,8 @@ func newAltHttpClient(
 // to that family's alt name (altHostPortForServerName). The returned
 // connection is owned by the http3 transport; the socket, the translation and
 // the quic transport under it are released when it dies or when the strategy
-// closes.
+// closes, by a watch the strategy's Close waits for. A dial that completes once
+// the strategy is closed starts no watch: it closes its attempt and fails.
 func (self *ClientStrategy) dialAltQuic(
 	ctx context.Context,
 	whodis bool,
@@ -166,13 +167,35 @@ func (self *ClientStrategy) dialAltQuic(
 		return nil, err
 	}
 	conn := attempt.conn
-	go HandleError(func() {
+	// Registered under the lock Close marks the strategy closed in, so a watch
+	// either counts before Close waits or never starts.
+	watching := func() bool {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		if self.closed {
+			return false
+		}
+		self.altConnectionWatches.Add(1)
+		return true
+	}()
+	if !watching {
+		attempt.close()
+		return nil, fmt.Errorf("alt dial: the client strategy is closed")
+	}
+	watch := func() {
 		select {
 		case <-conn.Context().Done():
 		case <-self.ctx.Done():
 		}
 		attempt.close()
-	})
+		if self.settings.altConnectionWatchExitForTest != nil {
+			self.settings.altConnectionWatchExitForTest()
+		}
+	}
+	go func() {
+		defer self.altConnectionWatches.Done()
+		HandleError(watch)
+	}()
 	return conn, nil
 }
 

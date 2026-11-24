@@ -187,6 +187,14 @@ type ClientStrategySettings struct {
 	// Nil outside package tests. Called by Close once the strategy is closed,
 	// right before Close waits for that goroutine.
 	contextCloseJoinForTest func()
+	// Nil outside package tests. Called once by an alt connection's watch
+	// (dialAltQuic) when it has closed its dial attempt, right before it
+	// returns, so a test can hold it while Close goes on.
+	altConnectionWatchExitForTest func()
+	// Nil outside package tests. Called by Close once it has joined the
+	// context goroutine, right before it waits for the alt connections'
+	// watches.
+	altConnectionWatchJoinForTest func()
 
 	// AltUrl enables the two api alt dialers (L4). Only its host and explicit
 	// port are read: the alt host decides where the packets go, while the
@@ -337,6 +345,11 @@ type ClientStrategy struct {
 	// strategy once its context ends, has returned. Close waits for it. Nil on
 	// a strategy built without NewClientStrategy, which runs none.
 	contextCloseDone chan struct{}
+	// The alt connections' watches, each of which closes its dial attempt
+	// when its connection or the strategy's context ends (dialAltQuic). Close
+	// waits for them on a strategy NewClientStrategy built, whose context it
+	// ends; a watch counts only while the strategy is open, under mutex.
+	altConnectionWatches sync.WaitGroup
 
 	settings *ClientStrategySettings
 	// A copy of the settings as the caller passed them, which a direct-only
@@ -709,26 +722,33 @@ func (self *ClientStrategy) shedMemory() {
 }
 
 // Ends discovery and releases pooled HTTP connections, and returns once the
-// goroutine that closes the strategy when its context ends has returned. APIs
-// and transports sharing the strategy must be closed first; repeated calls
-// are safe. That goroutine waits only for the close itself, so Close may be
+// goroutine that closes the strategy when its context ends and every alt
+// connection's watch have returned. APIs and transports sharing the strategy
+// must be closed first; repeated calls are safe. Those goroutines wait only
+// for the close itself and for their alt attempts' close, so Close may be
 // called from any goroutine but one the close runs: its dialers' and DoH
 // resolver's own work.
 func (self *ClientStrategy) Close() {
 	// The join is deferred, so a close that panics still makes it. It cancels
-	// first: the close's own cancel ends the goroutine's wait, and this one
-	// ends it too when the close panicked before it got there.
+	// first: the close's own cancel ends the goroutines' waits, and this one
+	// ends them too when the close panicked before it got there. Without a
+	// cancel, on a strategy built without NewClientStrategy, nothing here can
+	// end the alt watches, so it waits for none.
 	defer func() {
-		if self.contextCloseDone == nil {
+		if self.cancel == nil {
 			return
 		}
-		if self.cancel != nil {
-			self.cancel()
+		self.cancel()
+		if self.contextCloseDone != nil {
+			if self.settings != nil && self.settings.contextCloseJoinForTest != nil {
+				self.settings.contextCloseJoinForTest()
+			}
+			<-self.contextCloseDone
 		}
-		if self.settings != nil && self.settings.contextCloseJoinForTest != nil {
-			self.settings.contextCloseJoinForTest()
+		if self.settings != nil && self.settings.altConnectionWatchJoinForTest != nil {
+			self.settings.altConnectionWatchJoinForTest()
 		}
-		<-self.contextCloseDone
+		self.altConnectionWatches.Wait()
 	}()
 	self.close()
 }
