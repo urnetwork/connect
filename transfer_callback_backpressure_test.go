@@ -108,11 +108,13 @@ func TestSendSequenceCloseCallbackBackpressureIsDestinationLocal(t *testing.T) {
 	}
 }
 
-// TestReceiveSequenceReplacementDropsWithoutWaiting models a receive worker
-// parked in a callback. A newer generation cancels that worker but drops its
-// first Pack instead of parking the shared receive pump on worker exit. The
-// sender retains the Pack until Transfer acknowledges a later retry.
-func TestReceiveSequenceReplacementDropsWithoutWaiting(t *testing.T) {
+// TestReceiveSequenceReplacementTakesItsPackWithoutWaiting models a receive
+// worker parked in a callback. A newer generation cancels that worker without
+// parking the shared receive pump on its exit, and keeps its first Pack: the
+// replacement is installed at once and holds the Pack in its own handoff queue,
+// reading nothing until the old worker exits (QD-1232). Before, the Pack was
+// dropped and waited for its sender's resend.
+func TestReceiveSequenceReplacementTakesItsPackWithoutWaiting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	settings := DefaultClientSettings()
@@ -192,7 +194,7 @@ func TestReceiveSequenceReplacementDropsWithoutWaiting(t *testing.T) {
 	case result := <-replacementResult:
 		if result.err != nil || !result.success {
 			t.Fatalf(
-				"nonblocking replacement drop = (%t, %v), want accepted drop",
+				"nonblocking replacement = (%t, %v), want the Pack taken",
 				result.success,
 				result.err,
 			)
@@ -206,9 +208,24 @@ func TestReceiveSequenceReplacementDropsWithoutWaiting(t *testing.T) {
 	default:
 		t.Fatal("new generation did not retire the old receive sequence")
 	}
-	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 1 ||
+	if stats := client.ReceiveStats(); stats.PackHandoffDropCount != 0 ||
 		stats.PackHandoffDropByteCount != 0 || stats.AckHandoffDropCount != 0 {
 		t.Fatalf("replacement receive stats = %+v", stats)
+	}
+	newId := receiveSequenceId{
+		Source:         source,
+		SequenceId:     newSequenceId,
+		EncryptionRole: sequenceTlsRoleServer,
+	}
+	receiveBuffer.mutex.Lock()
+	replacement := receiveBuffer.receiveSequences[newId]
+	head := receiveBuffer.headReceiveSequenceIds[headKey]
+	started := replacement != nil && replacement.started
+	receiveBuffer.mutex.Unlock()
+	if replacement == nil || head != newId || started ||
+		replacement.predecessorExit != (<-chan struct{})(oldSequence.exit) ||
+		replacement.packQueueCount.Load() != 1 {
+		t.Fatal("the replacement is not the lane's head holding the Pack while the old worker runs")
 	}
 }
 

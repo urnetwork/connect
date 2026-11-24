@@ -15467,14 +15467,17 @@ type ReceiveBufferSettings struct {
 	// changing production behavior.
 	beforeCreateReceiveSequenceForTest func(receiveSequenceId)
 	beforeRunReceiveSequenceForTest    func(receiveSequenceId)
-	beforeCloseWaitForTest             func(receiveSequenceId)
-	afterRunReceiveSequenceForTest     func(receiveSequenceId)
-	beforeAckCompressWaitForTest       func(receiveSequenceId)
-	afterAckWriteForTest               func(receiveSequenceId)
-	h1SaturationNowForTest             func() time.Time
-	beforeAckWorkerStopForTest         func(receiveSequenceId)
-	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
-	afterAckWritesCanceledForTest      func(receiveSequenceId)
+	// Nil by default. A replacement's worker calls it as it starts to wait for
+	// the worker it replaced to exit.
+	beforePredecessorWaitForTest   func(receiveSequenceId)
+	beforeCloseWaitForTest         func(receiveSequenceId)
+	afterRunReceiveSequenceForTest func(receiveSequenceId)
+	beforeAckCompressWaitForTest   func(receiveSequenceId)
+	afterAckWriteForTest           func(receiveSequenceId)
+	h1SaturationNowForTest         func() time.Time
+	beforeAckWorkerStopForTest     func(receiveSequenceId)
+	afterAckWriterOpenForTest      func(receiveSequenceId, MultiRouteWriter)
+	afterAckWritesCanceledForTest  func(receiveSequenceId)
 	// Nil observer counts each arm of the ACK worker's compression timer.
 	afterAckCompressTimerArmForTest func(receiveSequenceId)
 	// Nil observer exposes an idle check while producer admission is held.
@@ -15599,6 +15602,7 @@ type ReceiveBuffer struct {
 
 	beforeCreateReceiveSequenceForTest func(receiveSequenceId)
 	beforeRunReceiveSequenceForTest    func(receiveSequenceId)
+	beforePredecessorWaitForTest       func(receiveSequenceId)
 	beforeCloseWaitForTest             func(receiveSequenceId)
 	afterRunReceiveSequenceForTest     func(receiveSequenceId)
 }
@@ -15619,6 +15623,8 @@ func NewReceiveBuffer(ctx context.Context,
 			beforeCreateReceiveSequenceForTest,
 		beforeRunReceiveSequenceForTest: receiveBufferSettings.
 			beforeRunReceiveSequenceForTest,
+		beforePredecessorWaitForTest: receiveBufferSettings.
+			beforePredecessorWaitForTest,
 		beforeCloseWaitForTest: receiveBufferSettings.beforeCloseWaitForTest,
 		afterRunReceiveSequenceForTest: receiveBufferSettings.
 			afterRunReceiveSequenceForTest,
@@ -15771,6 +15777,51 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 		headKey.LogicalLane = logicalLane
 	}
 
+	// Installs this Pack's sequence as its lane's head and starts its worker,
+	// which waits for predecessorExit, when it replaced a worker that has not
+	// exited, before it reads a Pack. Caller holds mutex.
+	openReceiveSequenceWithLock := func(predecessorExit <-chan struct{}) *ReceiveSequence {
+		if self.log.V(2).Enabled() {
+			self.log.Infof("[r]new sequence %s\n", receivePack.SequenceId)
+		}
+
+		logicalLaneReceiveBudget := self.logicalLaneReceiveBudget
+		if logicalLane != 0 &&
+			self.receiveBufferSettings.ReceiveQueueBudget == nil &&
+			logicalLaneReceiveBudget == nil {
+			// As on send, preserve the disabled path's allocation profile and
+			// create exactly one fixed byte pool on first negotiated data lane.
+			logicalLaneReceiveBudget = NewTransferMemoryBudget(
+				self.receiveBufferSettings.ReceiveQueueMaxByteCount,
+			)
+			self.logicalLaneReceiveBudget = logicalLaneReceiveBudget
+		}
+		receiveSequence := newReceiveSequenceWithLogicalLaneBudget(
+			self.ctx,
+			self.client,
+			headKey.Source,
+			receivePack.SequenceId,
+			headKey.transferKey(),
+			self.receiveBufferSettings,
+			logicalLaneReceiveBudget,
+		)
+		receiveSequence.contractHolders = self.contractHolders
+		receiveSequence.predecessorExit = predecessorExit
+		receiveSequence.started = predecessorExit == nil
+		self.receiveSequences[receiveSequenceId] = receiveSequence
+		self.headReceiveSequenceIds[headKey] = receiveSequenceId
+		self.activeReceiveSequences[receiveSequence] = true
+		if ledger := self.client.memoryOwnerLedger; ledger != nil {
+			ledger.admit(transferMemoryOwnerReceive, receiveSequence.memoryOwnerChannelBytes())
+		}
+		go self.runReceiveSequence(
+			receiveSequenceId,
+			headKey,
+			receiveSequence,
+		)
+		return receiveSequence
+	}
+
 	initReceiveSequence := func(skip *ReceiveSequence) *ReceiveSequence {
 		for {
 			if self.beforeCreateReceiveSequenceForTest != nil {
@@ -15891,15 +15942,27 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					continue
 				}
 				headReceiveSequence.Cancel()
-				self.mutex.Unlock()
 				if timeout == 0 {
-					// Do not install the replacement until the old worker has
-					// finished. Dropping this Pack is safe: it was not admitted,
-					// and its sender retains it until a Transfer ACK arrives.
-					self.client.recordReceivePackHandoffDrop(receivePack.MessageByteCount)
-					receivePack.messagePoolReturn()
-					return nil
+					// The shared pump never waits for a retiring worker, and a
+					// drop here cost the newer sequence its first Packs until
+					// their sender's resend: a client restarted in place opens
+					// with its head and ClientHello, and resends them only at its
+					// cold MinResendInterval (QD-1232). So the replacement is
+					// installed now and its worker waits for the old one's exit
+					// before it reads a Pack: the two never run together, and
+					// this Pack and the ones behind it wait in the replacement's
+					// own bounded handoff queue. A head that has not yet run
+					// never will, so its replacement waits for what it waited for,
+					// and no chain of waiting workers forms.
+					var predecessorExit <-chan struct{} = headReceiveSequence.exit
+					if !headReceiveSequence.started && headReceiveSequence.predecessorExit != nil {
+						predecessorExit = headReceiveSequence.predecessorExit
+					}
+					receiveSequence = openReceiveSequenceWithLock(predecessorExit)
+					self.mutex.Unlock()
+					return receiveSequence
 				}
+				self.mutex.Unlock()
 
 				// Sequence shutdown must finish before replacement for this
 				// source. Wait outside the buffer-wide map lock so other peers
@@ -15920,42 +15983,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				continue
 			}
 
-			if self.log.V(2).Enabled() {
-				self.log.Infof("[r]new sequence %s\n", receivePack.SequenceId)
-			}
-
-			logicalLaneReceiveBudget := self.logicalLaneReceiveBudget
-			if logicalLane != 0 &&
-				self.receiveBufferSettings.ReceiveQueueBudget == nil &&
-				logicalLaneReceiveBudget == nil {
-				// As on send, preserve the disabled path's allocation profile and
-				// create exactly one fixed byte pool on first negotiated data lane.
-				logicalLaneReceiveBudget = NewTransferMemoryBudget(
-					self.receiveBufferSettings.ReceiveQueueMaxByteCount,
-				)
-				self.logicalLaneReceiveBudget = logicalLaneReceiveBudget
-			}
-			receiveSequence = newReceiveSequenceWithLogicalLaneBudget(
-				self.ctx,
-				self.client,
-				headKey.Source,
-				receivePack.SequenceId,
-				headKey.transferKey(),
-				self.receiveBufferSettings,
-				logicalLaneReceiveBudget,
-			)
-			receiveSequence.contractHolders = self.contractHolders
-			self.receiveSequences[receiveSequenceId] = receiveSequence
-			self.headReceiveSequenceIds[headKey] = receiveSequenceId
-			self.activeReceiveSequences[receiveSequence] = true
-			if ledger := self.client.memoryOwnerLedger; ledger != nil {
-				ledger.admit(transferMemoryOwnerReceive, receiveSequence.memoryOwnerChannelBytes())
-			}
-			go self.runReceiveSequence(
-				receiveSequenceId,
-				headKey,
-				receiveSequence,
-			)
+			receiveSequence = openReceiveSequenceWithLock(nil)
 			self.mutex.Unlock()
 			return receiveSequence
 		}
@@ -16026,6 +16054,21 @@ func (self *ReceiveBuffer) runReceiveSequence(
 			)
 			self.mutex.Unlock()
 		}()
+		// A replacement reads no Pack while the worker it replaced runs; its
+		// Packs wait in its handoff queue (Pack). Canceled first, it runs only
+		// to exit: Run reads no Pack once its context has ended.
+		if predecessorExit := receiveSequence.predecessorExit; predecessorExit != nil {
+			if self.beforePredecessorWaitForTest != nil {
+				self.beforePredecessorWaitForTest(receiveSequenceId)
+			}
+			select {
+			case <-predecessorExit:
+			case <-receiveSequence.ctx.Done():
+			}
+			self.mutex.Lock()
+			receiveSequence.started = true
+			self.mutex.Unlock()
+		}
 		receiveSequence.Run()
 	})
 }
@@ -16273,6 +16316,14 @@ type ReceiveSequence struct {
 	ackWindow *sequenceAckWindow
 
 	exit chan struct{}
+	// The exit of the last worker on its lane that could still be reading
+	// Packs when this one replaced it, nil for none: this one's worker reads
+	// no Pack before it closes (ReceiveBuffer.Pack). Set at creation.
+	predecessorExit <-chan struct{}
+	// Whether this one's worker is past predecessorExit and may read Packs, so
+	// a later replacement waits for its exit rather than for predecessorExit.
+	// Guarded by the owning ReceiveBuffer's mutex.
+	started bool
 
 	// session is the per-peer TLS session that decrypts this inbound stream,
 	// of role `encryptionRole` (the complement of the sender's role).
