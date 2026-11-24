@@ -60,6 +60,7 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		AltH3DialerPriority:     60,
 		AltWhodisDialerPriority: 130,
 		AltDialerMinimumWeight:  0.25,
+		AltQuicRaceStagger:      250 * time.Millisecond,
 
 		HelloRetryTimeout: 5 * time.Second,
 		// API calls return JSON/control data rather than streamed payloads;
@@ -216,6 +217,13 @@ type ClientStrategySettings struct {
 	// carry, 0.25: a path that is never chosen while direct tcp works must
 	// still be tried often enough to learn that it works when tcp stops.
 	AltDialerMinimumWeight float32
+	// The Happy Eyeballs delay between the candidate addresses of one alt
+	// quic dial (raceAltQuicDialProgressive), the platform transport's H3
+	// stagger (PlatformTransportSettings.H3FamilyRaceStagger): each next
+	// candidate launches this long after the previous one, or at once when
+	// that one fails definitively. Non-positive launches the next candidate
+	// without waiting.
+	AltQuicRaceStagger time.Duration
 
 	DohSettings *DohSettings
 	// Refuses DoH servers other than the built-in ones, whatever path they

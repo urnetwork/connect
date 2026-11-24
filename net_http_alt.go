@@ -159,7 +159,7 @@ func (self *ClientStrategy) dialAltQuic(
 	if len(candidates) == 1 && source == nil {
 		attempt, err = dial(ctx, candidates[0])
 	} else {
-		attempt, err = raceAltQuicDialProgressive(ctx, candidates, source, policy, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
+		attempt, err = raceAltQuicDialProgressive(ctx, candidates, source, policy, self.settings.AltQuicRaceStagger, func(ctx context.Context, address *net.UDPAddr, claim *platformTransportBudgetReservation) (*h3DialAttempt, error) {
 			return dialAltQuicAttemptWithReservation(ctx, &self.settings.ConnectSettings, address, wrap, tlsConfig, quicConfig, policy, claim)
 		})
 	}

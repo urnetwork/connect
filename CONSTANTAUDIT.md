@@ -39,6 +39,14 @@ The identity proof resends' doubling, the doubling of the kept paces' and the st
 latches' sweep sizes, and the 63 doublings that cap the initial-retry failure count (a
 duration's bits) stay: the shape of a backoff or an amortized sweep, not a limit.
 
+Migrated 2026-11-24, with the transport goroutine joins (QD-702): transport_family.go's
+`platformH3FamilyRaceStagger`, the 250 ms Happy Eyeballs stagger of the H3 races, →
+`PlatformTransportSettings.H3FamilyRaceStagger` for `raceH3DialProgressive` and
+`raceH3DialWithMemoryProgressive`, and `ClientStrategySettings.AltQuicRaceStagger` for
+`raceAltQuicDialProgressive`. Each race takes the stagger from its caller's settings, and a
+non-positive one launches the next candidate without waiting. `extenderDnsPortRaceStagger`
+(net_extender_dns_ports.go), the extender dns carrier's own 250 ms, stays for its own sweep.
+
 ---
 
 ## A. Wire / protocol / ABI constants — stay fixed (compatibility-bearing)

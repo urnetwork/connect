@@ -39,7 +39,8 @@ import (
 
 // The launch stagger of the dns carrier's ports (L2), which is what the
 // platform's alt dns carrier staggers its ports by
-// (platformH3FamilyRaceStagger).
+// (PlatformTransportSettings.H3FamilyRaceStagger,
+// ClientStrategySettings.AltQuicRaceStagger).
 const extenderDnsPortRaceStagger = 250 * time.Millisecond
 
 // The ports one dns carrier dial races, in launch order: DnsPorts without a

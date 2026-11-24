@@ -15,9 +15,10 @@ func raceAltQuicDial(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
 	policy extenderQuicMemoryPolicy,
+	stagger time.Duration,
 	dial func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
-	return raceAltQuicDialProgressive(ctx, candidates, nil, policy, dial)
+	return raceAltQuicDialProgressive(ctx, candidates, nil, policy, stagger, dial)
 }
 
 // The first usable family starts immediately. Later results join the same
@@ -27,6 +28,7 @@ func raceAltQuicDialProgressive(
 	candidates []*net.UDPAddr,
 	source *udpDialCandidateSource,
 	policy extenderQuicMemoryPolicy,
+	stagger time.Duration,
 	dial func(context.Context, *net.UDPAddr, *platformTransportBudgetReservation) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	defer source.close()
@@ -84,8 +86,8 @@ func raceAltQuicDialProgressive(
 	if err := advance(); err != nil {
 		return nil, err
 	}
-	stagger := time.NewTimer(platformH3FamilyRaceStagger)
-	defer stagger.Stop()
+	staggerTimer := time.NewTimer(stagger)
+	defer staggerTimer.Stop()
 	var firstErr error
 	staggerReady := false
 	for {
@@ -107,21 +109,21 @@ func raceAltQuicDialProgressive(
 					return nil, err
 				}
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				if firstErr == nil {
 					firstErr = context.Canceled
 				}
 				return nil, firstErr
 			}
-		case <-stagger.C:
+		case <-staggerTimer.C:
 			staggerReady = true
 			if launched < len(candidates) {
 				if err := advance(); err != nil {
 					return nil, err
 				}
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			}
 		case resolved := <-resolution:
 			candidates = source.appendReady(candidates, resolved)
@@ -131,7 +133,7 @@ func raceAltQuicDialProgressive(
 					return nil, err
 				}
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				if firstErr == nil {
 					firstErr = context.Canceled

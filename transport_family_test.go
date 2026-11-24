@@ -1245,14 +1245,15 @@ func TestRaceH3DialLaunchesNextOnFailureAndClosesLosers(t *testing.T) {
 			}
 		}
 	}
-	winner, err := raceH3Dial(ctx, candidates, dial)
+	stagger := testingH3FamilyRaceStagger()
+	winner, err := raceH3Dial(ctx, candidates, stagger, dial)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if winner.udpAddr.Port != 2 {
 		t.Fatalf("winner = %v, want port 2", winner.udpAddr)
 	}
-	if elapsed := time.Since(start); platformH3FamilyRaceStagger <= elapsed {
+	if elapsed := time.Since(start); stagger <= elapsed {
 		t.Fatalf("a definitive failure did not launch the next candidate immediately (%s)", elapsed)
 	}
 	launchLock.Lock()
@@ -1270,6 +1271,16 @@ func TestRaceH3DialLaunchesNextOnFailureAndClosesLosers(t *testing.T) {
 		t.Fatalf("unexpected close of port %d", port)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+// The stagger the platform transport's H3 races launch candidates by.
+func testingH3FamilyRaceStagger() time.Duration {
+	return DefaultPlatformTransportSettings().H3FamilyRaceStagger
+}
+
+// The stagger the client strategy's alt quic races launch candidates by.
+func testingAltQuicRaceStagger() time.Duration {
+	return DefaultClientStrategySettings().AltQuicRaceStagger
 }
 
 // closeRecordingPacketConn reports its close for the race test.

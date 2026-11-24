@@ -213,7 +213,7 @@ func TestPlatformDnsGraphRaceAdmitsCompleteFallback(t *testing.T) {
 			transport := &PlatformTransport{settings: &PlatformTransportSettings{PlatformTransportBudget: budget}}
 			candidates := []*net.UDPAddr{{IP: net.ParseIP("192.0.2.53"), Port: 53}, {IP: net.ParseIP("192.0.2.53"), Port: 4053}}
 			var live, peak atomic.Int32
-			winner, err := raceH3DialWithMemory(ctx, candidates, budget, platformH3DialTransientByteCount, nestedBytes,
+			winner, err := raceH3DialWithMemory(ctx, candidates, budget, platformH3DialTransientByteCount, nestedBytes, testingH3FamilyRaceStagger(),
 				func(ctx context.Context, address *net.UDPAddr) (*h3DialAttempt, error) {
 					claim, err := transport.acquireH3TranslationMemory(ctx)
 					if err != nil {

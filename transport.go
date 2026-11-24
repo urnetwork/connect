@@ -536,10 +536,16 @@ type PlatformTransportSettings struct {
 	WsHandshakeTimeout   time.Duration
 	QuicConnectTimeout   time.Duration
 	QuicHandshakeTimeout time.Duration
-	QuicTlsConfig        *tls.Config
-	AuthTimeout          time.Duration
-	ReconnectTimeout     time.Duration
-	PingTimeout          time.Duration
+	// H3FamilyRaceStagger is the Happy Eyeballs delay between the candidate
+	// addresses of an H3 dial that races several (raceH3DialProgressive,
+	// raceH3DialWithMemoryProgressive): each next candidate launches this long
+	// after the previous one, or at once when that one fails definitively.
+	// Non-positive launches the next candidate without waiting.
+	H3FamilyRaceStagger time.Duration
+	QuicTlsConfig       *tls.Config
+	AuthTimeout         time.Duration
+	ReconnectTimeout    time.Duration
+	PingTimeout         time.Duration
 	// WriteTimeout bounds each carrier write, a ready batch or a ping, from
 	// the instant it begins: one still in progress this long after it began
 	// fails as a timeout, which ends the connection. Native I/O deadlines
@@ -909,6 +915,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		WsHandshakeTimeout:        15 * time.Second,
 		QuicConnectTimeout:        15 * time.Second,
 		QuicHandshakeTimeout:      15 * time.Second,
+		H3FamilyRaceStagger:       250 * time.Millisecond,
 		QuicTlsConfig:             tlsConfig,
 		AuthTimeout:               5 * time.Second,
 		ReconnectTimeout:          5 * time.Second,
@@ -3712,11 +3719,11 @@ func (self *PlatformTransport) runH3(
 					extraByteCount = self.h3BudgetByteCount()
 				}
 				nestedByteCount := self.h3NestedBudget.Stats().TotalByteCount
-				attempt, err = raceH3DialWithMemoryProgressive(attemptCtx, candidates, source, budget, extraByteCount, nestedByteCount, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialWithMemoryProgressive(attemptCtx, candidates, source, budget, extraByteCount, nestedByteCount, self.settings.H3FamilyRaceStagger, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			} else {
-				attempt, err = raceH3DialProgressive(attemptCtx, candidates, source, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
+				attempt, err = raceH3DialProgressive(attemptCtx, candidates, source, self.settings.H3FamilyRaceStagger, func(dialCtx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error) {
 					return self.dialH3(dialCtx, ptMode, serverName, udpAddr, wrapPacketConn, tlsConfig, quicConfig, slowMultiple, true)
 				})
 			}

@@ -25,9 +25,10 @@ func raceH3DialWithMemory(
 	budget *PlatformTransportBudget,
 	extraByteCount ByteCount,
 	nestedByteCount ByteCount,
+	stagger time.Duration,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
-	return raceH3DialWithMemoryProgressive(ctx, candidates, nil, budget, extraByteCount, nestedByteCount, dial)
+	return raceH3DialWithMemoryProgressive(ctx, candidates, nil, budget, extraByteCount, nestedByteCount, stagger, dial)
 }
 
 // Pending DNS is another source of candidates, not an admission bypass. A
@@ -39,6 +40,7 @@ func raceH3DialWithMemoryProgressive(
 	budget *PlatformTransportBudget,
 	extraByteCount ByteCount,
 	nestedByteCount ByteCount,
+	stagger time.Duration,
 	dial func(context.Context, *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	defer source.close()
@@ -105,8 +107,8 @@ func raceH3DialWithMemoryProgressive(
 		}
 	}
 	launch()
-	stagger := time.NewTimer(platformH3FamilyRaceStagger)
-	defer stagger.Stop()
+	staggerTimer := time.NewTimer(stagger)
+	defer staggerTimer.Stop()
 	var firstErr error
 	staggerReady := false
 	for {
@@ -126,17 +128,17 @@ func raceH3DialWithMemoryProgressive(
 			if launched < len(candidates) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				finish()
 				return nil, firstErr
 			}
-		case <-stagger.C:
+		case <-staggerTimer.C:
 			staggerReady = true
 			if launched < len(candidates) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			}
 		case resolved := <-resolution:
 			candidates = source.appendReady(candidates, resolved)
@@ -144,7 +146,7 @@ func raceH3DialWithMemoryProgressive(
 			if launched < len(candidates) && (pending == 0 || staggerReady) {
 				advance()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				finish()
 				return nil, firstErr

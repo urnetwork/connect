@@ -789,7 +789,7 @@ func TestRaceH3DialJoinsALoserThatCompletesAfterTheWinner(t *testing.T) {
 				defer close(raceDone)
 				// the first candidate is still dialing when the stagger
 				// launches the second, which wins
-				winner, raceErr = raceH3Dial(ctx, candidates, dialer.dial)
+				winner, raceErr = raceH3Dial(ctx, candidates, testingH3FamilyRaceStagger(), dialer.dial)
 			}()
 		})
 
@@ -844,7 +844,7 @@ func TestRaceH3DialEndedByItsContextJoinsEveryDial(t *testing.T) {
 		labelValue := goroutineJoinTestLabeled(ctx, func(ctx context.Context) {
 			go func() {
 				defer close(raceDone)
-				_, raceErr = raceH3Dial(ctx, candidates, dialer.dial)
+				_, raceErr = raceH3Dial(ctx, candidates, testingH3FamilyRaceStagger(), dialer.dial)
 			}()
 		})
 		// both candidates are dialing once the stagger, on the bubble's

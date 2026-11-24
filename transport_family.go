@@ -833,11 +833,6 @@ func (self *PlatformTransport) noteKick() {
 	}
 }
 
-// platformH3FamilyRaceStagger is the Happy Eyeballs delay between candidate
-// addresses of a family-agnostic H3 dial. A definitive failure launches the
-// next candidate immediately.
-const platformH3FamilyRaceStagger = 250 * time.Millisecond
-
 // resolveControlUDPAddrs is the multi-address form of resolveControlUDPAddr.
 // It applies the same protected-domain, custom-resolver and egress-bound
 // policy, then returns every usable address for the requested family, or for
@@ -1113,17 +1108,19 @@ func (self *PlatformTransport) openH3PacketConn(
 }
 
 // raceH3Dial is Happy Eyeballs for QUIC: candidates launch in order, each
-// after platformH3FamilyRaceStagger or immediately after the previous one
-// fails definitively, and the first confirmed handshake wins. Losers are
+// stagger after the previous one (PlatformTransportSettings.H3FamilyRaceStagger)
+// or immediately after it fails definitively, and the first confirmed handshake
+// wins. Losers are
 // cancelled and closed, including any that complete after the winner, before
 // the race returns. The returned error when nothing wins is the first
 // candidate's error, which names the preferred family's failure.
 func raceH3Dial(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
+	stagger time.Duration,
 	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
-	return raceH3DialProgressive(ctx, candidates, nil, dial)
+	return raceH3DialProgressive(ctx, candidates, nil, stagger, dial)
 }
 
 // The first family starts the existing confirmed-handshake race. DNS workers
@@ -1140,6 +1137,7 @@ func raceH3DialProgressive(
 	ctx context.Context,
 	candidates []*net.UDPAddr,
 	source *udpDialCandidateSource,
+	stagger time.Duration,
 	dial func(ctx context.Context, udpAddr *net.UDPAddr) (*h3DialAttempt, error),
 ) (*h3DialAttempt, error) {
 	defer source.close()
@@ -1185,8 +1183,8 @@ func raceH3DialProgressive(
 	launch()
 	var firstErr error
 	staggerReady := false
-	stagger := time.NewTimer(platformH3FamilyRaceStagger)
-	defer stagger.Stop()
+	staggerTimer := time.NewTimer(stagger)
+	defer staggerTimer.Stop()
 	for {
 		select {
 		case result := <-results:
@@ -1201,16 +1199,16 @@ func raceH3DialProgressive(
 			if launched < len(candidates) {
 				launch()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
-		case <-stagger.C:
+		case <-staggerTimer.C:
 			staggerReady = true
 			if launched < len(candidates) {
 				launch()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			}
 		case resolved := <-resolution:
 			candidates = source.appendReady(candidates, resolved)
@@ -1218,7 +1216,7 @@ func raceH3DialProgressive(
 			if launched < len(candidates) && (pending == 0 || staggerReady) {
 				launch()
 				staggerReady = false
-				stagger.Reset(platformH3FamilyRaceStagger)
+				staggerTimer.Reset(stagger)
 			} else if pending == 0 && resolution == nil {
 				return nil, firstErr
 			}
