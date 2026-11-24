@@ -1235,6 +1235,14 @@ func TestAckNothingDeliveredDecodesOnEveryPath(t *testing.T) {
 // The listener's timers are set past the bound, so a broken run waits for them.
 // Before, the restarted edge held the answer until the listener's backoff
 // brought the old write again, and the measured runs waited up to 18.6 s.
+//
+// The old write may come sooner, by the other recovery of a restarted peer.
+// When it is still on its way as the edge comes back, it reaches the restarted
+// edge sealed under the old session, which the edge cannot open and nacks, and
+// the listener reseals it once the edge seals under the new session, before the
+// answer is written (`SendSequence.resealUnreadable`): about half the runs.
+// Either way the old write went again at once, as receiver-state recovery, and
+// a run in which neither recovery wrote it waited for a timer.
 func TestRestartedClientGetsItsListenersAnswerWithoutTheListenersBackoff(t *testing.T) {
 	settings := defaultRestartFirstStreamTestSettings()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*settings.StepTimeout)
@@ -1261,12 +1269,14 @@ func TestRestartedClientGetsItsListenersAnswerWithoutTheListenersBackoff(t *test
 	openTime := time.Since(startTime)
 	pair.listenerSends("answer after the restart", open.key)
 	if _, ok := restartFirstStreamWait(pair.edgeGot, "answer after the restart", startTime.Add(settings.ReachTimeout)); !ok {
-		t.Fatalf("the listener's answer did not reach the restarted edge within %s (listener nothing-delivered writes %d, edge acks %d)",
+		t.Fatalf("the listener's answer did not reach the restarted edge within %s (listener nothing-delivered writes %d, reseal writes %d, edge acks %d)",
 			settings.ReachTimeout, pair.listener.SendRecoveryStats().ReceiverLostWriteCount,
+			pair.listener.SendRecoveryStats().ResealWriteCount,
 			pair.currentEdge().SendRecoveryStats().NothingDeliveredAckCount)
 	}
-	if writes := pair.listener.SendRecoveryStats().ReceiverLostWriteCount; writes == 0 {
-		t.Fatal("the answer arrived without a nothing-delivered write: the scenario did not happen")
+	stats := pair.listener.SendRecoveryStats()
+	if stats.ReceiverLostWriteCount == 0 && stats.ResealWriteCount == 0 {
+		t.Fatal("the answer arrived without a nothing-delivered write or a reseal: the scenario did not happen")
 	}
 	t.Logf("the restarted edge's open reached the listener %s after the restart, and the answer reached the edge %s after it",
 		openTime, time.Since(startTime))

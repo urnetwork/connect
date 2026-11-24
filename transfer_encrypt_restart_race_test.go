@@ -1,10 +1,10 @@
 package connect
 
-// A race in the encryption layer cost a client restarted in place, under its
+// Two races in the encryption layer cost a client restarted in place, under its
 // kept identity, one resend interval on its first stream to a listener that held
-// its old session: part of the one first stream in two hundred that sidecar's
-// TestEdgeClientPoolRestartedInPlaceReachesItsListenerAgain measured slow after
-// QD-1232's fixes.
+// its old session: about one first stream in two hundred, measured by sidecar's
+// TestEdgeClientPoolRestartedInPlaceReachesItsListenerAgain after QD-1232's
+// fixes.
 //
 //   - The listener, the responder of the restarted client's new handshake, sends
 //     its identity proof before it verifies the client's, which reached it before
@@ -13,12 +13,20 @@ package connect
 //     verification did: no cipher opened it, and it waited for the client's
 //     resend. The unwrap path now verifies the proof the epoch holds and opens
 //     the wrap (`peerEncryptionSession.verifyHeldPeerIdentityProofForUnwrap`).
+//   - The listener seals under the old epoch until the new one establishes
+//     there. The restarted client, which holds none of its previous process's
+//     epochs, drops such a write and nacks; the listener, which cannot
+//     re-handshake as the responder, ignored the nack, and the write waited for
+//     its own timer, backed off or deferred through the restart. The nack now
+//     owes the client a reseal: once the client seals under the established
+//     epoch, the listener writes again at once what it last sealed under another
+//     (`peerEncryptionSession.oweResealForNack`, `SendSequence.resealUnreadable`).
 //
-// The restart test runs real clients on conditioned loopback routes
+// The restart tests run real clients on conditioned loopback routes
 // (transfer_restart_first_stream_test.go's pair) with barriers on the listener's
-// identity exchange, so it drives the race's ordering every run; its bounds are
-// real time, each a broken run's, and the timer a broken run waits for is set
-// past them. The session tests drive the same decisions directly.
+// identity exchange, so each drives its race's ordering every run; their bounds
+// are real time, each a broken run's, and the timers a broken run waits for are
+// set past them. The session tests drive the same decisions directly.
 
 import (
 	"context"
@@ -154,6 +162,88 @@ func TestRestartedClientsFirstSealedOpenReachesTheListenerBeforeItsVerification(
 		t.Fatal("the restarted edge's send did not return")
 	}
 	t.Logf("the restarted edge's first sealed open reached the listener %s after the restart", time.Since(startTime))
+}
+
+// The listener writes to the restarted edge while its new session with the edge
+// is still handshaking (a barrier holds the completion), so it seals the write
+// under the old session, which the restarted edge never had: the edge drops it
+// and nacks. Once the new session establishes and the edge seals under it, the
+// listener writes the old write again at once, sealed under the new session, and
+// it reaches the edge within ReachTimeout of the barrier's release. The
+// listener's resend timers are set past the bound, and the listener writes
+// nothing after it that the edge could acknowledge, so a run that leaves the
+// write to its timer, as connect did, fails.
+func TestListenerResealsAtOnceWhatTheRestartedClientCouldNotOpen(t *testing.T) {
+	settings := defaultRestartFirstStreamTestSettings()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*settings.StepTimeout)
+	defer cancel()
+
+	hooks := &restartRaceHooks{}
+	completionHeld := make(chan struct{}, 1)
+	nackHandled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	pair := newRestartFirstStreamPair(t, ctx, settings, func(s *ClientSettings) {
+		s.SendBufferSettings.MinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.RttMinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.MaxResendInterval = settings.ColdResendInterval
+		s.EncryptionSettings.beforeHandshakeCompletionForTest = func(peerId Id, role sequenceTlsRole) {
+			if !hooks.matches(peerId, role) {
+				return
+			}
+			restartRaceSignal(completionHeld)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		s.EncryptionSettings.unknownWrapNackHandledForTest = func(peerId Id, role sequenceTlsRole, nackEpochId Id) {
+			if hooks.matches(peerId, role) {
+				restartRaceSignal(nackHandled)
+			}
+		}
+	}, nil)
+	defer pair.close()
+	var releaseOnce sync.Once
+	releaseCompletion := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer releaseCompletion()
+
+	kept, key := pair.runToRestart()
+	hooks.arm(pair.edgeId)
+	pair.startEdge(kept)
+	restarted := pair.currentEdge()
+	sent := make(chan bool, 1)
+	go func() {
+		sent <- restarted.SendWithTimeout(requiredGateFrame(t, "open after the restart"), pair.listenerId, func(error) {}, settings.StepTimeout)
+	}()
+
+	restartRaceAwait(t, completionHeld, settings.StepTimeout, "the listener's completion of the restarted edge's handshake")
+	// sealed under the old session, the only one the listener has established
+	pair.listenerSends("held", key)
+	restartRaceAwait(t, nackHandled, settings.StepTimeout, "the restarted edge's nack of the write it could not open")
+	releaseTime := time.Now()
+	releaseCompletion()
+
+	if _, ok := restartFirstStreamWait(pair.listenerGot, "open after the restart", time.Now().Add(settings.StepTimeout)); !ok {
+		t.Fatal("the restarted edge's open did not reach the listener")
+	}
+	if _, ok := restartFirstStreamWait(pair.edgeGot, "held", releaseTime.Add(settings.ReachTimeout)); !ok {
+		t.Fatalf("the listener's write sealed under the old session did not reach the restarted edge within %s (reseal writes %d)",
+			settings.ReachTimeout, pair.listener.SendRecoveryStats().ResealWriteCount)
+	}
+	if writes := pair.listener.SendRecoveryStats().ResealWriteCount; writes == 0 {
+		t.Fatal("the write arrived without a reseal: the scenario did not happen")
+	}
+	select {
+	case ok := <-sent:
+		if !ok {
+			t.Fatal("the restarted edge's send was refused")
+		}
+	case <-time.After(settings.StepTimeout):
+		t.Fatal("the restarted edge's send did not return")
+	}
+	t.Logf("the write sealed under the old session reached the restarted edge %s after the new session's completion was released", time.Since(releaseTime))
 }
 
 // A responder's session with a peer, on a real client, whose newest epoch has
@@ -330,5 +420,166 @@ func TestTwoVerificationsOfOneHeldProofSealTheSessionOnce(t *testing.T) {
 	}
 	if held.established() != held.epoch {
 		t.Fatal("the verified epoch is not the established one")
+	}
+}
+
+// A responder session, alone, whose reseal decisions tests drive through its nack
+// and unwrap entries, recording each reseal it asks for.
+type resealTestSession struct {
+	session              *peerEncryptionSession
+	requestedGenerations []uint8
+}
+
+func newResealTestSession() *resealTestSession {
+	r := &resealTestSession{}
+	settings := DefaultEncryptionSettings()
+	settings.resealRequestedForTest = func(peerId Id, role sequenceTlsRole, sealGeneration uint8) {
+		r.requestedGenerations = append(r.requestedGenerations, sealGeneration)
+	}
+	r.session = &peerEncryptionSession{
+		peerId:   NewId(),
+		role:     sequenceTlsRoleServer,
+		settings: settings,
+	}
+	return r
+}
+
+// Establishes a new epoch, as a verified handshake does, and answers it.
+func (self *resealTestSession) establish() *tlsHandshakeEpoch {
+	_, cancel := context.WithCancel(context.Background())
+	e := &tlsHandshakeEpoch{
+		epochId:              NewId(),
+		cancel:               cancel,
+		derivedTlsCipher:     &sequenceCipher{},
+		peerIdentityVerified: true,
+	}
+	self.session.stateLock.Lock()
+	defer self.session.stateLock.Unlock()
+	self.session.epoch = e
+	self.session.markEstablishedWithLock(e)
+	return e
+}
+
+// Takes the reseals asked for since the last take.
+func (self *resealTestSession) takeRequests() []uint8 {
+	requests := self.requestedGenerations
+	self.requestedGenerations = nil
+	return requests
+}
+
+// A client restarted in place, or one that lost its session and so names no
+// epoch, nacks a wrap sealed under the epoch its previous process held. The
+// reseal waits until the client seals under an epoch established since: a wrap
+// under the old epoch, a straggler from the previous process, shows nothing.
+// Under the new epoch the reseal is asked for once, and neither later wraps nor
+// a late copy of the nack ask for it again.
+func TestResealWaitsForThePeerToSealUnderAnEpochItHolds(t *testing.T) {
+	for _, nackEpochId := range []Id{NewId(), {}} {
+		r := newResealTestSession()
+		old := r.establish()
+		// the previous process sealed under the old epoch
+		r.session.observePeerSealed(old.derivedTlsCipher)
+
+		r.session.handleUnknownWrapNack(nackEpochId)
+		r.session.observePeerSealed(old.derivedTlsCipher)
+		if requests := r.takeRequests(); len(requests) != 0 {
+			t.Fatalf("nack %s: a reseal was asked for under the epoch the peer does not hold: %v", nackEpochId, requests)
+		}
+
+		renewed := r.establish()
+		r.session.observePeerSealed(renewed.derivedTlsCipher)
+		if requests := r.takeRequests(); len(requests) != 1 || requests[0] != renewed.derivedTlsCipher.sealGeneration {
+			t.Fatalf("nack %s: once the peer sealed under the new epoch, reseals %v, want one under generation %d",
+				nackEpochId, requests, renewed.derivedTlsCipher.sealGeneration)
+		}
+		r.session.observePeerSealed(renewed.derivedTlsCipher)
+		r.session.handleUnknownWrapNack(renewed.epochId)
+		if requests := r.takeRequests(); len(requests) != 0 {
+			t.Fatalf("nack %s: the new epoch was resealed under again: %v", nackEpochId, requests)
+		}
+	}
+}
+
+// The nack reaches the listener after the restarted client has sealed under the
+// established epoch: its wrap under the old epoch was still in flight when the
+// listener established. The reseal is asked for at once.
+func TestLateNackFromAPeerSealingUnderTheEstablishedEpochResealsAtOnce(t *testing.T) {
+	r := newResealTestSession()
+	r.establish()
+	established := r.establish()
+	r.session.observePeerSealed(established.derivedTlsCipher)
+	if requests := r.takeRequests(); len(requests) != 0 {
+		t.Fatalf("reseals %v with no nack", requests)
+	}
+	r.session.handleUnknownWrapNack(established.epochId)
+	if requests := r.takeRequests(); len(requests) != 1 || requests[0] != established.derivedTlsCipher.sealGeneration {
+		t.Fatalf("reseals %v, want one under generation %d", requests, established.derivedTlsCipher.sealGeneration)
+	}
+}
+
+// A nack naming the prior epoch is from a peer that reads it and has yet to
+// verify the established one: it reads everything sealed under the prior, and
+// what it dropped went out under the established epoch, which a reseal leaves
+// alone. Nothing is owed.
+func TestNackFromAPeerOnThePriorEpochOwesNoReseal(t *testing.T) {
+	r := newResealTestSession()
+	prior := r.establish()
+	established := r.establish()
+	r.session.handleUnknownWrapNack(prior.epochId)
+	r.session.observePeerSealed(prior.derivedTlsCipher)
+	r.session.observePeerSealed(established.derivedTlsCipher)
+	if requests := r.takeRequests(); len(requests) != 0 {
+		t.Fatalf("reseals %v for a peer that reads the prior epoch", requests)
+	}
+	if r.session.resealOwed.Load() {
+		t.Fatal("a reseal is owed to a peer that reads the prior epoch")
+	}
+}
+
+// A reseal makes due at once each unacknowledged Pack the sequence last sealed
+// under another epoch than the established one, as receiver-state recovery,
+// and leaves alone a Pack sealed under the established epoch, one written in
+// plaintext, which the peer reads, and one the peer acknowledged selectively,
+// which it holds. A second reseal before the write changes nothing.
+func TestResealMakesDueOnlyWhatWentOutUnderAnotherEpoch(t *testing.T) {
+	r := newResealTestSession()
+	old := r.establish()
+	established := r.establish()
+	cases := []struct {
+		sealGeneration uint8
+		selectiveAcked bool
+		resealed       bool
+	}{
+		{sealGeneration: old.derivedTlsCipher.sealGeneration, resealed: true},
+		{sealGeneration: established.derivedTlsCipher.sealGeneration},
+		{sealGeneration: 0},
+		{sealGeneration: old.derivedTlsCipher.sealGeneration, selectiveAcked: true},
+	}
+	for _, c := range cases {
+		backlog := newCompactHeadBacklog(t)
+		backlog.sequence.session = r.session
+		item := backlog.one
+		due := item.resendTime
+		item.sealGeneration = c.sealGeneration
+		item.selectiveAcked = c.selectiveAcked
+		at := time.Now()
+		backlog.sequence.resealUnreadable(at)
+		if c.resealed {
+			if item.recoveryKind != sendRecoveryResealed || item.resendTime.After(at) ||
+				backlog.sequence.resendQueue.GetByMessageId(item.messageId) != item {
+				t.Fatalf("%+v: the Pack is not due at once as a reseal: kind %d", c, item.recoveryKind)
+			}
+			backlog.sequence.resealUnreadable(time.Now())
+			if item.recoveryKind != sendRecoveryResealed || item.resendTime.After(at) {
+				t.Fatalf("%+v: a second reseal changed the Pack", c)
+			}
+		} else if item.recoveryKind != sendRecoveryNone || item.resendTime != due {
+			t.Fatalf("%+v: the Pack was made due: kind %d", c, item.recoveryKind)
+		}
+		for _, other := range []*sendItem{backlog.head, backlog.two} {
+			if other.recoveryKind != sendRecoveryNone {
+				t.Fatalf("%+v: Pack %d, written in plaintext, was made due", c, other.sequenceNumber)
+			}
+		}
 	}
 }

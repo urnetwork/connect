@@ -2185,6 +2185,12 @@ type ClientSendRecoveryStatsSnapshot struct {
 	// receivers made that said so.
 	ReceiverLostWriteCount   uint64
 	NothingDeliveredAckCount uint64
+	// Packs last sealed under another epoch than their session's established
+	// one, written again at once under the established epoch, after the peer
+	// nacked a wrap it could not open and then sealed under the established
+	// epoch (`SendSequence.resealUnreadable`): a peer restarted in place, which
+	// holds none of its previous process's epochs.
+	ResealWriteCount uint64
 }
 
 // The Transfer endpoint. All callbacks are wrapped to check for nil and
@@ -2317,6 +2323,7 @@ type Client struct {
 	missingContractRequestCount         atomic.Uint64
 	receiverLostWriteCount              atomic.Uint64
 	nothingDeliveredAckCount            atomic.Uint64
+	resealWriteCount                    atomic.Uint64
 	compactRecoveryAckCount             atomic.Uint64
 	compactRecoveryContractCount        atomic.Uint64
 	unreliableFlowIsolationBypassCount  atomic.Uint64
@@ -2607,11 +2614,12 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 // non-nil key is shared with the session and every Peer that carries it, so it
 // must not be written.
 //
-// When no candidate opens a frame, each gets one more try once it has verified
-// the peer identity proof its newest epoch holds, if that is all the epoch
-// lacked (`peerEncryptionSession.verifyHeldPeerIdentityProofForUnwrap`): the
-// peer may have sealed under that epoch as soon as it verified this side's
-// proof.
+// The session that opens a frame learns which epoch the peer sealed it under
+// (`peerEncryptionSession.observePeerSealed`). When no candidate opens it, each
+// gets one more try once it has verified the peer identity proof its newest
+// epoch holds, if that is all the epoch lacked
+// (`peerEncryptionSession.verifyHeldPeerIdentityProofForUnwrap`): the peer may
+// have sealed under that epoch as soon as it verified this side's proof.
 func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
@@ -2648,6 +2656,7 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 		}
 		for _, cipher := range ciphers {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
+				session.observePeerSealed(cipher)
 				return plaintext, true
 			}
 		}
@@ -2806,6 +2815,7 @@ func (self *Client) SendRecoveryStats() ClientSendRecoveryStatsSnapshot {
 		MissingContractRequestCount:            self.missingContractRequestCount.Load(),
 		ReceiverLostWriteCount:                 self.receiverLostWriteCount.Load(),
 		NothingDeliveredAckCount:               self.nothingDeliveredAckCount.Load(),
+		ResealWriteCount:                       self.resealWriteCount.Load(),
 		CompactRecoveryAckCount:                self.compactRecoveryAckCount.Load(),
 		CompactRecoveryContractCount:           self.compactRecoveryContractCount.Load(),
 		UnreliableFlowIsolationBypassCount:     self.unreliableFlowIsolationBypassCount.Load(),
@@ -3427,6 +3437,8 @@ func (self *Client) recordSendRecovery(recoveryKind sendRecoveryKind, writeErr e
 		self.sendEvictionResendCount.Add(1)
 	case sendRecoveryReceiverLost:
 		self.receiverLostWriteCount.Add(1)
+	case sendRecoveryResealed:
+		self.resealWriteCount.Add(1)
 	}
 	if writeErr != nil {
 		self.recoveryWriteErrorCount.Add(1)
@@ -7403,6 +7415,11 @@ type SendSequence struct {
 	// (rewriteForLostReceiver), so a later saying of it makes due only the
 	// items above it, each at most once.
 	receiverLostRewrittenBelow uint64
+	// Set by the session once the peer, which nacked a wrap of the session it
+	// could not open, seals under the established epoch (requestReseal); the
+	// send worker takes it on its next pass and writes again what it last
+	// sealed under another epoch (resealUnreadable).
+	resealRequested atomic.Bool
 	// Nil in production; deterministically observes full-flight recovery work.
 	beforeSelectiveAckRecoveryForTest func()
 
@@ -10224,6 +10241,10 @@ sendSequenceLoop:
 		}
 		for messageId, ack := range ackSnapshot.contractMissingAcks {
 			self.receiveContractMissingAck(messageId, ack)
+		}
+		// taken after the snapshot, which drains the wake a request made
+		if self.resealRequested.Swap(false) {
+			self.resealUnreadable(time.Now())
 		}
 		if self.sendBuffer != nil && self.sendBuffer.afterApplyAckSnapshotForTest != nil {
 			self.sendBuffer.afterApplyAckSnapshotForTest(self.id())
@@ -14828,6 +14849,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 			// ownership stays here: undo the consumer's share or the buffer can
 			// never reach zero references and silently leaves the pool
 			MessagePoolReturn(shared)
+		} else if item != nil {
+			// what the peer reads whatever epochs it holds
+			item.sealGeneration = 0
 		}
 		return disposition, err
 	}
@@ -14864,6 +14888,10 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	if err != nil {
 		// see the plaintext branch: a failed write leaves ownership here
 		MessagePoolReturn(shared)
+	} else if item != nil {
+		// a peer that turns out not to hold this epoch gets the item resealed
+		// (resealUnreadable)
+		item.sealGeneration = cipher.sealGeneration
 	}
 	return disposition, err
 }
@@ -15192,6 +15220,12 @@ const (
 	// Receiver-state recovery, as a missing contract is, so the write spends
 	// none of the item's backoff.
 	sendRecoveryReceiverLost
+	// the receiver could not open this one, last sealed under an epoch it does
+	// not hold, and has since sealed under the established epoch, which this
+	// write is sealed under (resealUnreadable): a receiver restarted in place,
+	// which holds none of its previous process's epochs. Receiver-state
+	// recovery, so the write spends none of the item's backoff.
+	sendRecoveryResealed
 )
 
 type sendItem struct {
@@ -15268,7 +15302,13 @@ type sendItem struct {
 	carrierChanged bool
 	// Two captured/current receiver-withdrawal bits, under queue.stateLock.
 	pendingEvictionPhases uint8
-	schedulingKey         sendSchedulingKey
+	// The seal generation of the epoch this item's latest write was sealed
+	// under (`sequenceCipher.sealGeneration`), zero for a plaintext write or
+	// none, so that a reseal finds what went out under an epoch the peer may
+	// not hold (`SendSequence.resealUnreadable`). Owned by the send worker; it
+	// takes the byte of padding before schedulingKey, so the item does not grow.
+	sealGeneration uint8
+	schedulingKey  sendSchedulingKey
 	// carrierRoute is the route of the newest successful write, any carrier;
 	// acknowledgement progress is reported per route from it (M6 watchdog).
 	carrierRoute Route

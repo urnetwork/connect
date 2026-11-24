@@ -284,6 +284,12 @@ func (t *sequenceTlsTransport) SetWriteDeadline(time.Time) error { return nil }
 // prepended to the ciphertext.
 type sequenceCipher struct {
 	aead cipher.AEAD
+	// The generation its session gave this cipher's epoch as it established,
+	// 1 to 255 and cycling, so that a send item records the epoch it was last
+	// sealed under in one byte (`sendItem.sealGeneration`); zero before. Written
+	// once, under the session's stateLock, before `Cipher` or `decryptCiphers`
+	// hands the cipher out.
+	sealGeneration uint8
 }
 
 func newSequenceCipher(tlsConn *tls.Conn) (*sequenceCipher, error) {
@@ -937,6 +943,14 @@ type EncryptionSettings struct {
 	beforeHandshakeCompletionForTest func(peerId Id, role sequenceTlsRole)
 	afterIdentityProofSentForTest    func(peerId Id, role sequenceTlsRole)
 	peerIdentityProofCheckedForTest  func(peerId Id, role sequenceTlsRole)
+	// Nil test observer of each unknown-wrap nack a session acted on, called
+	// outside the session lock once it has: the session's peer and role, and
+	// the epoch the nack named.
+	unknownWrapNackHandledForTest func(peerId Id, role sequenceTlsRole, nackEpochId Id)
+	// Nil test observer of each reseal a session asked its send sequences for
+	// (`peerEncryptionSession.requestReseal`), called outside the session lock
+	// with the generation of the epoch they reseal under.
+	resealRequestedForTest func(peerId Id, role sequenceTlsRole, sealGeneration uint8)
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -1367,6 +1381,28 @@ type peerEncryptionSession struct {
 	// on the sealing side. Guarded by stateLock.
 	lastUnknownWrapNackTime        time.Time
 	nextUnknownWrapNackRestartTime time.Time
+	// Sealing again what the peer could not open (see `oweResealForNack`). The
+	// generation the latest established cipher took
+	// (`sequenceCipher.sealGeneration`), and the one the latest reseal sealed
+	// under, so that one epoch is resealed under at most once; both cycle 1 to
+	// 255 and are guarded by stateLock. establishedSealGeneration mirrors the
+	// established cipher's generation, zero with none, for the receive loop's
+	// lock-free check (`observePeerSealed`).
+	sealGeneration            uint8
+	resealedGeneration        uint8
+	establishedSealGeneration atomic.Uint32
+	// A nack has said the peer could not open a wrap of this session, and
+	// nothing has been resealed for it yet: the reseal waits until the peer
+	// seals under the established epoch, and, when resealOwedPastGeneration is
+	// not zero, until that epoch is another one than the epoch of that
+	// generation, which the nack said the peer does not hold. The generation is
+	// guarded by stateLock.
+	resealOwed               atomic.Bool
+	resealOwedPastGeneration uint8
+	// The peer has sealed a wrap under the established epoch, so it holds that
+	// epoch. Cleared when the established epoch changes, and when a nack says
+	// the peer does not hold it.
+	peerSealsEstablished atomic.Bool
 	// The early ClientHello pace (`EncryptionSettings.EarlyClientHelloMinInterval`):
 	// when the session's burst is whole again, zero for a session that took
 	// none. Each early ClientHello that opens an attempt moves it one interval
@@ -3587,8 +3623,9 @@ func (self *peerEncryptionSession) verifyHeldPeerIdentityProofForUnwrap() bool {
 // markEstablishedWithLock promotes epoch e to the established epoch — its
 // cipher now serves wrap (`Cipher()`) and decrypt. The previously
 // established epoch is demoted to priorEstablishedEpoch, kept for decrypt
-// during the brief swap window; an even older prior is cancelled. Caller
-// holds stateLock.
+// during the brief swap window; an even older prior is cancelled. The cipher
+// takes the session's next seal generation, and the peer has yet to show it
+// holds the epoch. Caller holds stateLock.
 func (self *peerEncryptionSession) markEstablishedWithLock(e *tlsHandshakeEpoch) {
 	if self.establishedEpoch == e {
 		return
@@ -3598,6 +3635,16 @@ func (self *peerEncryptionSession) markEstablishedWithLock(e *tlsHandshakeEpoch)
 	}
 	self.priorEstablishedEpoch = self.establishedEpoch
 	self.establishedEpoch = e
+	if c := e.derivedTlsCipher; c != nil {
+		if c.sealGeneration == 0 {
+			self.sealGeneration = self.sealGeneration%255 + 1
+			c.sealGeneration = self.sealGeneration
+		}
+		self.establishedSealGeneration.Store(uint32(c.sealGeneration))
+	} else {
+		self.establishedSealGeneration.Store(0)
+	}
+	self.peerSealsEstablished.Store(false)
 	if self.stickyRequired != nil {
 		self.stickyRequired.seal()
 	}
@@ -5313,7 +5360,20 @@ func (self *peerEncryptionSession) sendUnknownWrapNack() {
 // which it would otherwise meet first, leave this side's send sequences
 // (`dropStaleHandshakeRecords`). Once the recovery seals, the backlog's resend
 // carries the new epoch, its oldest Pack promoted to the sequence's head.
+//
+// In either role, and whatever the epoch named, the nack also owes the peer a
+// reseal (`oweResealForNack`): once the peer seals under the established
+// epoch, every Pack this session's send sequences last sealed under another
+// one is written again at once, sealed under the established epoch, rather
+// than at its own timer. A server-role session cannot re-handshake, but a
+// client that restarted in place and holds none of its previous process's
+// epochs re-handshakes itself, and it is this side's backlog sealed under the
+// old epoch, which it drops, that the reseal brings to it.
 func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
+	self.oweResealForNack(nackEpochId)
+	if self.settings != nil && self.settings.unknownWrapNackHandledForTest != nil {
+		defer self.settings.unknownWrapNackHandledForTest(self.peerId, self.role, nackEpochId)
+	}
 	demoted := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -5368,6 +5428,8 @@ func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 		demotedEpoch := self.epoch
 		self.establishedEpoch.cancel()
 		self.establishedEpoch = nil
+		self.establishedSealGeneration.Store(0)
+		self.peerSealsEstablished.Store(false)
 		self.buildAndStartEpochWithLock()
 		// Every attempt minted before the new one is dropped, so are its handshake
 		// records still queued or retransmittable: a peer that lost its session
@@ -5390,6 +5452,208 @@ func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 			Type:   EncryptionEventPeerSessionLost,
 			Reason: "the peer holds no session with this client",
 		})
+	}
+}
+
+// A nack says the peer could not open a wrap this session sealed, and names the
+// epoch the peer reads or is establishing, or none. The peer reads what is
+// sealed under an epoch it holds, so once it is seen to seal under the
+// established epoch, each of this session's send sequences writes again at once,
+// sealed under that epoch, every Pack it last sealed under another one
+// (`requestReseal`). A client restarted in place is the case: it holds none of
+// its previous process's epochs, drops what this side sealed under them, and
+// nacks, naming the epoch it is establishing. This side seals under the old
+// epoch until the new one establishes here, and those Packs would otherwise
+// wait out their own timers, which the restart has backed off or deferred: the
+// other cause of the one first stream in two hundred from such a client that
+// waited a resend.
+//
+//   - A nack naming the prior epoch is from a peer that reads it and has yet
+//     to verify the established one. It dropped a wrap sealed under the
+//     established epoch, which a reseal leaves alone, and reads what went out
+//     under the prior: nothing is owed.
+//   - A nack naming the established epoch, from a peer already seen sealing
+//     under it, reseals at once: the wrap it dropped went out under another
+//     epoch, before this side established, and was still in flight. Corruption
+//     in flight looks the same, and reseals nothing, since all it could
+//     concern was sealed under the established epoch.
+//   - Any other nack, an empty one included, owes the reseal until the peer
+//     seals under the established epoch. A nack naming another epoch than the
+//     established one, or none, says the peer does not hold the established
+//     one, and never will, since an epoch is the handshake that made it and the
+//     peer is on a newer one or on none: the reseal waits for an epoch
+//     established after it, and a wrap under the old epoch that arrives
+//     meanwhile, a straggler from the process the peer was before, shows
+//     nothing.
+//
+// One established epoch is resealed under at most once, and only Packs last
+// sealed under another epoch are written again, so repeated or forged nacks cost
+// a lock each once that is done.
+func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
+	generation := func() uint8 {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if nackEpochId != (Id{}) && self.priorEstablishedEpoch != nil &&
+			self.priorEstablishedEpoch.epochId == nackEpochId {
+			return 0
+		}
+		established := self.establishedEpoch
+		if established != nil && nackEpochId != (Id{}) && established.epochId == nackEpochId {
+			if self.peerSealsEstablished.Load() {
+				return self.takeResealWithLock()
+			}
+		} else {
+			self.peerSealsEstablished.Store(false)
+			self.resealOwedPastGeneration = 0
+			if established != nil && established.derivedTlsCipher != nil {
+				self.resealOwedPastGeneration = established.derivedTlsCipher.sealGeneration
+			}
+		}
+		self.resealOwed.Store(true)
+		return 0
+	}()
+	if generation != 0 {
+		self.requestReseal(generation)
+	}
+}
+
+// Notes, for the unwrap path, a wrap of the peer's that cipher opened. One
+// opened under the established epoch shows the peer holds that epoch, unless a
+// nack said it does not (`oweResealForNack`), and does a reseal a nack owes. Any
+// other wrap costs an atomic load, as does every wrap once the peer has been
+// seen sealing under the established epoch with no reseal owed.
+func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
+	if cipher == nil || cipher.sealGeneration == 0 ||
+		uint32(cipher.sealGeneration) != self.establishedSealGeneration.Load() {
+		return
+	}
+	if self.peerSealsEstablished.Load() && !self.resealOwed.Load() {
+		return
+	}
+	generation := func() uint8 {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher != cipher {
+			return 0
+		}
+		if self.resealOwed.Load() && cipher.sealGeneration == self.resealOwedPastGeneration {
+			// sealed under an epoch the peer has said it does not hold
+			return 0
+		}
+		self.peerSealsEstablished.Store(true)
+		if !self.resealOwed.Load() {
+			return 0
+		}
+		return self.takeResealWithLock()
+	}()
+	if generation != 0 {
+		self.requestReseal(generation)
+	}
+}
+
+// Takes the reseal under the established epoch, and answers that epoch's seal
+// generation, unless a reseal under it was taken already, when it answers zero.
+// Either way no reseal is owed after it. Caller holds stateLock.
+func (self *peerEncryptionSession) takeResealWithLock() uint8 {
+	self.resealOwed.Store(false)
+	self.resealOwedPastGeneration = 0
+	if self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil {
+		return 0
+	}
+	generation := self.establishedEpoch.derivedTlsCipher.sealGeneration
+	if generation == 0 || generation == self.resealedGeneration {
+		return 0
+	}
+	self.resealedGeneration = generation
+	return generation
+}
+
+// Asks each of this session's send sequences to write again, at once, the
+// Packs it last sealed under an epoch other than the established one, whose
+// seal generation is generation (`SendSequence.resealUnreadable`). Takes the
+// send buffer's lock briefly, as an acknowledgement's handoff from the receive
+// loop does.
+func (self *peerEncryptionSession) requestReseal(generation uint8) {
+	if self.settings != nil && self.settings.resealRequestedForTest != nil {
+		self.settings.resealRequestedForTest(self.peerId, self.role, generation)
+	}
+	if self.client == nil || self.client.sendBuffer == nil {
+		return
+	}
+	self.client.sendBuffer.requestReseal(self)
+}
+
+// Asks every send sequence that seals with session to reseal
+// (`SendSequence.requestReseal`): every sequence to the session's peer whose
+// session it is, through the destination index too, which holds a multi-hop
+// sequence's peer.
+func (self *SendBuffer) requestReseal(session *peerEncryptionSession) {
+	sequences := func() []*SendSequence {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		sequences := []*SendSequence{}
+		for id, sequence := range self.sendSequences {
+			if id.Destination == session.peerId && sequence.session == session {
+				sequences = append(sequences, sequence)
+			}
+		}
+		for sequence := range self.sendSequencesByDestination[session.peerId] {
+			if sequence.session == session && !slices.Contains(sequences, sequence) {
+				sequences = append(sequences, sequence)
+			}
+		}
+		return sequences
+	}()
+	for _, sequence := range sequences {
+		sequence.requestReseal()
+	}
+}
+
+// Asks the send worker to reseal on its next pass (`resealUnreadable`), and
+// wakes it, as an eviction notice does.
+func (self *SendSequence) requestReseal() {
+	self.resealRequested.Store(true)
+	if self.ackWindow != nil {
+		self.ackWindow.Wake()
+	}
+}
+
+// Makes due at once every Pack this sequence holds unacknowledged that it last
+// sealed under an epoch other than its session's established one, as recovery
+// for the receiver's state that spends none of the Pack's backoff
+// (sendRecoveryResealed): the peer said it could not open a wrap of the
+// session, and has since sealed under the established epoch, so it reads what is
+// sealed under that, and not necessarily what was sealed under any other
+// (`peerEncryptionSession.oweResealForNack`). The resend loop writes them in
+// sequence order, the oldest promoted to the head, each sealed under the
+// established epoch as it is written, which its generation then records, so a
+// later request writes a Pack again only once another epoch has established. A
+// Pack written in plaintext, which the peer reads, and a selectively
+// acknowledged one, which it holds, are left alone, and one already due keeps
+// its time, and its recovery kind if it has one. Runs on the send worker, which
+// owns the items.
+func (self *SendSequence) resealUnreadable(at time.Time) {
+	if self.session == nil {
+		return
+	}
+	cipher := self.session.Cipher()
+	if cipher == nil || cipher.sealGeneration == 0 {
+		return
+	}
+	for _, item := range self.sendItems {
+		if item == nil || item.selectiveAcked || item.sealGeneration == 0 ||
+			item.sealGeneration == cipher.sealGeneration {
+			continue
+		}
+		if item.resendTime.After(at) {
+			if !self.setResendTimeIfRetained(item, at) {
+				continue
+			}
+			item.recoveryKind = sendRecoveryResealed
+		} else if item.recoveryKind == sendRecoveryNone &&
+			self.resendQueue.GetByMessageId(item.messageId) == item {
+			item.recoveryKind = sendRecoveryResealed
+		}
 	}
 }
 
