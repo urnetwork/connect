@@ -2606,6 +2606,12 @@ func (self *Client) EncryptionSessionManager() *EncryptionSessionManager {
 // `peerEncryptionSession.verifiedClientKey` decides the session's cases. A
 // non-nil key is shared with the session and every Peer that carries it, so it
 // must not be written.
+//
+// When no candidate opens a frame, each gets one more try once it has verified
+// the peer identity proof its newest epoch holds, if that is all the epoch
+// lacked (`peerEncryptionSession.verifyHeldPeerIdentityProofForUnwrap`): the
+// peer may have sealed under that epoch as soon as it verified this side's
+// proof.
 func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, companionHint *bool, wrapped []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
 	if self.encryptionSessionManager == nil {
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("encryption disabled")
@@ -2634,21 +2640,37 @@ func (self *Client) unwrapFrame(sourceId Id, roleHint protocol.SequenceRole, com
 		return nil, sequenceTlsRoleServer, false, nil, fmt.Errorf("no encryption session for peer %s", sourceId)
 	}
 	var identityGated bool
-	for _, session := range ordered {
+	open := func(session *peerEncryptionSession) ([]byte, bool) {
 		ciphers, gated := session.decryptCiphers()
 		if gated {
 			identityGated = true
-			continue
+			return nil, false
 		}
 		for _, cipher := range ciphers {
 			if plaintext, err := cipher.Open(wrapped); err == nil {
-				// Taken here, from the session that authenticated this frame,
-				// not later from the session a receive sequence holds.
-				var verifiedClientKey *[ed25519.PublicKeySize]byte
-				if self.encryptionSessionManager.settings.ExposeVerifiedPeerClientKey {
-					verifiedClientKey = session.verifiedClientKey()
-				}
-				return plaintext, session.role, session.companion, verifiedClientKey, nil
+				return plaintext, true
+			}
+		}
+		return nil, false
+	}
+	opened := func(session *peerEncryptionSession, plaintext []byte) ([]byte, sequenceTlsRole, bool, *[ed25519.PublicKeySize]byte, error) {
+		// Taken here, from the session that authenticated this frame,
+		// not later from the session a receive sequence holds.
+		var verifiedClientKey *[ed25519.PublicKeySize]byte
+		if self.encryptionSessionManager.settings.ExposeVerifiedPeerClientKey {
+			verifiedClientKey = session.verifiedClientKey()
+		}
+		return plaintext, session.role, session.companion, verifiedClientKey, nil
+	}
+	for _, session := range ordered {
+		if plaintext, ok := open(session); ok {
+			return opened(session, plaintext)
+		}
+	}
+	for _, session := range ordered {
+		if session.verifyHeldPeerIdentityProofForUnwrap() {
+			if plaintext, ok := open(session); ok {
+				return opened(session, plaintext)
 			}
 		}
 	}

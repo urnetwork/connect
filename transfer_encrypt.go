@@ -926,6 +926,17 @@ type EncryptionSettings struct {
 	// the attempt it names, and whether the session took it. Called outside the
 	// session lock.
 	earlyClientHelloPacedForTest func(peerId Id, epochId Id, taken bool)
+	// Nil test hooks on a session's identity exchange, each called outside the
+	// session lock with the session's peer and role: as a peer identity proof
+	// is buffered on an epoch, before the session tries to verify it; as a
+	// handshake that succeeded starts its completion, before the epoch's cipher
+	// is derived; once the completion has sent this side's identity proof,
+	// before it verifies a peer proof the epoch holds; and as a verification
+	// has checked a proof's signature, before it records the verdict.
+	peerIdentityProofBufferedForTest func(peerId Id, role sequenceTlsRole)
+	beforeHandshakeCompletionForTest func(peerId Id, role sequenceTlsRole)
+	afterIdentityProofSentForTest    func(peerId Id, role sequenceTlsRole)
+	peerIdentityProofCheckedForTest  func(peerId Id, role sequenceTlsRole)
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -2068,6 +2079,9 @@ func (self *peerEncryptionSession) adoptEpochId(e *tlsHandshakeEpoch, epochId Id
 // `Cipher() != nil`, so an unset cipher is the same as never having one:
 // subsequent traffic flows in plaintext.
 func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err error) {
+	if err == nil && self.settings != nil && self.settings.beforeHandshakeCompletionForTest != nil {
+		self.settings.beforeHandshakeCompletionForTest(self.peerId, self.role)
+	}
 	logFailure := false
 	// read under the lock for the capability evidence below
 	negotiatedCurveId := tls.CurveID(0)
@@ -2160,7 +2174,17 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		// Send our identity proof and try to verify any peer proof
 		// that arrived early. Both happen on completed-handshake
 		// success; on failure neither path is meaningful.
+		//
+		// The proof goes first, so that the peer can read anything this side
+		// seals under the epoch, which it may from the verification on. That
+		// leaves a window, until the verification below, in which the peer can
+		// verify our proof and seal under the epoch before this side has
+		// verified the proof it already holds: the unwrap path closes it by
+		// verifying that proof itself (`verifyHeldPeerIdentityProofForUnwrap`).
 		self.sendIdentityProofOnce(e)
+		if self.settings != nil && self.settings.afterIdentityProofSentForTest != nil {
+			self.settings.afterIdentityProofSentForTest(self.peerId, self.role)
+		}
 		self.maybeVerifyPendingPeerIdentityProof(e)
 		self.startWorker("identity proof resend", func() {
 			self.resendIdentityProofForEstablishment(e)
@@ -2312,6 +2336,12 @@ func (self *peerEncryptionSession) identityProofResendWindow() time.Duration {
 // `completeHandshake`, `DeliverEncryptedControl(IdentityProof, ...)`, and
 // `SetPeerClientPublicKey`. Operates on the given epoch (the proof binds that
 // epoch's exporter); a nil epoch is a no-op.
+//
+// Two callers can verify the same proof at once: the completion of the
+// handshake, and the unwrap path that meets a wrap sealed under the epoch
+// first (`verifyHeldPeerIdentityProofForUnwrap`). Both reach the same verdict
+// on the same proof, and the first to record it acts on it; the other does
+// nothing more.
 func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHandshakeEpoch) {
 	if e == nil {
 		return
@@ -2351,13 +2381,22 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		return
 	}
 	ok := VerifyClientKeySignature(peerPub, exporter, payload)
+	if self.settings != nil && self.settings.peerIdentityProofCheckedForTest != nil {
+		self.settings.peerIdentityProofCheckedForTest(self.peerId, self.role)
+	}
 	logFailure := false
 	// set under the lock when e is promoted, for the capability evidence below
 	sealed := false
 	sealedCurveId := tls.CurveID(0)
+	// another caller recorded the verdict on this proof while this one verified
+	decided := false
 	identityFailed := func() bool {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
+		if e.peerIdentityVerified || e.identityFailedTerminal {
+			decided = true
+			return false
+		}
 		e.pendingPeerIdentityProof = nil
 		if ok {
 			e.peerIdentityVerified = true
@@ -2389,6 +2428,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 			return true
 		}
 	}()
+	if decided {
+		return
+	}
 	self.notifyIdleStateChanged()
 	if ok {
 		// always-on: one line per established session, the on-device signal
@@ -3096,6 +3138,9 @@ func (self *peerEncryptionSession) bufferPeerIdentityProof(e *tlsHandshakeEpoch,
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[tls]%s receivePeerIdentityProof buffered %d-byte proof — attempting verify\n", self.logTag, len(payload))
 	}
+	if self.settings != nil && self.settings.peerIdentityProofBufferedForTest != nil {
+		self.settings.peerIdentityProofBufferedForTest(self.peerId, self.role)
+	}
 	self.maybeVerifyPendingPeerIdentityProof(e)
 }
 
@@ -3496,6 +3541,47 @@ func (self *peerEncryptionSession) decryptCiphers() ([]*sequenceCipher, bool) {
 		out = append(out, self.priorEstablishedEpoch.derivedTlsCipher)
 	}
 	return out, false
+}
+
+// Verifies, for the unwrap path, the peer identity proof the newest epoch
+// already holds, when that verification is all the epoch lacks to establish,
+// and reports whether the epoch is established now: the caller tries its
+// ciphers again. The unwrap path calls it only for a wrap no cipher opened.
+//
+// That wrap can be the peer's first under the epoch, sealed in the window
+// `completeHandshake` leaves between sending this side's proof and verifying
+// the peer's: the peer verified our proof and sealed at once, while the proof
+// it sent before its seal was waiting here for that verification. Dropped, the
+// wrap waited a resend interval for its sender's resend. A client restarted in
+// place met this on its first stream to the listener that held its old
+// session: it was one of the two causes of the one such first stream in two
+// hundred that waited a resend. Verifying here takes the verification out of
+// the window: it is the same check on the same proof, acted on once whichever
+// caller gets there first, and nothing is opened under the epoch until its
+// proof has verified.
+//
+// It does no work but a lock and a few comparisons unless a proof is waiting
+// on a completed handshake, which happens once an epoch, and then a signature
+// check, as the completion would do.
+func (self *peerEncryptionSession) verifyHeldPeerIdentityProofForUnwrap() bool {
+	e := func() *tlsHandshakeEpoch {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		e := self.epoch
+		if e == nil || e == self.establishedEpoch || e.peerIdentityVerified || e.identityFailed ||
+			len(e.pendingPeerIdentityProof) == 0 || len(e.tlsExporter) == 0 ||
+			len(self.peerClientPublicKey) != ed25519.PublicKeySize {
+			return nil
+		}
+		return e
+	}()
+	if e == nil {
+		return false
+	}
+	self.maybeVerifyPendingPeerIdentityProof(e)
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.establishedEpoch == e
 }
 
 // markEstablishedWithLock promotes epoch e to the established epoch — its
