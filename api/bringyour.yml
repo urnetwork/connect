@@ -14030,16 +14030,16 @@ paths:
         its Delegation ends, as `/network/auth-key-revoke` answers.
 
         Every API key the member's user made in the team is deleted in the
-        same write, with the auth codes made from it and the network tokens
-        it minted, so none acts again, with a new role's reach, if the same
-        person later joins the team anew: `deleted_api_key_count` counts them,
-        the API key security notice lists them once, and each records an
-        `api_key.delete` admin event after the auth keys' events and before
-        the removal's `member.remove`. An API key has no bundle, so
-        `bundle_still_admits` speaks of auth keys alone. Each count is left
-        out when it is zero. A `MemberRevoke` that lands in the log with no
-        denial before it ends the member's auth keys and API keys the same
-        way.
+        same write, with the auth codes made from it, and the network tokens
+        it minted stop with its row, so none acts again, with a new role's
+        reach, if the same person later joins the team anew:
+        `deleted_api_key_count` counts them, the API key security notice
+        lists them once, and each records an `api_key.delete` admin event
+        after the auth keys' events and before the removal's `member.remove`.
+        An API key has no bundle, so `bundle_still_admits` speaks of auth
+        keys alone. Each count is left out when it is zero. A `MemberRevoke`
+        that lands in the log with no denial before it ends the member's auth
+        keys and API keys the same way.
 
         A member's credential reaches the route only with the members
         permission (`RolePermissionRefused`), and any other caller is refused
