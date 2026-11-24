@@ -384,13 +384,15 @@ type FindProviders2Args struct {
 	// server ignores it.
 	PostQuantumEncryption bool `json:"post_quantum_encryption,omitempty"`
 	// Keeps only modern providers in every draw, providers named by a
-	// `ClientId` spec included. A provider is modern when the platform's
-	// capability probe measured it within the last seven days negotiating
-	// end-to-end post-quantum encryption with resizable transfer windows, or,
-	// for a provider holding only a Network key, which the probe cannot reach,
-	// when its latest provide declared post-quantum encryption. A client whose
-	// window clients require end-to-end encryption sets it. With neither this
-	// nor `PostQuantumEncryption` set, the request is the capability-blind
+	// `ClientId` spec included, except a named provider in the caller's own
+	// network. A provider is modern when the platform's probe measured it
+	// negotiating end-to-end post-quantum encryption with resizable transfer
+	// windows; no provider is modern by its own declaration. The caller's own
+	// devices are answered without the requirement, since the probe cannot
+	// reach a device that provides only to its network; the window client
+	// still requires the sealed session with it. A client whose window
+	// clients require end-to-end encryption sets it. With neither this nor
+	// `PostQuantumEncryption` set, the request is the capability-blind
 	// discovery of an older client. An older server ignores it.
 	RequireModernProvider bool `json:"require_modern_provider,omitempty"`
 	// Asks for the requested targets only. Unset, as before the field, a city

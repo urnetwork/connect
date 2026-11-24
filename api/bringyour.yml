@@ -2931,6 +2931,11 @@ paths:
         and the tolerance can be tuned in the input.
         Note that a location or group will need to be mapped to an actual provider
         using `/network/find-providers2`.
+        With `require_modern_provider`, the list holds only the supply a
+        `/network/find-providers2` request with `require_modern_provider`
+        draws from (see `FindLocationsArgs`). An empty `query` then lists
+        the locations `/network/provider-locations` lists, without those
+        that have no modern provider.
       operationId: networkFindProviderLocations
       security: []
       requestBody:
@@ -16051,6 +16056,19 @@ components:
             stable: `quality`, the default, or `speed`, as `rank_mode` of
             `FindProviders2Args` describes them.
           type: string
+        require_modern_provider:
+          description: |
+            List only modern supply, the providers a
+            `/network/find-providers2` request with `require_modern_provider`
+            draws from. A location the platform's latest score export found
+            no modern provider for is left out, and each listed location's
+            `provider_count` and `stable` count its modern providers only. A
+            location whose supply was exported before the platform counted
+            modern providers is listed as without the field. A client whose
+            connections require end-to-end encryption sets it, so it is never
+            offered a location it cannot connect to; unset keeps the
+            capability-blind list.
+          type: boolean
 
     FindLocationsResult:
       type: object
@@ -16241,13 +16259,20 @@ components:
         require_modern_provider:
           description: |
             Keep only modern providers, in every draw, providers named by
-            `client_id` included. A provider holding a Public key is modern
-            when the platform's capability probe measured it, within the last
-            seven days, negotiating end-to-end post-quantum encryption with
-            resizable transfer windows. A provider holding only a Network key,
-            which the probe cannot reach, is modern when its latest provide
-            with a Network key declared post-quantum encryption sessions. A
-            provider holding neither key is never modern. With
+            `client_id` included, except a named provider in the caller's own
+            network. A provider is modern when the platform's probe measured
+            it negotiating end-to-end post-quantum encryption with resizable
+            transfer windows: a positive post-quantum outcome within the last
+            eight hours, with window evidence from the last seven days (only
+            the evidence of the last seven days while the platform's
+            post-quantum signal is not ready). No provider is modern by its
+            own declaration, whatever provide keys it holds, and a provider
+            holding neither a Public nor a Network key is never modern. A
+            provider named by `client_id` that belongs to the caller's own
+            network, one of the caller's own devices, is answered without the
+            requirement: the probe cannot reach a device that provides only to
+            its network, and the client still requires a sealed end-to-end
+            session with it, so nothing is ever sent to it in plaintext. With
             `post_quantum_encryption` too, both filters apply. A client whose
             connections require end-to-end encryption sets it; unset keeps
             the capability-blind answer.
