@@ -12259,6 +12259,69 @@ paths:
         "503":
           description: The mail cannot be judged or filed now; the sender sends it again.
 
+  /internal/gate/report-key/{network_id}:
+    get:
+      x-internal: true
+      tags: [Other]
+      summary: Read the network mail key a network's reports are sealed to
+      description: |
+        The platform listener's report intake reads, for a report at a
+        network's own report token, the key it seals the report's raw bytes
+        to (§14.8): the newest generation's drop key of the repo the
+        network's verified rows name as its mail repo (§15.8), which api
+        reads from gkm's drop-key route under a deposit token it issues
+        itself, and answers only once the generation verifies under an
+        identity key the network's log admits, passes the rotation checks,
+        covers every removal and holder expiry the newest state shows, and
+        its drop_not_after_ms has not passed; api keeps what it read at
+        most 5 minutes. No field when the network has none to seal to: its
+        rows name no mail repo, gkm serves no drop key or refuses the read,
+        or the newest fails a check; the intake then drops the raw bytes
+        unread and keeps the report's fields. The answer carries a public
+        key and no repo id. The platform listener's bearer only
+        (`mxedge-platform`). 503 with Retry-After when api cannot tell now,
+        so the listener answers 451 and the reporter sends the report again.
+      operationId: internalGateReportKey
+      security:
+        - InternalGateAuth: []
+      parameters:
+        - name: network_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The network's key, or none.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalGateReportKeyResult"
+        "400":
+          description: The network id is invalid or zero.
+          content:
+            text/plain:
+              schema: {type: string}
+        "403":
+          description: |
+            Refused before anything was read: api holds no verify file, the
+            bearer is none it holds, or it is not the platform listener's.
+            The body is the plain text "Forbidden.".
+          content:
+            text/plain:
+              schema: {type: string}
+        "503":
+          description: The key cannot be told now; the reporter sends the report again.
+          content:
+            text/plain:
+              schema: {type: string}
+
   /internal/gate/mail-direct-mx-probe:
     post:
       x-internal: true
@@ -32889,6 +32952,22 @@ components:
         paged:
           description: The pager took the notice's page; false beside `notice` is a page taskworker's clock pass owes.
           type: boolean
+    InternalGateReportKeyResult:
+      type: object
+      additionalProperties: false
+      properties:
+        public_key:
+          description: The drop key's X-Wing public key (1,216 bytes), base64; absent for none.
+          type: string
+          format: byte
+        generation:
+          description: The generation whose drop key it is; absent for none.
+          type: integer
+          format: int64
+        not_after_ms:
+          description: The drop key's drop_not_after_ms; absent for none. The intake seals to none at or past it.
+          type: integer
+          format: int64
     InternalGateMailDirectMxProbeArgs:
       type: object
       additionalProperties: false
