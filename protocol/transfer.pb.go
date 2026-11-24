@@ -1160,8 +1160,26 @@ type Ack struct {
 	// Field 10 rather than the design's 8: 8 and 9 were taken by the receive
 	// window advertisement and the eviction notice while §39.1 was written.
 	ContractAhead bool `protobuf:"varint,10,opt,name=contract_ahead,json=contractAhead,proto3" json:"contract_ahead,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// On a selective acknowledgement, and on a request for a compact head's
+	// contract (missing_contract_id): the receiver has delivered no frame of
+	// this sequence, so beyond what it has acknowledged it holds nothing below
+	// the Pack named by message_id, and, lacking the contract, it lost the
+	// sequence's state. A receiver restarted in place is the case (QD-1232):
+	// its new receive sequence starts at the first Pack that reaches it and
+	// that it can read, often the answer to its first open, a resent head, or
+	// a head that carries only the contract, while the Packs its previous
+	// process never acknowledged were sealed under keys the restarted one never
+	// had, or never reached it. A sender that reads it writes again, at once,
+	// every Pack the receiver has not acknowledged below this one, or, with a
+	// contract request, every one, the oldest as the sequence's head, rather
+	// than leaving them to timers that backed off toward MaxResendInterval
+	// through the restart; each Pack is written so at most once, and the write
+	// spends none of its backoff. False, or absent, on every other
+	// acknowledgement and from a legacy receiver, and a legacy sender does not
+	// read it, so either side alone keeps today's recovery.
+	NothingDelivered bool `protobuf:"varint,13,opt,name=nothing_delivered,json=nothingDelivered,proto3" json:"nothing_delivered,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Ack) Reset() {
@@ -1274,6 +1292,13 @@ func (x *Ack) GetEvictedSequenceNumbers() []uint64 {
 func (x *Ack) GetContractAhead() bool {
 	if x != nil {
 		return x.ContractAhead
+	}
+	return false
+}
+
+func (x *Ack) GetNothingDelivered() bool {
+	if x != nil {
+		return x.NothingDelivered
 	}
 	return false
 }
@@ -3705,7 +3730,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\xce\x05\n" +
+	"\x0f_contract_frame\"\xfb\x05\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3721,7 +3746,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\x19receiver_ack_delay_micros\x18\f \x01(\rH\x04R\x16receiverAckDelayMicros\x88\x01\x01\x128\n" +
 	"\x18evicted_sequence_numbers\x18\t \x03(\x04R\x16evictedSequenceNumbers\x12%\n" +
 	"\x0econtract_ahead\x18\n" +
-	" \x01(\bR\rcontractAheadB\x06\n" +
+	" \x01(\bR\rcontractAhead\x12+\n" +
+	"\x11nothing_delivered\x18\r \x01(\bR\x10nothingDeliveredB\x06\n" +
 	"\x04_tagB\x16\n" +
 	"\x14_missing_contract_idB\x1c\n" +
 	"\x1a_receive_window_byte_countB\x1e\n" +

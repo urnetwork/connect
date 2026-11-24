@@ -152,6 +152,11 @@ func (self *sequenceAckWindow) updateContractMissingWithLock(ack sequenceAck) {
 		if prior.unwrapped {
 			ack.unwrapped = true
 		}
+		// the receiver had lost the sequence's state when it said so
+		// (QD-1232), whatever it has delivered since
+		if prior.nothingDelivered {
+			ack.nothingDelivered = true
+		}
 		if prior.compactContractRecoverySupported {
 			ack.compactContractRecoverySupported = true
 		}
@@ -232,6 +237,7 @@ func (self *sequenceAckWindow) Restore(acks []sequenceAck) {
 			newer.unwrapped = newer.unwrapped || ack.unwrapped
 			newer.receiverTiming = newer.receiverTiming || ack.receiverTiming
 			newer.compactContractRecoverySupported = newer.compactContractRecoverySupported || ack.compactContractRecoverySupported
+			newer.nothingDelivered = newer.nothingDelivered || ack.nothingDelivered
 			if newer.transportType == TransportTypeUnknown {
 				newer.transportType = ack.transportType
 			}
@@ -261,6 +267,11 @@ func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCoun
 				}
 				if prior.compactContractRecoverySupported {
 					ack.compactContractRecoverySupported = true
+				}
+				// a later copy written after the receiver delivered does not
+				// take back what the Packs below this one were (QD-1232)
+				if prior.nothingDelivered {
+					ack.nothingDelivered = true
 				}
 				if ack.transportType == TransportTypeUnknown {
 					ack.transportType = prior.transportType

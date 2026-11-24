@@ -313,6 +313,7 @@ func buildEquivalentAckFrame(m *sendAckFrame) *protocol.TransferFrame {
 		ContractAhead:            m.contractAhead,
 		ReceiveWindowByteCount:   receiveWindowByteCount,
 		EvictedSequenceNumbers:   m.evictedSequenceNumbers,
+		NothingDelivered:         m.nothingDelivered,
 	}
 	tf := &protocol.TransferFrame{
 		TransferPath: m.path.ToProtobuf(),
@@ -390,6 +391,17 @@ func TestAckCodecEdgeCases(t *testing.T) {
 			sequenceId:         idA,
 			logicalLaneVersion: transferLogicalLaneVersion,
 			contractAhead:      true,
+		},
+		// field 13, which a receiver restarted in place sets on the selective
+		// ack of the first Pack it holds (QD-1232)
+		"nothing delivered": {
+			path:             TransferPath{DestinationId: idA, SourceId: idB},
+			messageId:        idC,
+			sequenceId:       idA,
+			selective:        true,
+			tagSendTime:      1_700_000_000_000,
+			tagSet:           true,
+			nothingDelivered: true,
 		},
 		// field 8, the advertised capacity. It is the OUTERMOST clamp on every
 		// send window, so a marshal that drops or corrupts it is silent in the
@@ -595,6 +607,7 @@ func TestAckCodecRandomized(t *testing.T) {
 		m.ackCompressTimeoutMicros = mathrandv2.Uint32()
 		m.receiverAckDelaySet = mathrandv2.IntN(2) == 0
 		m.receiverAckDelayMicros = mathrandv2.Uint32()
+		m.nothingDelivered = mathrandv2.IntN(2) == 0
 		assertAckCodecMatches(t, m)
 	}
 }

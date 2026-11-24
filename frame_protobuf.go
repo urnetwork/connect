@@ -365,6 +365,11 @@ type sendAckFrame struct {
 	// contract announced ahead of its data (THROUGHPUTFIX §39.1). Emitted only
 	// when true; absent is the legacy peer.
 	contractAhead bool
+	// nothingDelivered is Ack field 13: on a selective acknowledgement or a
+	// request for a missing contract, the receiver has delivered no frame of
+	// the sequence (QD-1232). Emitted only when true; absent is every other
+	// acknowledgement.
+	nothingDelivered bool
 }
 
 func (m *sendAckFrame) sizeAck() int {
@@ -406,6 +411,9 @@ func (m *sendAckFrame) sizeAck() int {
 	}
 	if m.receiverAckDelaySet {
 		n += protoSizeTag(12) + protoSizeVarint(uint64(m.receiverAckDelayMicros))
+	}
+	if m.nothingDelivered {
+		n += protoSizeTag(13) + 1
 	}
 	return n
 }
@@ -462,6 +470,10 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 	if m.receiverAckDelaySet {
 		b = protoAppendTag(b, 12, protoWireVarint)
 		b = protoAppendVarint(b, uint64(m.receiverAckDelayMicros))
+	}
+	if m.nothingDelivered {
+		b = protoAppendTag(b, 13, protoWireVarint)
+		b = append(b, 1)
 	}
 	return b
 }
@@ -1501,6 +1513,16 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 			b = b[vn:]
 			micros := uint32(v)
 			ack.ReceiverAckDelayMicros = &micros
+		case 13: // nothing_delivered
+			if typ != protowire.VarintType {
+				return nil, false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return nil, false
+			}
+			b = b[vn:]
+			ack.NothingDelivered = protowire.DecodeBool(v)
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1654,6 +1676,16 @@ func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
 			b = b[vn:]
 			decoded.ackReceiverDelayMicros = uint32(v)
 			ack.ReceiverAckDelayMicros = &decoded.ackReceiverDelayMicros
+		case 13: // nothing_delivered
+			if typ != protowire.VarintType {
+				return false
+			}
+			v, vn := protowire.ConsumeVarint(b)
+			if vn < 0 {
+				return false
+			}
+			b = b[vn:]
+			ack.NothingDelivered = protowire.DecodeBool(v)
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {

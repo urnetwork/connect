@@ -155,7 +155,7 @@ func TestAckReceiverDelayFitsEncodedEntryReservation(t *testing.T) {
 				receiveWindowSet: true, receiveWindowByteCount: math.MaxUint64,
 				ackCompressTimeoutSet: true, ackCompressTimeoutMicros: math.MaxUint32,
 				receiverAckDelaySet: true, receiverAckDelayMicros: math.MaxUint32,
-				contractAhead: true,
+				contractAhead: true, nothingDelivered: true,
 			}
 			wire := marshalSendAckTransferFrame(&frame)
 			if legacy {

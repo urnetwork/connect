@@ -2177,6 +2177,14 @@ type ClientSendRecoveryStatsSnapshot struct {
 	// Age of the newest acknowledgement of an item carried by an unreliable
 	// lane; zero when none was ever acknowledged (feeds a lane watchdog, M6).
 	UnreliableCarrierLastAckAge time.Duration
+	// Packs written again at once for a receiver that lost the sequence's
+	// state, which said it has delivered no frame of the sequence
+	// (Ack.nothing_delivered) on a selective ack or a request for a compact
+	// head's contract: a receiver restarted in place (QD-1232).
+	// NothingDeliveredAckCount counts the acks and requests this client's
+	// receivers made that said so.
+	ReceiverLostWriteCount   uint64
+	NothingDeliveredAckCount uint64
 }
 
 // The Transfer endpoint. All callbacks are wrapped to check for nil and
@@ -2307,6 +2315,8 @@ type Client struct {
 	recoveryWriteErrorCount             atomic.Uint64
 	missingContractWriteCount           atomic.Uint64
 	missingContractRequestCount         atomic.Uint64
+	receiverLostWriteCount              atomic.Uint64
+	nothingDeliveredAckCount            atomic.Uint64
 	compactRecoveryAckCount             atomic.Uint64
 	compactRecoveryContractCount        atomic.Uint64
 	unreliableFlowIsolationBypassCount  atomic.Uint64
@@ -2772,6 +2782,8 @@ func (self *Client) SendRecoveryStats() ClientSendRecoveryStatsSnapshot {
 		RecoveryWriteErrorCount:                self.recoveryWriteErrorCount.Load(),
 		MissingContractWriteCount:              self.missingContractWriteCount.Load(),
 		MissingContractRequestCount:            self.missingContractRequestCount.Load(),
+		ReceiverLostWriteCount:                 self.receiverLostWriteCount.Load(),
+		NothingDeliveredAckCount:               self.nothingDeliveredAckCount.Load(),
 		CompactRecoveryAckCount:                self.compactRecoveryAckCount.Load(),
 		CompactRecoveryContractCount:           self.compactRecoveryContractCount.Load(),
 		UnreliableFlowIsolationBypassCount:     self.unreliableFlowIsolationBypassCount.Load(),
@@ -3391,6 +3403,8 @@ func (self *Client) recordSendRecovery(recoveryKind sendRecoveryKind, writeErr e
 		self.missingContractWriteCount.Add(1)
 	case sendRecoveryEviction:
 		self.sendEvictionResendCount.Add(1)
+	case sendRecoveryReceiverLost:
+		self.receiverLostWriteCount.Add(1)
 	}
 	if writeErr != nil {
 		self.recoveryWriteErrorCount.Add(1)
@@ -7362,6 +7376,11 @@ type SendSequence struct {
 	// Owned by the send worker. Once applied, selective evidence stays known
 	// for the sequence lifetime even after cumulative progress clears it.
 	selectiveAckObserved bool
+	// Owned by the send worker. Every item below this sequence number has been
+	// made due for a receiver that lost the sequence's state
+	// (rewriteForLostReceiver), so a later saying of it makes due only the
+	// items above it, each at most once.
+	receiverLostRewrittenBelow uint64
 	// Nil in production; deterministically observes full-flight recovery work.
 	beforeSelectiveAckRecoveryForTest func()
 
@@ -8331,6 +8350,9 @@ type receiveAckMessage struct {
 	// the receiver registers a contract announced ahead of its data
 	// (THROUGHPUTFIX §39.1); absent is the legacy peer
 	contractAheadSupported bool
+	// Ack.nothing_delivered, read on a selective ack and on a request for a
+	// missing contract only (QD-1232)
+	nothingDelivered bool
 	// what the receiver said it can still hold out of order; unset is a
 	// legacy peer, and zero is a receiver that is currently full. A receive
 	// hold is never near four gibibytes, so this is the narrow type and packs
@@ -8384,6 +8406,7 @@ func receiveAckMessageFromProtocol(ack *protocol.Ack) (receiveAckMessage, error)
 		selective:                        ack.Selective,
 		compactContractRecoverySupported: ack.CompactContractRecovery,
 		contractAheadSupported:           ack.ContractAhead,
+		nothingDelivered:                 ack.NothingDelivered && (ack.Selective || 0 < len(ack.MissingContractId)),
 	}
 	if ack.ReceiveWindowByteCount != nil {
 		receiveAck.receiveWindowByteCount = uint32(min(*ack.ReceiveWindowByteCount, math.MaxUint32))
@@ -8580,6 +8603,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		tag:                              ack.tag,
 		compactContractRecoverySupported: ack.compactContractRecoverySupported,
 		receiverTiming:                   ack.receiverAckDelaySet,
+		nothingDelivered:                 (ack.selective || ack.contractMissing) && ack.nothingDelivered,
 	}
 	if ack.contractMissing {
 		sequenceAck.contractMissing = true
@@ -10159,6 +10183,7 @@ sendSequenceLoop:
 				ackSnapshot.headAck.receiverTiming,
 			)
 		}
+		nothingDeliveredBelow := uint64(0)
 		for messageId, ack := range ackSnapshot.selectiveAcks {
 			self.receiveAckFeedbackAt(
 				messageId,
@@ -10168,9 +10193,15 @@ sendSequenceLoop:
 				ack.receivedAtNanos,
 				ack.receiverTiming,
 			)
+			if ack.nothingDelivered {
+				nothingDeliveredBelow = max(nothingDeliveredBelow, ack.sequenceNumber)
+			}
+		}
+		if 0 < nothingDeliveredBelow {
+			self.rewriteForLostReceiver(nothingDeliveredBelow, time.Now())
 		}
 		for messageId, ack := range ackSnapshot.contractMissingAcks {
-			self.receiveContractMissing(messageId, ack.missingContractId)
+			self.receiveContractMissingAck(messageId, ack)
 		}
 		if self.sendBuffer != nil && self.sendBuffer.afterApplyAckSnapshotForTest != nil {
 			self.sendBuffer.afterApplyAckSnapshotForTest(self.id())
@@ -12823,6 +12854,68 @@ func (self *SendSequence) receiveContractMissing(
 	return true
 }
 
+// A receiver asked for a compact head's contract. One that also says it has
+// delivered no frame of the sequence (Ack.nothing_delivered) lost the
+// sequence's state, so everything it has not acknowledged is missing there,
+// and all of it is written again with the rebuilt head
+// (rewriteForLostReceiver). One that has delivered still holds what it took
+// and lacks only the contract, as one that retired it behind
+// MaxOpenReceiveContract newer ones does, so only the head is rebuilt.
+func (self *SendSequence) receiveContractMissingAck(messageId Id, ack sequenceAck) {
+	if self.receiveContractMissing(messageId, ack.missingContractId) && ack.nothingDelivered {
+		self.rewriteForLostReceiver(self.nextSequenceNumber, time.Now())
+	}
+}
+
+// The receiver lost this sequence's state, so every Pack numbered under below
+// that it has not acknowledged is missing there, the sequence's head among them
+// unless that carried only the contract. The receiver says so
+// (Ack.nothing_delivered): on a selective ack, whose Pack is the bound, and on a
+// request for a compact head's contract, for which the bound is everything
+// sent (receiveContractMissingAck). A receiver restarted in place is the case
+// (QD-1232): it starts the sequence at the first Pack that reaches it and that
+// it can read, often the answer to its first open or a resent head, while what
+// came before went to the process it replaced, or was sealed under keys only
+// that process had, and the timers that would bring it again have backed off
+// toward MaxResendInterval through the restart, or are deferred by the progress
+// the receiver's first acknowledgements make. So each such Pack is due at once,
+// as receiver-state recovery that spends none of its backoff, and the resend
+// loop writes them in sequence order, the oldest promoted to the head
+// (selectDueRecovery). A Pack already due keeps its time, and an ordinary
+// timer's Pack among them becomes this recovery too, which no
+// cumulative-progress deferral holds. A Pack is written so at most once:
+// receiverLostRewrittenBelow records how far this has run, so a repeated or
+// later saying writes only what lies above it. A selectively acknowledged Pack
+// is held there already, and one the queue does not retain is being
+// acknowledged or retired.
+func (self *SendSequence) rewriteForLostReceiver(below uint64, at time.Time) {
+	if below <= self.receiverLostRewrittenBelow {
+		return
+	}
+	from := self.receiverLostRewrittenBelow
+	self.receiverLostRewrittenBelow = below
+	for _, item := range self.sendItems {
+		if item == nil || item.sequenceNumber < from {
+			continue
+		}
+		if below <= item.sequenceNumber {
+			break
+		}
+		if item.selectiveAcked {
+			continue
+		}
+		if item.resendTime.After(at) {
+			if !self.setResendTimeIfRetained(item, at) {
+				continue
+			}
+			item.recoveryKind = sendRecoveryReceiverLost
+		} else if item.recoveryKind == sendRecoveryNone &&
+			self.resendQueue.GetByMessageId(item.messageId) == item {
+			item.recoveryKind = sendRecoveryReceiverLost
+		}
+	}
+}
+
 /*
 func (self *SendSequence) setTag(item *sendItem) ([]byte, error) {
 	self.log.V(1).Infof("[s]set tag %s->%s...%s s(%s)\n", self.client.ClientTag(), self.intermediaryIds, self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -15072,6 +15165,11 @@ const (
 	// a few late packets and an eviction generation is bounded by what was in
 	// flight on a dead route, so these ride the unbounded path.
 	sendRecoveryEviction
+	// the receiver lost the sequence's state, so it lacks this one
+	// (rewriteForLostReceiver): a receiver restarted in place (QD-1232).
+	// Receiver-state recovery, as a missing contract is, so the write spends
+	// none of the item's backoff.
+	sendRecoveryReceiverLost
 )
 
 type sendItem struct {
@@ -16324,6 +16422,11 @@ type ReceiveSequence struct {
 	// a later replacement waits for its exit rather than for predecessorExit.
 	// Guarded by the owning ReceiveBuffer's mutex.
 	started bool
+	// Whether this sequence has delivered an acknowledged Pack with a frame.
+	// Until it has, it holds no frame of the sender's below a Pack it holds,
+	// and its selective acks and its requests for a missing contract say so
+	// (Ack.nothing_delivered). Owned by Run.
+	frameDelivered bool
 
 	// session is the per-peer TLS session that decrypts this inbound stream,
 	// of role `encryptionRole` (the complement of the sender's role).
@@ -17092,6 +17195,7 @@ func (self *ReceiveSequence) Run() {
 					receiverAckDelayMicros:   receiverDelayMicros,
 					receiverAckDelaySet:      receiverDelaySet,
 					evictedSequenceNumbers:   evictedSequenceNumbers,
+					nothingDelivered:         (sendAck.selective || sendAck.contractMissing) && sendAck.nothingDelivered,
 				}
 				if sendAck.contractMissing {
 					saf.missingContractId = &sendAck.missingContractId
@@ -17117,6 +17221,7 @@ func (self *ReceiveSequence) Run() {
 					ack.ReceiveWindowByteCount = &receiveWindowByteCount
 				}
 				ack.EvictedSequenceNumbers = evictedSequenceNumbers
+				ack.NothingDelivered = (sendAck.selective || sendAck.contractMissing) && sendAck.nothingDelivered
 				if sendAck.contractMissing {
 					ack.MissingContractId = sendAck.missingContractId.Bytes()
 				}
@@ -17820,7 +17925,12 @@ func (self *ReceiveSequence) sendAck(
 	self.sendAckAt(sequenceNumber, messageId, selective, tag, unwrapped, transportType, 0)
 }
 
-// The ingress stamp and echoed tag name the same physical Pack copy.
+// The ingress stamp and echoed tag name the same physical Pack copy. A
+// selective ack from a sequence that has delivered no frame says the receiver
+// lacks every Pack below this one it has not acknowledged
+// (Ack.nothing_delivered): a receiver restarted in place, holding the first
+// Pack that reached it and that it could read, beyond at most a head that
+// carried only the contract (QD-1232).
 func (self *ReceiveSequence) sendAckAt(
 	sequenceNumber uint64,
 	messageId Id,
@@ -17839,6 +17949,10 @@ func (self *ReceiveSequence) sendAckAt(
 		compactContractRecoverySupported: true,
 		unwrapped:                        unwrapped,
 		transportType:                    transportType,
+		nothingDelivered:                 selective && !self.frameDelivered,
+	}
+	if ack.nothingDelivered && self.client != nil {
+		self.client.nothingDeliveredAckCount.Add(1)
 	}
 	self.ackWindow.Update(ack)
 }
@@ -17851,7 +17965,7 @@ func (self *ReceiveSequence) sendContractMissing(
 	transportType TransportType,
 ) {
 	self.client.missingContractRequestCount.Add(1)
-	self.ackWindow.UpdateContractMissing(sequenceAck{
+	ack := sequenceAck{
 		sequenceNumber:                   sequenceNumber,
 		messageId:                        messageId,
 		contractMissing:                  true,
@@ -17859,7 +17973,14 @@ func (self *ReceiveSequence) sendContractMissing(
 		compactContractRecoverySupported: true,
 		unwrapped:                        unwrapped,
 		transportType:                    transportType,
-	})
+		// a sequence that has delivered nothing and lacks the contract it
+		// acknowledged lost its state, so the sender writes everything again
+		nothingDelivered: !self.frameDelivered,
+	}
+	if ack.nothingDelivered {
+		self.client.nothingDeliveredAckCount.Add(1)
+	}
+	self.ackWindow.UpdateContractMissing(ack)
 }
 
 // Decodes the optional reference shared by compact acknowledged heads and
@@ -18456,6 +18577,9 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	self.peerAudit.Update(func(a *PeerAudit) {
 		a.received(item.messageByteCount)
 	})
+	if item.ack && 0 < len(item.frames) {
+		self.frameDelivered = true
+	}
 	var peer Peer
 
 	if item.contractId != nil {
@@ -19195,6 +19319,11 @@ type sequenceAck struct {
 	// Sender-only: metadata was handled at physical confirmation/coalescing,
 	// including rejected timing that must not fall back to legacy sampling.
 	receiverTiming bool
+	// On a selective ack or a request for a missing contract,
+	// Ack.nothing_delivered: the receiver's sequence has delivered no frame, so
+	// it lacks every Pack below this one that it has not acknowledged, and,
+	// lacking the contract, every one (QD-1232).
+	nothingDelivered bool
 }
 
 type sequenceContract struct {

@@ -114,6 +114,46 @@ func newReplacementFixture(t *testing.T) *replacementFixture {
 	return f
 }
 
+// One acknowledgement the receiving client wrote for the fixture's source.
+type replacementFixtureAck struct {
+	messageId        Id
+	selective        bool
+	contractMissing  bool
+	nothingDelivered bool
+}
+
+// Reads every acknowledgement written so far, in order.
+func (self *replacementFixture) takeAcks() []replacementFixtureAck {
+	self.t.Helper()
+	var acks []replacementFixtureAck
+	for {
+		select {
+		case wire := <-self.output:
+			var frame protocol.TransferFrame
+			err := ProtoUnmarshal(wire, &frame)
+			MessagePoolReturn(wire)
+			if err != nil {
+				self.t.Fatalf("a written frame does not decode: %v", err)
+			}
+			if frame.Ack == nil {
+				continue
+			}
+			messageId, err := IdFromBytes(frame.Ack.MessageId)
+			if err != nil {
+				self.t.Fatalf("an ack names no message: %v", err)
+			}
+			acks = append(acks, replacementFixtureAck{
+				messageId:        messageId,
+				selective:        frame.Ack.Selective,
+				contractMissing:  0 < len(frame.Ack.MissingContractId),
+				nothingDelivered: frame.Ack.NothingDelivered,
+			})
+		default:
+			return acks
+		}
+	}
+}
+
 // Holds the worker of sequenceId at its exit until the returned release runs.
 func (self *replacementFixture) hold(sequenceId Id) func() {
 	release := make(chan struct{})
@@ -145,35 +185,26 @@ func (self *replacementFixture) reachedWait(sequenceId Id) bool {
 	return self.waiting[sequenceId]
 }
 
-// Offers one Pack of sequenceId as the shared receive pump does, with a zero
-// handoff timeout, fails unless the buffer took it, and answers its message id.
-func (self *replacementFixture) offer(sequenceId Id, number uint64, payload string) Id {
+// Hands pack to the buffer as the shared receive pump does, with a zero handoff
+// timeout, and fails unless the buffer took it.
+func (self *replacementFixture) handOff(pack *protocol.Pack, byteCount ByteCount, what string) {
 	self.t.Helper()
-	messageId := NewId()
-	pack := &protocol.Pack{
-		MessageId:      messageId.Bytes(),
-		SequenceId:     sequenceId.Bytes(),
-		SequenceNumber: number,
-		Head:           number == 0,
-		Frames: []*protocol.Frame{{
-			MessageType:  protocol.MessageType_IpIpPacketToProvider,
-			MessageBytes: MessagePoolCopy([]byte(payload)),
-		}},
-	}
 	wire, err := ProtoMarshal(&protocol.TransferFrame{
 		TransferPath: sendTransferPath(self.source.SourceId, DestinationId(self.client.ClientId())).ToProtobuf(),
 		Pack:         pack,
 	})
 	if err != nil {
-		MessagePoolReturn(pack.Frames[0].MessageBytes)
-		self.t.Fatalf("marshal a receive Pack: %v", err)
+		for _, frame := range pack.Frames {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		self.t.Fatalf("marshal %s: %v", what, err)
 	}
 	receivePack := &ReceivePack{
 		Source:             self.source,
-		SequenceId:         sequenceId,
+		SequenceId:         RequireIdFromBytes(pack.SequenceId),
 		Pack:               pack,
 		ReceiveCallback:    self.client.receiveCallback,
-		MessageByteCount:   ByteCount(len(payload)),
+		MessageByteCount:   byteCount,
 		TransferFrameBytes: wire,
 		TransportType:      TransportTypeH1,
 		Ctx:                self.ctx,
@@ -185,8 +216,53 @@ func (self *replacementFixture) offer(sequenceId Id, number uint64, payload stri
 		receivePack.messagePoolReturn()
 	}
 	if !accepted || err != nil {
-		self.t.Fatalf("the shared pump's handoff of %q: accepted=%t err=%v", payload, accepted, err)
+		self.t.Fatalf("the shared pump's handoff of %s: accepted=%t err=%v", what, accepted, err)
 	}
+}
+
+// Offers one Pack of sequenceId and answers its message id.
+func (self *replacementFixture) offer(sequenceId Id, number uint64, payload string) Id {
+	self.t.Helper()
+	messageId := NewId()
+	self.handOff(&protocol.Pack{
+		MessageId:      messageId.Bytes(),
+		SequenceId:     sequenceId.Bytes(),
+		SequenceNumber: number,
+		Head:           number == 0,
+		Frames: []*protocol.Frame{{
+			MessageType:  protocol.MessageType_IpIpPacketToProvider,
+			MessageBytes: MessagePoolCopy([]byte(payload)),
+		}},
+	}, ByteCount(len(payload)), "\""+payload+"\"")
+	return messageId
+}
+
+// Offers the head of sequenceId with no frame, as a contract-only head is, and
+// answers its message id.
+func (self *replacementFixture) offerContractHead(sequenceId Id) Id {
+	self.t.Helper()
+	messageId := NewId()
+	self.handOff(&protocol.Pack{
+		MessageId:      messageId.Bytes(),
+		SequenceId:     sequenceId.Bytes(),
+		SequenceNumber: 0,
+		Head:           true,
+	}, 0, "a contract head")
+	return messageId
+}
+
+// Offers a compact head of sequenceId, one that names contractId and carries
+// no contract, and answers its message id.
+func (self *replacementFixture) offerCompactHead(sequenceId Id, number uint64, contractId Id) Id {
+	self.t.Helper()
+	messageId := NewId()
+	self.handOff(&protocol.Pack{
+		MessageId:      messageId.Bytes(),
+		SequenceId:     sequenceId.Bytes(),
+		SequenceNumber: number,
+		Head:           true,
+		ContractId:     contractId.Bytes(),
+	}, 0, "a compact head")
 	return messageId
 }
 
@@ -789,4 +865,409 @@ func TestRestartedClientsFirstOpenReachesItsListenerWithoutItsResend(t *testing.
 		t.Fatalf("the listener dropped %d of the restarted edge's Packs", drops)
 	}
 	t.Logf("the restarted edge's first open reached the listener %s after the restart", time.Since(startTime))
+}
+
+// A receive sequence that has delivered nothing holds a later Pack: the first
+// Pack that reaches a receiver restarted in place, the answer to its first open.
+// Its selective ack says so (Ack.nothing_delivered), so the sender writes what
+// the receiver lacks at once. Once the head has come and the sequence has
+// delivered, no ack says it, a later gap's included.
+func TestReceiverThatHasDeliveredNothingSaysSo(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newReplacementFixture(t)
+		sequenceId := NewId()
+		answer := f.offer(sequenceId, 2, "answer")
+		synctest.Wait()
+		acks := f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != answer || !acks[0].selective || !acks[0].nothingDelivered {
+			t.Fatalf("the held Pack's acks %+v do not say the sequence delivered nothing", acks)
+		}
+		if got := f.takeDelivered(); len(got) != 0 {
+			t.Fatalf("delivered %v with no head", got)
+		}
+
+		f.offer(sequenceId, 0, "head")
+		f.offer(sequenceId, 1, "next")
+		synctest.Wait()
+		if got := f.takeDelivered(); len(got) != 3 || got[0] != "head" || got[1] != "next" || got[2] != "answer" {
+			t.Fatalf("once the head came the sequence delivered %v", got)
+		}
+		for _, ack := range f.takeAcks() {
+			if ack.nothingDelivered {
+				t.Fatalf("an ack after the sequence delivered says it delivered nothing: %+v", ack)
+			}
+		}
+
+		later := f.offer(sequenceId, 4, "later")
+		synctest.Wait()
+		acks = f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != later || !acks[0].selective || acks[0].nothingDelivered {
+			t.Fatalf("a gap after delivery was acked %+v, want a selective ack without nothing_delivered", acks)
+		}
+		if requests := f.client.SendRecoveryStats().NothingDeliveredAckCount; requests != 1 {
+			t.Fatalf("%d nothing-delivered acks, want the one", requests)
+		}
+	})
+}
+
+// The other way a receiver restarted in place starts a sequence: the sender
+// writes the sequence's head again in plaintext, since it carries only the
+// contract, while the Packs behind it were sealed under keys the restarted
+// receiver never had, so it delivers the head and drops them. It has delivered
+// no frame, so the selective ack of the next Pack it can read still says so.
+func TestReceiverThatDeliveredOnlyAContractHeadSaysItDeliveredNothing(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newReplacementFixture(t)
+		sequenceId := NewId()
+		head := f.offerContractHead(sequenceId)
+		synctest.Wait()
+		acks := f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != head || acks[0].selective || acks[0].nothingDelivered {
+			t.Fatalf("the contract head was acked %+v, want one cumulative ack", acks)
+		}
+		answer := f.offer(sequenceId, 3, "answer")
+		synctest.Wait()
+		acks = f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != answer || !acks[0].selective || !acks[0].nothingDelivered {
+			t.Fatalf("the held answer's acks %+v do not say the sequence delivered nothing", acks)
+		}
+		f.offer(sequenceId, 1, "one")
+		f.offer(sequenceId, 2, "two")
+		synctest.Wait()
+		if got := f.takeDelivered(); len(got) != 3 || got[0] != "one" || got[1] != "two" || got[2] != "answer" {
+			t.Fatalf("once the missing Packs came the sequence delivered %v", got)
+		}
+		for _, ack := range f.takeAcks() {
+			if ack.nothingDelivered {
+				t.Fatalf("an ack after the sequence delivered says it delivered nothing: %+v", ack)
+			}
+		}
+	})
+}
+
+// A receive sequence that has delivered nothing gets a compact head whose
+// contract it does not hold, as a receiver restarted in place gets the sender's
+// resent head, so its request for the contract says it delivered nothing, and
+// the sender writes everything again with the head. Once the sequence has
+// delivered, a request for a contract it lacks asks for that alone.
+func TestReceiverMissingAContractSaysWhetherItDeliveredNothing(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newReplacementFixture(t)
+		sequenceId := NewId()
+		resent := f.offerCompactHead(sequenceId, 0, NewId())
+		synctest.Wait()
+		acks := f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != resent || !acks[0].contractMissing || !acks[0].nothingDelivered {
+			t.Fatalf("the resent head's acks %+v do not ask for its contract saying the sequence delivered nothing", acks)
+		}
+
+		f.offer(sequenceId, 0, "head")
+		synctest.Wait()
+		if got := f.takeDelivered(); len(got) != 1 || got[0] != "head" {
+			t.Fatalf("the sequence delivered %v, want its head", got)
+		}
+		f.takeAcks()
+		compact := f.offerCompactHead(sequenceId, 1, NewId())
+		synctest.Wait()
+		acks = f.takeAcks()
+		if len(acks) != 1 || acks[0].messageId != compact || !acks[0].contractMissing || acks[0].nothingDelivered {
+			t.Fatalf("after delivery the compact head's acks are %+v, want a request for its contract alone", acks)
+		}
+		if requests := f.client.SendRecoveryStats().NothingDeliveredAckCount; requests != 1 {
+			t.Fatalf("%d nothing-delivered sayings, want the one", requests)
+		}
+	})
+}
+
+// A selective ack that says the receiver has delivered nothing makes every Pack
+// below it that the receiver has not acknowledged due at once, as receiver-state
+// recovery, and each at most once: a repeated ack writes nothing again, and a
+// later one only what lies above the first. A Pack already due keeps its time
+// and takes the same recovery, and a Pack the receiver holds and the Packs above
+// the acknowledged one keep theirs.
+func TestSenderWritesEveryPackBelowANothingDeliveredAckAtOnce(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	now := base.Add(10 * time.Second)
+	sequence, items := newSelectiveAckRecoveryTestSequence(8, base)
+	items[2].selectiveAcked = true
+	items[4].selectiveAcked = true
+	sequence.setResendTime(items[1], base.Add(time.Second))
+	var originalDue [8]time.Time
+	for index, item := range items {
+		originalDue[index] = item.resendTime
+	}
+
+	sequence.rewriteForLostReceiver(4, now)
+	for index, item := range items {
+		wantDue, wantKind := originalDue[index], sendRecoveryNone
+		switch index {
+		case 0, 3:
+			wantDue, wantKind = now, sendRecoveryReceiverLost
+		case 1:
+			wantKind = sendRecoveryReceiverLost
+		}
+		if item.resendTime != wantDue || item.recoveryKind != wantKind {
+			t.Fatalf("item %d after the nothing-delivered ack: due %s kind %d, want %s kind %d",
+				index, item.resendTime.Sub(base), item.recoveryKind, wantDue.Sub(base), wantKind)
+		}
+		if item.sendCount != 1 || sequence.resendQueue.GetByMessageId(item.messageId) != item {
+			t.Fatalf("item %d lost its backoff or its retained ownership", index)
+		}
+	}
+	if first := sequence.resendQueue.PeekFirst(); first != items[1] ||
+		sequence.resendQueue.cmp(items[0], items[3]) >= 0 {
+		t.Fatal("the resend queue does not hold the already due Pack first and then the missing Packs oldest first")
+	}
+
+	later := now.Add(time.Second)
+	for index := range items {
+		items[index].recoveryKind = sendRecoveryNone
+	}
+	sequence.rewriteForLostReceiver(4, later)
+	sequence.rewriteForLostReceiver(3, later)
+	for index, item := range items {
+		if item.recoveryKind != sendRecoveryNone {
+			t.Fatalf("a repeated nothing-delivered ack wrote item %d again", index)
+		}
+	}
+
+	sequence.rewriteForLostReceiver(7, later)
+	for index, item := range items {
+		wantKind := sendRecoveryNone
+		if index == 5 || index == 6 {
+			wantKind = sendRecoveryReceiverLost
+		}
+		if item.recoveryKind != wantKind {
+			t.Fatalf("after a later nothing-delivered ack item %d has kind %d, want %d", index, item.recoveryKind, wantKind)
+		}
+	}
+	if items[5].resendTime != later || items[7].resendTime != originalDue[7] {
+		t.Fatal("the later ack did not make only the Packs above the first due")
+	}
+}
+
+// A sender whose compact head and the two Packs written behind it wait for
+// their acknowledgement, on their own timers.
+type compactHeadBacklog struct {
+	sequence   *SendSequence
+	contractId Id
+	head       *sendItem
+	one        *sendItem
+	two        *sendItem
+}
+
+func newCompactHeadBacklog(t *testing.T) *compactHeadBacklog {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	client, sequence, destinationId, contract := newSendNoContractHarness(t, ctx)
+	sequence.sendBuffer = client.sendBuffer
+	contract.compactContractRecoverySupported = true
+	contract.contract = &protocol.Contract{StoredContractBytes: make([]byte, 256)}
+	route := make(chan []byte, 3)
+	client.RouteManager().UpdateTransport(NewSendClientTransport(DestinationId(destinationId)), []Route{route})
+	for _, content := range []string{"head", "one", "two"} {
+		frame := RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: content})
+		if !contract.update(MessageByteCount([]*protocol.Frame{frame})) {
+			t.Fatalf("the contract refused %q", content)
+		}
+		sequence.sendRecord([]*protocol.Frame{frame}, sendAckRecord{}, noAckSendRecord{}, true, false)
+	}
+	for range 3 {
+		select {
+		case wire := <-route:
+			MessagePoolReturn(wire)
+		case <-ctx.Done():
+			t.Fatalf("wait for the writes: %v", ctx.Err())
+		}
+	}
+	if len(sequence.sendItems) != 3 || !sequence.sendItems[0].head || sequence.sendItems[0].hasContractFrame {
+		t.Fatal("the fixture did not write a compact head and two Packs behind it")
+	}
+	backlog := &compactHeadBacklog{
+		sequence:   sequence,
+		contractId: contract.contractId,
+		head:       sequence.sendItems[0],
+		one:        sequence.sendItems[1],
+		two:        sequence.sendItems[2],
+	}
+	now := time.Now()
+	if !backlog.one.resendTime.After(now) || !backlog.two.resendTime.After(now) {
+		t.Fatal("the Packs behind the head are already due")
+	}
+	t.Cleanup(func() {
+		items := []*sendItem{backlog.head, backlog.one, backlog.two}
+		for _, item := range items {
+			sequence.resendQueue.RemoveByMessageId(item.messageId)
+		}
+		sequence.sendItems = nil
+		for _, item := range items {
+			item.messagePoolReturn()
+		}
+	})
+	return backlog
+}
+
+// A receiver that asks for a compact head's contract and says it has delivered
+// no frame of the sequence lost the sequence's state: a client restarted in
+// place that the sender's resent head reached before the answer to its first
+// open did, and that would hold that answer behind the rest of the old
+// process's backlog. The request rebuilds the head, as before, and makes every
+// other unacknowledged Pack due at once, each once.
+func TestSenderWritesEverythingAgainForAReceiverThatLostItsContract(t *testing.T) {
+	backlog := newCompactHeadBacklog(t)
+	backlog.sequence.receiveContractMissingAck(backlog.head.messageId, sequenceAck{
+		contractMissing:   true,
+		missingContractId: backlog.contractId,
+		nothingDelivered:  true,
+	})
+	now := time.Now()
+	if !backlog.head.hasContractFrame || backlog.head.recoveryKind != sendRecoveryContractMissing {
+		t.Fatal("the head was not rebuilt with its contract")
+	}
+	for _, item := range []*sendItem{backlog.one, backlog.two} {
+		if item.recoveryKind != sendRecoveryReceiverLost || item.resendTime.After(now) ||
+			item.sendCount != 1 || backlog.sequence.resendQueue.GetByMessageId(item.messageId) != item {
+			t.Fatalf("Pack %d is not due at once for the lost receiver: kind %d", item.sequenceNumber, item.recoveryKind)
+		}
+	}
+	if backlog.sequence.receiverLostRewrittenBelow != 3 {
+		t.Fatalf("rewritten below %d, want every Pack sent", backlog.sequence.receiverLostRewrittenBelow)
+	}
+}
+
+// A receiver that asks for a compact head's contract after it has delivered
+// still holds what it took, and lacks only the contract, as one that retired it
+// behind MaxOpenReceiveContract newer ones does. Only the head is rebuilt; the
+// Packs behind it keep their timers.
+func TestSenderRebuildsOnlyTheHeadForAReceiverThatHasDelivered(t *testing.T) {
+	backlog := newCompactHeadBacklog(t)
+	oneDue, twoDue := backlog.one.resendTime, backlog.two.resendTime
+	backlog.sequence.receiveContractMissingAck(backlog.head.messageId, sequenceAck{
+		contractMissing:   true,
+		missingContractId: backlog.contractId,
+	})
+	if !backlog.head.hasContractFrame || backlog.head.recoveryKind != sendRecoveryContractMissing {
+		t.Fatal("the head was not rebuilt with its contract")
+	}
+	if backlog.one.resendTime != oneDue || backlog.two.resendTime != twoDue ||
+		backlog.one.recoveryKind != sendRecoveryNone || backlog.two.recoveryKind != sendRecoveryNone ||
+		backlog.sequence.receiverLostRewrittenBelow != 0 {
+		t.Fatal("a receiver that has delivered had the Packs behind the head written again")
+	}
+}
+
+// The ack window keeps a receiver's saying that it delivered nothing when a
+// later copy of the same acknowledgement, written after the sequence delivered,
+// coalesces with it, and when an unwritten response returns: the Packs below
+// were missing there when it said so.
+func TestAckWindowKeepsANothingDeliveredSaying(t *testing.T) {
+	window := newSequenceAckWindow()
+	held, resent := NewId(), NewId()
+	window.Update(sequenceAck{sequenceNumber: 3, messageId: held, selective: true, nothingDelivered: true})
+	window.Update(sequenceAck{sequenceNumber: 3, messageId: held, selective: true})
+	window.UpdateContractMissing(sequenceAck{
+		sequenceNumber: 1, messageId: resent, contractMissing: true, missingContractId: NewId(), nothingDelivered: true,
+	})
+	window.UpdateContractMissing(sequenceAck{
+		sequenceNumber: 1, messageId: resent, contractMissing: true, missingContractId: NewId(),
+	})
+	snapshot := window.Snapshot(true)
+	if !snapshot.selectiveAcks[held].nothingDelivered || !snapshot.contractMissingAcks[resent].nothingDelivered {
+		t.Fatal("a later copy took back the saying")
+	}
+
+	window.Update(sequenceAck{sequenceNumber: 3, messageId: held, selective: true})
+	window.Restore([]sequenceAck{{sequenceNumber: 3, messageId: held, selective: true, nothingDelivered: true}})
+	if snapshot := window.Snapshot(true); !snapshot.selectiveAcks[held].nothingDelivered {
+		t.Fatal("a returned response lost the saying to the newer copy")
+	}
+}
+
+// Both of the receive pump's decoders read Ack.nothing_delivered, the owned one on
+// the ack hot path and the allocating one, and a selective ack or a request for
+// a missing contract carries it to the sender's ack message, while a cumulative
+// ack never does.
+func TestAckNothingDeliveredDecodesOnEveryPath(t *testing.T) {
+	path := TransferPath{DestinationId: NewId(), SourceId: NewId()}
+	missingContractId := NewId()
+	for _, ack := range []struct {
+		selective       bool
+		contractMissing bool
+	}{{true, false}, {false, false}, {false, true}} {
+		frame := sendAckFrame{
+			path: path, messageId: NewId(), sequenceId: NewId(),
+			selective: ack.selective, nothingDelivered: true,
+		}
+		if ack.contractMissing {
+			frame.missingContractId = &missingContractId
+		}
+		wire := marshalSendAckTransferFrame(&frame)
+		var allocated protocol.TransferFrame
+		if !unmarshalTransferFrame(wire, &allocated, true) || allocated.Ack == nil || !allocated.Ack.NothingDelivered {
+			MessagePoolReturn(wire)
+			t.Fatalf("%+v: the allocating decoder lost nothing_delivered", ack)
+		}
+		decoded := inboundDecodedTransferFrames.take()
+		if !unmarshalOwnedTransferFrame(wire, decoded, true) || decoded.frame.Ack == nil || !decoded.frame.Ack.NothingDelivered {
+			inboundDecodedTransferFrames.put(decoded)
+			MessagePoolReturn(wire)
+			t.Fatalf("%+v: the owned decoder lost nothing_delivered", ack)
+		}
+		message, err := receiveAckMessageFromProtocol(decoded.frame.Ack)
+		inboundDecodedTransferFrames.put(decoded)
+		MessagePoolReturn(wire)
+		if want := ack.selective || ack.contractMissing; err != nil || message.nothingDelivered != want {
+			t.Fatalf("%+v: the ack message's nothing_delivered is %t, want %t (%v)", ack, message.nothingDelivered, want, err)
+		}
+	}
+}
+
+// The listener holds a write the old process never acknowledged when the edge
+// restarts in place. The restarted edge's open reaches the listener, and the
+// listener's answer, written on the same send sequence behind that write,
+// reaches the restarted edge within ReachTimeout: the restarted edge holds the
+// answer, says in its selective ack that it has delivered no frame of the
+// sequence, and the listener writes the old write again at once, as the head.
+// The listener's timers are set past the bound, so a broken run waits for them.
+// Before, the restarted edge held the answer until the listener's backoff
+// brought the old write again, and the measured runs waited up to 18.6 s.
+func TestRestartedClientGetsItsListenersAnswerWithoutTheListenersBackoff(t *testing.T) {
+	settings := defaultRestartFirstStreamTestSettings()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*settings.StepTimeout)
+	defer cancel()
+	pair := newRestartFirstStreamPair(t, ctx, settings, func(s *ClientSettings) {
+		// past ReachTimeout, so only the restarted edge's word brings the
+		// held write again within it
+		s.SendBufferSettings.MinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.RttMinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.MaxResendInterval = settings.ColdResendInterval
+	}, nil)
+	defer pair.close()
+
+	kept, key := pair.runToRestart()
+	// the old process never acknowledges it
+	pair.listenerSends("held", key)
+	startTime := time.Now()
+	pair.startEdge(kept)
+	pair.edgeSends("open after the restart")
+	open, ok := restartFirstStreamWait(pair.listenerGot, "open after the restart", startTime.Add(settings.ReachTimeout))
+	if !ok {
+		t.Fatalf("the restarted edge's open did not reach the listener within %s", settings.ReachTimeout)
+	}
+	openTime := time.Since(startTime)
+	pair.listenerSends("answer after the restart", open.key)
+	if _, ok := restartFirstStreamWait(pair.edgeGot, "answer after the restart", startTime.Add(settings.ReachTimeout)); !ok {
+		t.Fatalf("the listener's answer did not reach the restarted edge within %s (listener nothing-delivered writes %d, edge acks %d)",
+			settings.ReachTimeout, pair.listener.SendRecoveryStats().ReceiverLostWriteCount,
+			pair.currentEdge().SendRecoveryStats().NothingDeliveredAckCount)
+	}
+	if writes := pair.listener.SendRecoveryStats().ReceiverLostWriteCount; writes == 0 {
+		t.Fatal("the answer arrived without a nothing-delivered write: the scenario did not happen")
+	}
+	t.Logf("the restarted edge's open reached the listener %s after the restart, and the answer reached the edge %s after it",
+		openTime, time.Since(startTime))
 }
