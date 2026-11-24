@@ -943,6 +943,12 @@ type EncryptionSettings struct {
 	beforeHandshakeCompletionForTest func(peerId Id, role sequenceTlsRole)
 	afterIdentityProofSentForTest    func(peerId Id, role sequenceTlsRole)
 	peerIdentityProofCheckedForTest  func(peerId Id, role sequenceTlsRole)
+	// Nil test hooks, called outside the session lock with the session's peer
+	// and role: on the send worker, before it hands this side's identity proof
+	// to the send path; and once a verified epoch is promoted to the
+	// established one.
+	beforeIdentityProofHandOffForTest func(peerId Id, role sequenceTlsRole)
+	afterEpochEstablishedForTest      func(peerId Id, role sequenceTlsRole)
 	// Nil test observer of each unknown-wrap nack a session acted on, called
 	// outside the session lock once it has: the session's peer and role, and
 	// the epoch the nack named.
@@ -1142,6 +1148,17 @@ type tlsHandshakeEpoch struct {
 	// wire, so we don't double-send if the handshake or the peer-key-arrival
 	// path tries to trigger it again.
 	identityProofSent bool
+	// Set for an epoch the session builds, until the send path takes this
+	// side's identity proof for it: a worker hands the proof over once the
+	// handshake completes, and nothing is sealed under the epoch before then
+	// (`sealingEpochWithLock`). An initiator's seals ride the same send
+	// sequence as its proof, and one that went first would reach the peer
+	// ahead of the proof it needs.
+	awaitingProofHandOff bool
+	// Set as a responder that holds a prior epoch establishes this one, until
+	// the peer is seen sealing under it (`observePeerSealed`): the responder
+	// keeps sealing under the prior epoch until then (`sealingEpochWithLock`).
+	awaitingPeerSeal bool
 	// pendingPeerIdentityProof buffers the peer's `IdentityProof` payload when
 	// it arrives before we can verify it (no `tlsExporter` yet because our TLS
 	// handshake hasn't completed, or no peer public key yet).
@@ -1783,11 +1800,12 @@ func (self *peerEncryptionSession) buildAndStartEpochWithLock() {
 	}
 	ctx, cancel := context.WithCancel(self.ctx)
 	e := &tlsHandshakeEpoch{
-		ctx:               ctx,
-		cancel:            cancel,
-		transport:         newSequenceTlsTransport(ctx),
-		handshakeDone:     make(chan struct{}),
-		establishmentDone: make(chan struct{}),
+		ctx:                  ctx,
+		cancel:               cancel,
+		transport:            newSequenceTlsTransport(ctx),
+		handshakeDone:        make(chan struct{}),
+		establishmentDone:    make(chan struct{}),
+		awaitingProofHandOff: true,
 	}
 	// the initiator names the generation; the responder adopts the name from
 	// the inbound handshake (see adoptEpochId)
@@ -2056,6 +2074,10 @@ func (self *peerEncryptionSession) sendEncryptedControl(
 		if epochId := self.epochIdOf(e); epochId != (Id{}) {
 			ec.EpochId = epochId.Bytes()
 		}
+		if ec.ControlType == protocol.EncryptedControlType_EncryptedControlIdentityProof &&
+			self.settings != nil && self.settings.beforeIdentityProofHandOffForTest != nil {
+			self.settings.beforeIdentityProofHandOffForTest(self.peerId, self.role)
+		}
 		// Carry the EC on this session's (peer, companion, role) send sequence,
 		// keeping the session it drives referenced for the handshake. The
 		// carrier rides `carrierCompanion`'s contract, decoupled from the
@@ -2285,7 +2307,24 @@ func (self *peerEncryptionSession) sendIdentityProofOnce(e *tlsHandshakeEpoch) {
 		Payload:     payload,
 		SessionRole: self.role.toProtobuf(),
 		Companion:   self.companion,
-	}, nil)
+	}, func() {
+		self.markIdentityProofHandedOff(e)
+	})
+}
+
+// Records that the send path has taken this side's identity proof for epoch e,
+// so the epoch can seal (`sealingEpochWithLock`), and wakes the senders waiting
+// for a cipher when it is the established epoch. Runs on the send worker.
+func (self *peerEncryptionSession) markIdentityProofHandedOff(e *tlsHandshakeEpoch) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if !e.awaitingProofHandOff {
+		return
+	}
+	e.awaitingProofHandOff = false
+	if self.establishedEpoch == e {
+		self.notifyRequiredCipherChangedWithLock()
+	}
 }
 
 // resendIdentityProofForEstablishment re-sends the local identity proof on
@@ -2347,7 +2386,9 @@ func (self *peerEncryptionSession) resendIdentityProofForEstablishment(e *tlsHan
 			Payload:     payload,
 			SessionRole: self.role.toProtobuf(),
 			Companion:   self.companion,
-		}, nil)
+		}, func() {
+			self.markIdentityProofHandedOff(e)
+		})
 	}
 }
 
@@ -2482,6 +2523,9 @@ func (self *peerEncryptionSession) maybeVerifyPendingPeerIdentityProof(e *tlsHan
 		// established epoch swapped): the only promote path runs above
 		self.manager.peerIdentityChanged()
 		self.manager.notifySessionSealed(self)
+		if sealed && self.settings != nil && self.settings.afterEpochEstablishedForTest != nil {
+			self.settings.afterEpochEstablishedForTest(self.peerId, self.role)
+		}
 	} else {
 		if identityFailed {
 			if e.cancel != nil {
@@ -3476,7 +3520,57 @@ func (self *peerEncryptionSession) cipherWithLock() *sequenceCipher {
 	//
 	// Contract-only controls have their own plaintext bootstrap pin, including
 	// during rekey. They cannot rely on a retained cipher the peer may have lost.
-	return self.establishedEpoch.derivedTlsCipher
+	//
+	// The established epoch seals only once the peer can open what it seals
+	// (`sealingEpochWithLock`); until then the prior established epoch keeps
+	// sealing, as it did through the handshake, or, with none, nothing does.
+	sealing := self.sealingEpochWithLock()
+	if sealing == nil {
+		if self.client != nil && self.client.log.V(2).Enabled() {
+			self.client.log.V(2).Infof("[tls]%s Cipher()=nil: established epoch not sealing yet\n", self.logTag)
+		}
+		return nil
+	}
+	return sealing.derivedTlsCipher
+}
+
+// The epoch whose cipher seals (`Cipher`): the established epoch once the peer
+// can open what it seals, and before that the prior established epoch, nil
+// when there is none. Caller holds stateLock.
+//
+// The peer opens a wrap only once it has verified this side's identity proof
+// for the epoch, and the proof and the wraps can take separate ways:
+//
+//   - The proof is handed to the send path by a worker, after the handshake
+//     completes, and the epoch can establish first, from the peer's proof. An
+//     initiator's wraps ride the send sequence its proof rides, so the epoch
+//     seals once the proof is on it (`awaitingProofHandOff`): a wrap that went
+//     first reached the peer ahead of the proof, which dropped it, and the
+//     wrap waited for its resend.
+//   - A responder's proof rides its control carrier, apart from its replies,
+//     which can reach the peer ahead of the proof all the same. A responder
+//     that holds a prior epoch keeps sealing under it until the peer has been
+//     seen sealing under the established one (`awaitingPeerSeal`), which the
+//     peer does only once it has verified the proof; through a rekey the peer
+//     still opens the prior epoch. A responder with no prior epoch seals at
+//     once, as it always has, rather than send nothing.
+//
+// A peer restarted in place holds none of its previous process's epochs, so
+// what a responder seals under the prior epoch in the meantime does not reach
+// it; it nacks that, and once it seals under the established epoch the
+// responder writes it again at once (`oweResealForNack`).
+func (self *peerEncryptionSession) sealingEpochWithLock() *tlsHandshakeEpoch {
+	e := self.establishedEpoch
+	if e == nil {
+		return nil
+	}
+	if !e.awaitingProofHandOff && !e.awaitingPeerSeal {
+		return e
+	}
+	if prior := self.priorEstablishedEpoch; prior != nil && prior.derivedTlsCipher != nil {
+		return prior
+	}
+	return nil
 }
 
 // Snapshots the complete Required gate and its next state edge. Only client
@@ -3513,10 +3607,12 @@ func (self *peerEncryptionSession) establishHoldPending() bool {
 // epoch all fire. A hold that is over for good latches establishHoldEnded.
 // Before any establishment has started (a server-role session before the
 // peer's ClientHello) there is nothing to wait for yet, and nothing latches.
+// The first cipher is the first epoch that seals (`sealingEpochWithLock`), a
+// moment after it establishes.
 func (self *peerEncryptionSession) establishHoldState(now time.Time) (holding bool, changed <-chan struct{}, deadline time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.establishedEpoch != nil || 0 < self.initialHandshakeFailureCount {
+	if self.sealingEpochWithLock() != nil || 0 < self.initialHandshakeFailureCount {
 		self.establishHoldEnded.Store(true)
 		return false, nil, time.Time{}
 	}
@@ -3546,7 +3642,8 @@ func (self *peerEncryptionSession) notifyRequiredCipherChangedWithLock() {
 // Contract-only controls precede handshake bytes in the reliable sequence.
 // A retained application cipher cannot bootstrap a peer that lost that cipher.
 // An unsuccessful replacement is still unresolved; its timeout must not make
-// a later control depend on the same old cipher again.
+// a later control depend on the same old cipher again. Nor may one depend on
+// an established epoch that does not seal yet (`sealingEpochWithLock`).
 func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -3554,7 +3651,7 @@ func (self *peerEncryptionSession) contractControlNeedsPlaintext() bool {
 		return true
 	}
 	return self.establishedEpoch == nil || self.establishedEpoch.derivedTlsCipher == nil ||
-		self.epoch != self.establishedEpoch
+		self.epoch != self.establishedEpoch || self.sealingEpochWithLock() != self.establishedEpoch
 }
 
 // decryptCiphers returns the candidate ciphers for unwrapping an inbound
@@ -3590,11 +3687,10 @@ func (self *peerEncryptionSession) decryptCiphers() ([]*sequenceCipher, bool) {
 // it sent before its seal was waiting here for that verification. Dropped, the
 // wrap waited a resend interval for its sender's resend. A client restarted in
 // place met this on its first stream to the listener that held its old
-// session: it was one of the two causes of the one such first stream in two
-// hundred that waited a resend. Verifying here takes the verification out of
-// the window: it is the same check on the same proof, acted on once whichever
-// caller gets there first, and nothing is opened under the epoch until its
-// proof has verified.
+// session, one of the races that cost about one such first stream in a hundred
+// a resend. Verifying here takes the verification out of the window: it is the
+// same check on the same proof, acted on once whichever caller gets there
+// first, and nothing is opened under the epoch until its proof has verified.
 //
 // It does no work but a lock and a few comparisons unless a proof is waiting
 // on a completed handshake, which happens once an epoch, and then a signature
@@ -3635,6 +3731,9 @@ func (self *peerEncryptionSession) markEstablishedWithLock(e *tlsHandshakeEpoch)
 	}
 	self.priorEstablishedEpoch = self.establishedEpoch
 	self.establishedEpoch = e
+	// a responder seals under its prior epoch until the peer seals under this
+	// one (sealingEpochWithLock)
+	e.awaitingPeerSeal = self.role == sequenceTlsRoleServer && self.priorEstablishedEpoch != nil
 	if c := e.derivedTlsCipher; c != nil {
 		if c.sealGeneration == 0 {
 			self.sealGeneration = self.sealGeneration%255 + 1
@@ -5463,28 +5562,28 @@ func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 // (`requestReseal`). A client restarted in place is the case: it holds none of
 // its previous process's epochs, drops what this side sealed under them, and
 // nacks, naming the epoch it is establishing. This side seals under the old
-// epoch until the new one establishes here, and those Packs would otherwise
-// wait out their own timers, which the restart has backed off or deferred: the
-// other cause of the one first stream in two hundred from such a client that
-// waited a resend.
+// epoch until the new one establishes here, or longer (`sealingEpochWithLock`),
+// and those Packs would otherwise wait out their own timers, which the restart
+// has backed off or deferred.
 //
-//   - A nack naming the prior epoch is from a peer that reads it and has yet
-//     to verify the established one. It dropped a wrap sealed under the
-//     established epoch, which a reseal leaves alone, and reads what went out
-//     under the prior: nothing is owed.
 //   - A nack naming the established epoch, from a peer already seen sealing
 //     under it, reseals at once: the wrap it dropped went out under another
 //     epoch, before this side established, and was still in flight. Corruption
 //     in flight looks the same, and reseals nothing, since all it could
-//     concern was sealed under the established epoch.
-//   - Any other nack, an empty one included, owes the reseal until the peer
-//     seals under the established epoch. A nack naming another epoch than the
-//     established one, or none, says the peer does not hold the established
-//     one, and never will, since an epoch is the handshake that made it and the
-//     peer is on a newer one or on none: the reseal waits for an epoch
-//     established after it, and a wrap under the old epoch that arrives
-//     meanwhile, a straggler from the process the peer was before, shows
-//     nothing.
+//     concern was sealed under the established epoch. From a peer not yet seen
+//     sealing under it, the nack owes the reseal until it does.
+//   - A nack naming the prior epoch, or one older than the established epoch
+//     (epoch ids are time-ordered), is from a peer that lags behind the
+//     established epoch and is converging onto it. It reads what went out under
+//     the epoch it holds, and dropped a wrap sealed under the established one,
+//     which a reseal leaves alone: nothing is owed.
+//   - Any other nack, an empty one, one newer than the established epoch, or
+//     one with nothing established here, says the peer does not hold the
+//     established epoch, and never will, since an epoch is the handshake that
+//     made it and the peer is on a newer one or on none. It owes the reseal
+//     until the peer seals under an epoch established after it; a wrap under
+//     the old epoch that arrives meanwhile, a straggler from the process the
+//     peer was before, shows nothing.
 //
 // One established epoch is resealed under at most once, and only Packs last
 // sealed under another epoch are written again, so repeated or forged nacks cost
@@ -5493,16 +5592,17 @@ func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 	generation := func() uint8 {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		if nackEpochId != (Id{}) && self.priorEstablishedEpoch != nil &&
-			self.priorEstablishedEpoch.epochId == nackEpochId {
-			return 0
-		}
 		established := self.establishedEpoch
-		if established != nil && nackEpochId != (Id{}) && established.epochId == nackEpochId {
+		prior := self.priorEstablishedEpoch
+		switch {
+		case established != nil && nackEpochId != (Id{}) && established.epochId == nackEpochId:
 			if self.peerSealsEstablished.Load() {
 				return self.takeResealWithLock()
 			}
-		} else {
+		case established != nil && nackEpochId != (Id{}) &&
+			(prior != nil && prior.epochId == nackEpochId || nackEpochId.LessThan(established.epochId)):
+			return 0
+		default:
 			self.peerSealsEstablished.Store(false)
 			self.resealOwedPastGeneration = 0
 			if established != nil && established.derivedTlsCipher != nil {
@@ -5519,9 +5619,11 @@ func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 
 // Notes, for the unwrap path, a wrap of the peer's that cipher opened. One
 // opened under the established epoch shows the peer holds that epoch, unless a
-// nack said it does not (`oweResealForNack`), and does a reseal a nack owes. Any
-// other wrap costs an atomic load, as does every wrap once the peer has been
-// seen sealing under the established epoch with no reseal owed.
+// nack said it does not (`oweResealForNack`): a responder that sealed under its
+// prior epoch until then seals under the established one from here
+// (`sealingEpochWithLock`), and a reseal a nack owes is done. Any other wrap
+// costs an atomic load, as does every wrap once the peer has been seen sealing
+// under the established epoch with no reseal owed.
 func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 	if cipher == nil || cipher.sealGeneration == 0 ||
 		uint32(cipher.sealGeneration) != self.establishedSealGeneration.Load() {
@@ -5541,6 +5643,12 @@ func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 			return 0
 		}
 		self.peerSealsEstablished.Store(true)
+		if self.establishedEpoch.awaitingPeerSeal {
+			// a responder seals under the established epoch from here
+			// (sealingEpochWithLock)
+			self.establishedEpoch.awaitingPeerSeal = false
+			self.notifyRequiredCipherChangedWithLock()
+		}
 		if !self.resealOwed.Load() {
 			return 0
 		}
