@@ -542,17 +542,30 @@ func (self *PlatformTransport) refreshFamilyHold() {
 // network change (the kick, which the transport already subscribes to) and on
 // a control family policy change; the channels are captured before each
 // evaluation so a change between the two cannot be missed.
+//
+// It is one of the transport's workers: it ends with the transport's context,
+// and done waits for it (NewPlatformTransportWithTargetMode). A wake that
+// lands once the transport is closing ends it before another evaluation, so
+// the close waits for no further interface read. Nothing it calls (the
+// policy, the probe, the logger, the hold's monitors) waits for the close. A
+// callback of it may close the transport with the nonblocking Close but never
+// with CloseAndWait, which would wait for this watcher.
 func (self *PlatformTransport) runFamilyHoldWatcher() {
-	for {
+	for self.ctx.Err() == nil {
 		kick := self.kickMonitor.NotifyChannel()
 		policy := controlFamilyPolicyNotify()
 		self.refreshFamilyHold()
+		if self.settings.familyHoldWatcherWaitForTest != nil {
+			self.settings.familyHoldWatcherWaitForTest()
+		}
 		select {
 		case <-self.ctx.Done():
-			return
 		case <-kick:
 		case <-policy:
 		}
+	}
+	if self.settings.familyHoldWatcherExitForTest != nil {
+		self.settings.familyHoldWatcherExitForTest()
 	}
 }
 

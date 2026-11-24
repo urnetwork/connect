@@ -862,6 +862,17 @@ type PlatformTransportSettings struct {
 	// is about to wait for a change, with the transport, so a test can change
 	// the hold right after the watch read it.
 	connectionWatchWaitForTest func(transport *PlatformTransport)
+	// Nil outside package tests. Called each time a pinned transport's family
+	// hold watcher has evaluated the hold and is about to wait for a change.
+	familyHoldWatcherWaitForTest func()
+	// Nil outside package tests. Called once when a pinned transport's family
+	// hold watcher has seen the transport close, right before it returns, so a
+	// test can hold the watcher while the close goes on.
+	familyHoldWatcherExitForTest func()
+	// Nil outside package tests. Called once when the transport's close has
+	// joined run and is about to wait for a pinned transport's family hold
+	// watcher, before done closes.
+	familyHoldWatcherJoinForTest func()
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
@@ -1125,7 +1136,8 @@ type PlatformTransport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	log    Logger
-	// done closes after run joins every mode runner and its connection workers.
+	// done closes after run joins every mode runner and its connection workers,
+	// and after a pinned transport's family hold watcher has returned.
 	done chan struct{}
 
 	// runWaitGroup owns the mode runners started synchronously by run.
@@ -1888,15 +1900,38 @@ func NewPlatformTransportWithTargetMode(
 	// unsubscribe rides the run loop exit (ctx cancel), not just Close — most
 	// owners tear transports down by canceling the client ctx.
 	transport.unsubNetworkChange = AddNetworkChangeListener(transport.Kick)
+	// closes when a pinned transport's family hold watcher has returned; nil
+	// for a family-agnostic transport, which runs none
+	var familyHoldWatcherDone chan struct{}
 	if transport.pinned() {
 		// the initial hold is in place before any runner can dial, so a
 		// pinned transport on a device without its family never dials once
 		transport.refreshFamilyHold()
-		go HandleError(transport.runFamilyHoldWatcher, cancel)
+		familyHoldWatcherDone = make(chan struct{})
+		go HandleError(func() {
+			defer close(familyHoldWatcherDone)
+			transport.runFamilyHoldWatcher()
+		}, cancel)
 	}
 	go HandleError(func() {
 		defer close(transport.done)
 		defer transport.unsubNetworkChange()
+		// The watcher is one of the transport's workers, so done waits for it
+		// as for the mode runners. run cancels the transport before it
+		// returns, which ends the watcher's wait, and the join is deferred so
+		// a panic in run still makes it. It comes after run's own joins, so a
+		// watcher still in an interface read holds back no budget that run
+		// releases. The watcher waits for nothing of the close (see
+		// runFamilyHoldWatcher), so this join can never be its own.
+		defer func() {
+			if familyHoldWatcherDone == nil {
+				return
+			}
+			if transport.settings.familyHoldWatcherJoinForTest != nil {
+				transport.settings.familyHoldWatcherJoinForTest()
+			}
+			<-familyHoldWatcherDone
+		}()
 		transport.run()
 	}, cancel)
 	return transport
@@ -4591,6 +4626,9 @@ func (self *PlatformTransport) runH3(
 	}
 }
 
+// Close cancels the transport and returns without waiting for its workers, so
+// a callback the transport runs may call it; see Done and CloseAndWait for the
+// join.
 func (self *PlatformTransport) Close() {
 	self.cancel()
 	// unsubscribe eagerly (idempotent; the run loop's deferred unsubscribe
@@ -4602,14 +4640,16 @@ func (self *PlatformTransport) Close() {
 }
 
 // Closes after every mode runner and connection worker has released route,
-// socket, channel, and pooled-message ownership. Close remains nonblocking.
+// socket, channel, and pooled-message ownership, and a pinned transport's
+// family hold watcher has returned. Close remains nonblocking.
 func (self *PlatformTransport) Done() <-chan struct{} {
 	return self.done
 }
 
-// CloseAndWait cancels the transport and joins its owned mode runners. The
-// caller's context is only a liveness bound; cancellation continues after it
-// returns.
+// CloseAndWait cancels the transport and joins its owned mode runners and, on
+// a pinned transport, its family hold watcher. The caller's context is only a
+// liveness bound; cancellation continues after it returns. A callback the
+// transport runs must not call it: the join would wait for that callback.
 func (self *PlatformTransport) CloseAndWait(ctx context.Context) error {
 	self.Close()
 	select {
