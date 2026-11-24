@@ -9655,7 +9655,9 @@ paths:
   # may lack a planned route, and `x-internal` keeps it out of the public
   # reference and the generated client. A body is one of sidecar's protocol/gkm.proto
   # messages or a bare `Signed`, as application/octet-stream, and each description
-  # says which and which scope it takes.
+  # says which and which scope it takes. Each answers 503 with no body and a
+  # `Retry-After` when gkm cannot answer now: its 503 names the causes gkmservice's
+  # guard gives every route, then those its handler adds.
   /gkm/key-packages:
     servers:
       - url: https://gkm.bringyour.com
@@ -9688,6 +9690,16 @@ paths:
           description: Not the credential's sidecar, or not a member device.
         "429":
           description: Past the sidecar's count, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/key-packages/claim:
     servers:
@@ -9728,6 +9740,17 @@ paths:
           description: The target holds no KeyPackage.
         "429":
           description: Past the rate, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes whether the target reads the group's repo. No body. The
+            same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/reader-key:
     servers:
@@ -9758,6 +9781,16 @@ paths:
           description: Not the record's sidecar.
         "429":
           description: Past the daily limit, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/reader-key/{sidecar_id}:
     servers:
@@ -9791,6 +9824,15 @@ paths:
           description: Not an admitted sidecar's token.
         "404":
           description: The sidecar holds no ReaderKey.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/reader-keys:
     servers:
@@ -9826,6 +9868,15 @@ paths:
           description: Not an admitted sidecar's token.
         "429":
           description: Past a rate.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups:
     servers:
@@ -9858,6 +9909,19 @@ paths:
           description: The group holds other bytes.
         "429":
           description: Past a rate, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes the standing of generation 1's signer, an auth pin, the
+            form's or generation 1's, that the state has not reached yet, and
+            the record of a newly placed repo, which evs may not have written
+            yet. No body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}:
     servers:
@@ -9884,6 +9948,15 @@ paths:
           description: Out of scope.
         "404":
           description: No such group.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/repos/{repo_id}/drop-key:
     servers:
@@ -9923,6 +9996,15 @@ paths:
                 format: binary
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/repos/{repo_id}/forms:
     servers:
@@ -9953,6 +10035,15 @@ paths:
                 format: binary
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     post:
       x-internal: true
       tags: [Other]
@@ -10024,6 +10115,23 @@ paths:
                 format: binary
         "429":
           description: Past a rate, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes a form's auth pin that the state has not reached yet. It
+            answers so too when another write changes the old group's closing
+            marker under each of the 4 times gkm writes it, and when a re-form
+            is resent after another re-form voided its closing as stalled but
+            before that one took the marker, the old group holding no generation
+            past the form's: a later resend finds the 409 with the marker that
+            took over, once it stands. No body. The same request goes again
+            after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/epochs:
     servers:
@@ -10057,6 +10165,15 @@ paths:
                 format: binary
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/epochs/{n}:
     servers:
@@ -10106,6 +10223,17 @@ paths:
                 format: binary
         "429":
           description: Past 60 commits an hour, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes a commit's auth pin that the state has not reached yet. No
+            body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/gen:
     servers:
@@ -10139,6 +10267,15 @@ paths:
                 format: binary
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/gen/{g}:
     servers:
@@ -10198,6 +10335,19 @@ paths:
                 format: binary
         "429":
           description: Past 60 claims an hour, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes the signer's standing, a claim's auth pin that the state
+            has not reached yet, the members' current recovery bindings, and the
+            group's closing marker, read before the claim's write and after it.
+            No body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/wraps/{g}:
     servers:
@@ -10245,6 +10395,17 @@ paths:
                 format: binary
         "403":
           description: Out of scope, or not the caller's recipient.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. What it cannot tell
+            here includes whether a `d:` recipient is a forwarding Delegation of
+            the caller's. No body. The same request goes again after
+            `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/wraps/{g}/{c8}:
     servers:
@@ -10302,6 +10463,21 @@ paths:
           description: Out of scope.
         "429":
           description: Past a rate.
+        "503":
+          description: |
+            gkm cannot answer the batch now, and writes none of it: its gate is
+            closed to the token's network or to writes, it is draining, or it
+            cannot yet check the token or tell what its verified authorization
+            state or the store holds. What it cannot tell here includes the
+            repo's readers, the standing of a delivery's signer, a
+            DelegationWrap's Delegation row, and for a late delivery an auth pin
+            that the state has not reached yet and whether its recipient reads
+            the repo. A write budget that cannot admit the batch answers its
+            deliveries 0 or 429 instead. No body. The same request goes again
+            after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/recovery-wraps/{g}/{c8}:
     servers:
@@ -10350,6 +10526,18 @@ paths:
           description: Out of scope.
         "429":
           description: Past a rate.
+        "503":
+          description: |
+            gkm cannot answer the batch now, and writes none of it: its gate is
+            closed to the token's network or to writes, it is draining, or it
+            cannot yet check the token or tell what its verified authorization
+            state or the store holds. What it cannot tell here includes the
+            repo's readers and its members' current recovery bindings. A write
+            budget that cannot admit the batch answers its wraps 0 or 429
+            instead. No body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/ladder:
     servers:
@@ -10389,6 +10577,16 @@ paths:
           description: Out of order, off the chain, or past the form's generation.
         "429":
           description: Past a rate, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/welcome/{n}:
     servers:
@@ -10424,6 +10622,17 @@ paths:
           description: Out of scope, or not epoch `n`'s uploader.
         "429":
           description: Queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes whether each recipient reads the group's repo. No body. The
+            same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     head:
       x-internal: true
       x-status: planned
@@ -10447,6 +10656,16 @@ paths:
           description: Out of scope.
         "404":
           description: No Welcome is stored for epoch `n`.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. A store that does
+            not answer is a 503, never a 404, so a leaf removes no joiner on a
+            fault. No body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/group-info:
     servers:
@@ -10484,6 +10703,15 @@ paths:
           description: Out of scope.
         "404":
           description: The group holds none.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. No body. The same
+            request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     post:
       x-internal: true
       x-status: planned
@@ -10515,6 +10743,16 @@ paths:
           description: Its epoch does not rise.
         "429":
           description: Past one an epoch, or queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/groups/{group_id}/ack:
     servers:
@@ -10544,6 +10782,16 @@ paths:
           description: Taken.
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, or it cannot yet check the token or tell
+            what its verified authorization state, the store or the Redis that
+            keeps acks holds. No body. The same request goes again after
+            `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/welcomes:
     servers:
@@ -10569,6 +10817,17 @@ paths:
                 format: binary
         "403":
           description: Out of scope.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. What it cannot tell
+            here includes, for each pending Welcome, whether the token reaches
+            its repo and where that repo is placed. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/recovery/{member_id}/wraps:
     servers:
@@ -10608,7 +10867,16 @@ paths:
         "409":
           description: The binding is no longer current or replacement coverage is incomplete.
         "503":
-          description: The verified state or object store is unavailable.
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. What it cannot tell
+            here includes the member's wraps on any metadata cluster, every one
+            of which the read lists, and with `complete` the member's recovery
+            coverage. No body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     post:
       x-internal: true
       tags: [Other]
@@ -10638,6 +10906,17 @@ paths:
           description: That wrap exists.
         "429":
           description: Queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes the member's recovery coverage. No body. The same request
+            goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     delete:
       x-internal: true
       tags: [Other]
@@ -10663,6 +10942,18 @@ paths:
           description: Deleted.
         "403":
           description: Another member's device.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes the member's recovery coverage and the member's wraps on
+            any metadata cluster. No body. The same request goes again after
+            `Retry-After` and deletes what is left.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/delegation-keys:
     servers:
@@ -10704,6 +10995,17 @@ paths:
           description: Not a reader of the config.
         "404":
           description: No id names a forwarding Delegation gkm's newest verified state holds.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. What it cannot tell
+            here includes each Delegation's row, as when the state holds one
+            with no key digest or names two config repos for the network. No
+            body. The same request goes again after `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   /gkm/delegation-keys/{delegation_id}:
     servers:
@@ -10748,6 +11050,18 @@ paths:
           description: gkm's newest verified state does not hold the Delegation's row yet; the same request goes again once it does.
         "429":
           description: Queued out by the write budget.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network or
+            to writes, it is draining, the write budget cannot admit the write,
+            or it cannot yet check the token or tell what its verified
+            authorization state or the store holds. What it cannot tell here
+            includes the Delegation's row, as when the state holds it with no
+            key digest. No body. The same request goes again after
+            `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
     get:
       x-internal: true
       tags: [Other]
@@ -10779,6 +11093,17 @@ paths:
           description: Not a reader of the config.
         "404":
           description: No such object, or a Delegation that keeps its key in its row.
+        "503":
+          description: |
+            gkm cannot answer now: its gate is closed to the token's network, it
+            is draining, or it cannot yet check the token or tell what its
+            verified authorization state or the store holds. What it cannot tell
+            here includes the Delegation's row, as when the state holds it with
+            no key digest. No body. The same request goes again after
+            `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/GkmRetryAfter"
 
   # ----- oauth authorization server (server/IDP.md) -----
 
@@ -17908,6 +18233,20 @@ components:
           schema:
             type: string
           example: A sidecar token needs a proof of its client key on this route.
+  headers:
+    GkmRetryAfter:
+      description: |
+        Seconds before the same request goes again, on every 503 of gkm's: 60,
+        the interval at which gkm reads its gate again, while the gate is
+        closed to the token's network or to writes; else 1, as what did not
+        answer may answer soon. The first request for a network whose verified
+        authorization state gkm has not loaded starts that load. Before gkm is
+        ready, the process hosting it answers every route 503 too, with 1 and
+        the plain-text body `Service not ready.`.
+      required: true
+      schema:
+        type: integer
+        minimum: 1
   securitySchemes:
     BearerAuth:
       type: http

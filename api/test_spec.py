@@ -571,13 +571,14 @@ class GkmRoutesTest(unittest.TestCase):
         self.assertIn("bare ciphertext", responses["200"]["description"])
 
     def test_statuses_are_the_designs(self):
-        # a wrap's own 201, 412 and 409 ride its batch's 200, and a claim in a
-        # group a re-form closed answers 409 (QD-1186)
+        # a wrap's own 201, 412 and 409 ride its batch's 200, a claim in a
+        # group a re-form closed answers 409 (QD-1186), and gkm answers 503
+        # with Retry-After when it cannot answer now (§19.11)
         for path, want in {
-            "/gkm/groups/{group_id}/epochs/{n}": {"200", "403", "409", "429"},
-            "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "409", "412", "429"},
-            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"200", "403", "429"},
-            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"200", "403", "429"},
+            "/gkm/groups/{group_id}/epochs/{n}": {"200", "403", "409", "429", "503"},
+            "/gkm/groups/{group_id}/gen/{g}": {"201", "403", "409", "412", "429", "503"},
+            "/gkm/groups/{group_id}/wraps/{g}/{c8}": {"200", "403", "429", "503"},
+            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}": {"200", "403", "429", "503"},
         }.items():
             with self.subTest(path=path):
                 self.assertEqual(want, set(self.spec["paths"][path]["post"]["responses"]))
@@ -621,6 +622,77 @@ class GkmRoutesTest(unittest.TestCase):
                 _, description = response(path, "200")
                 self.assertIn("a re-form closed", description)
                 self.assertIn("409 with no winner", description)
+
+    def unavailable(self, method, path):
+        """An operation's 503 and its description on one line."""
+        response = self.spec["paths"][path][method]["responses"]["503"]
+        return response, " ".join(response["description"].split())
+
+    def test_every_route_answers_503_with_retry_after(self):
+        # gkmservice's guard answers 503 on every route when the gate is closed,
+        # gkm drains, or a token, state or store cannot be told, with no body
+        # and Retry-After: the gate's reread interval while it is closed, else
+        # UnavailableRetryAfter
+        retry_after = {"Retry-After": {"$ref": "#/components/headers/GkmRetryAfter"}}
+        for method, path in self.operations(True):
+            with self.subTest(path=path, method=method):
+                response, description = self.unavailable(method, path)
+                self.assertNotIn("content", response)
+                self.assertEqual(retry_after, response["headers"])
+                self.assertTrue(description.startswith("gkm cannot answer"), description)
+                self.assertIn("its gate is closed to the token's network", description)
+                self.assertIn("No body.", description)
+        header = self.spec["components"]["headers"]["GkmRetryAfter"]
+        self.assertTrue(header["required"])
+        self.assertEqual({"type": "integer", "minimum": 1}, header["schema"])
+        description = " ".join(header["description"].split())
+        self.assertIn("60, the interval at which gkm reads its gate again", description)
+        self.assertIn("else 1", description)
+
+    def test_a_routes_503_names_what_its_handler_adds(self):
+        # the gate also closes to writes, which are every route but a GET, a HEAD
+        # and the two batched reads (gkmservice's routes.go); a batch that cannot
+        # be judged is refused whole before any of it is written, while a budget
+        # refusal answers its items; HEAD welcome never turns a store fault into
+        # the 404 that removes a joiner; and a statement's auth pin the state has
+        # not reached yet waits rather than being refused
+        batched_reads = {("post", "/gkm/reader-keys"), ("post", "/gkm/delegation-keys")}
+        for method, path in self.operations(True):
+            with self.subTest(path=path, method=method):
+                _, description = self.unavailable(method, path)
+                write = method not in ("get", "head") and (method, path) not in batched_reads
+                self.assertEqual(write, "or to writes" in description)
+        for path in (
+            "/gkm/groups/{group_id}/wraps/{g}/{c8}",
+            "/gkm/groups/{group_id}/recovery-wraps/{g}/{c8}",
+        ):
+            with self.subTest(path=path):
+                _, description = self.unavailable("post", path)
+                self.assertIn("cannot answer the batch now, and writes none of it", description)
+                self.assertIn("0 or 429 instead", description)
+                self.assertNotIn("the write budget cannot admit the write", description)
+        _, description = self.unavailable("head", "/gkm/groups/{group_id}/welcome/{n}")
+        self.assertIn("never a 404", description)
+        for path in (
+            "/gkm/groups",
+            "/gkm/repos/{repo_id}/forms",
+            "/gkm/groups/{group_id}/epochs/{n}",
+            "/gkm/groups/{group_id}/gen/{g}",
+        ):
+            with self.subTest(path=path):
+                _, description = self.unavailable("post", path)
+                self.assertIn("auth pin", description)
+                self.assertIn("the state has not reached yet", description)
+
+    def test_a_resent_reform_whose_closing_was_taken_over_answers_503(self):
+        # QD-1188: another re-form voids a closing stalled 10 minutes, then takes
+        # the marker; the stalled form, resent in between, finds its closing
+        # void, no generation past its form and no marker yet, and answers 503,
+        # so a later resend finds the 409 with the marker that took over
+        _, description = self.unavailable("post", "/gkm/repos/{repo_id}/forms")
+        self.assertIn("voided its closing as stalled but before that one took the marker", description)
+        self.assertIn("a later resend finds the 409 with the marker that took over", description)
+        self.assertIn("under each of the 4 times gkm writes it", description)
 
     def test_check_routes_says_when_it_could_not_read_the_table(self):
         result = self.check_routes()
