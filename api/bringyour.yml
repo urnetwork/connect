@@ -11986,6 +11986,18 @@ paths:
         for the caller's network. `revoked` says whether the server holds
         the caller's sidecar revoked, which the client checks against its own
         signed configuration and never acts on alone.
+
+        `auth_features` names the authorization features every service
+        serving the caller's network implements, which a network may turn on
+        (a base turning on any other is refused, `feature_unsupported`):
+        unsigned, for the client's turn-on prompt alone, and none until the
+        operator names each service's. The request's own `auth_features`
+        states the features the caller's sidecar release implements, which
+        the server keeps per sidecar for that prompt alone. To an Owner's or
+        Admin's device the answer also carries `auth_features_lacking`, the
+        network's sidecars whose last stated features lack one of
+        `auth_features`, each of which would pause at that feature's
+        turning-on until it updates; it is absent to every other device.
       operationId: sidecarSyncTopic
       security:
         - BearerAuth: []
@@ -11998,6 +12010,12 @@ paths:
         - name: since
           in: query
           required: false
+          schema:
+            type: string
+        - name: auth_features
+          in: query
+          required: false
+          description: The authorization features the caller's sidecar release implements, their names comma separated (agent_repos, compute_policy, listeners, enclaves). None, or a name that is no feature's, states none.
           schema:
             type: string
       responses:
@@ -14976,7 +14994,13 @@ paths:
         the base adds, oldest first and at most 4,096, none when the version is
         unchanged: api walks the config repo's chain through them from the
         newest base's head, or for base 1 from the start of the genesis's config
-        repo, and refuses a base whose walk does not end at its head.
+        repo, and refuses a base whose walk does not end at its head. A base
+        whose rows' settings turn on an authorization feature that some
+        service serving the network does not implement (one the newest base
+        did not already set) is refused before anything is appended,
+        `feature_unsupported`, with the tip; the server reads only those
+        settings and the services' features, which `GET /sidecar/sync/core`
+        names as `auth_features`.
       operationId: networkConfigProjectionPublish
       security:
         - BearerAuth: []
@@ -14994,7 +15018,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkConfigPinResult"
         "403":
-          description: The base fails at the tip, or the client publishes no base.
+          description: The base fails at the tip, turns on a feature a service serving the network does not implement (feature_unsupported), or the client publishes no base.
           content:
             application/json:
               schema:
@@ -32081,6 +32105,7 @@ components:
         - min_secure_version
         - gates
         - revoked
+        - auth_features
       properties:
         version:
           type: string
@@ -32093,6 +32118,43 @@ components:
             type: string
         revoked:
           type: boolean
+        auth_features:
+          description: The authorization features every service serving the network implements, by name in bit order.
+          type: array
+          items:
+            type: string
+        auth_features_lacking:
+          $ref: "#/components/schemas/SidecarSyncCoreLackingResult"
+
+    SidecarSyncCoreLackingResult:
+      description: To an Owner's or Admin's device alone, the network's sidecars whose last stated features lack one of auth_features.
+      type: object
+      required:
+        - sidecars
+        - more
+      properties:
+        sidecars:
+          description: In sidecar id order, a bounded number.
+          type: array
+          items:
+            $ref: "#/components/schemas/SidecarSyncCoreSidecarResult"
+        more:
+          description: More sidecars lack one than are listed.
+          type: boolean
+
+    SidecarSyncCoreSidecarResult:
+      type: object
+      required:
+        - sidecar_id
+        - auth_features
+      properties:
+        sidecar_id:
+          type: string
+        auth_features:
+          description: What the sidecar's last core sync stated, by name; none for one that never stated.
+          type: array
+          items:
+            type: string
     NetworkUsage:
       type: object
       required: [limits, stored_byte_count, storage_over, spent, days]
@@ -34074,7 +34136,7 @@ components:
         error:
           type: string
         code:
-          description: config_refused, config_tip_moved, config_unadmitted or config_no_log.
+          description: config_refused, config_tip_moved, config_unadmitted, config_no_log or feature_unsupported.
           type: string
         tip:
           $ref: "#/components/schemas/NetworkConfigPinResult"
