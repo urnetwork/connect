@@ -30,7 +30,11 @@ func immediateParentHealthMatchesPath(t *testing.T, packet []byte, expected *IpP
 // the admitted source channel's context or its ordinary parent receive path.
 func immediateParentHealthWire(t *testing.T, exit *multiClientChannel, egress *IpPath) *immediateProgressFixture {
 	t.Helper()
-	wire := newWindowRoundFixture(t, nil, nil)
+	return openImmediateParentHealthGap(t, exit, egress, newWindowRoundFixture(t, nil, nil))
+}
+
+func openImmediateParentHealthGap(t *testing.T, exit *multiClientChannel, egress *IpPath, wire *windowRoundFixture) *immediateProgressFixture {
+	t.Helper()
 	wire.receiver.AddReceiveCallback(exit.clientReceive)
 	path := *egress.Reverse()
 	path.SourcePort++

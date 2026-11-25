@@ -58,6 +58,7 @@ type receiveDeliveryReceipt struct {
 	immediateToken      uint64
 	control             bool
 	controlReserve      bool
+	connectRace         bool
 	firstSequenceNumber uint64
 }
 
@@ -192,6 +193,8 @@ func (q *receiveDeliveryQueue) appendLocked(item *receiveItem, required bool, ad
 		return nil, false
 	}
 	r := &receiveDeliveryReceipt{queue: q, item: item, bytes: bytes, messageBytes: item.messageByteCount,
+		connectRace: item.connectRace && item.ack && !item.deliverImmediately &&
+			len(item.frames) == 1 && item.frames[0] != nil && item.frames[0].MessageType == protocol.MessageType_IpIpPacketToProvider,
 		required: required, control: control, controlReserve: controlReserve, firstSequenceNumber: item.sequenceNumber, ack: sequenceAck{
 			receivedAtNanos: item.receivedAtNanos, sequenceNumber: item.sequenceNumber,
 			messageId: item.messageId, tag: item.receiveTag(), compactContractRecoverySupported: true,
@@ -378,6 +381,9 @@ func (q *receiveDeliveryQueue) advanceLocked(changed *receiveDeliveryReceipt) []
 			previous.ack.sequenceNumber+1 != current.firstSequenceNumber {
 			index++
 			continue
+		}
+		if previous.ack.connectedRaceReset != 0 {
+			current.ack.inheritConnectedRaceReset(previous.ack)
 		}
 		current.firstSequenceNumber = previous.firstSequenceNumber
 		current.messageBytes += previous.messageBytes

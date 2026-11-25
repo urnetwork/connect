@@ -630,6 +630,9 @@ type Peer struct {
 	// the peer reachable, not that its ordered stream moved; exit health and
 	// readiness must not read it as progress (multiClientChannel.clientReceive).
 	aheadOfGap bool
+	// Identifies this receive worker's reliable dispatch after its first
+	// ahead-of-gap delivery. NoAck has no ordered custody.
+	reliableReceiveToken *byte
 }
 
 // ReceiveFunction is invoked inline and must not block. A handoff uses a
@@ -8560,6 +8563,7 @@ type receiveAckMessage struct {
 	// (THROUGHPUTFIX §39.1); absent is the legacy peer
 	contractAheadSupported     bool
 	deliveredImmediately       bool
+	connectedRaceReset         uint32
 	immediateSequenceNumber    uint64
 	immediateSequenceNumberSet bool
 	// what the receiver said it can still hold out of order; unset is a
@@ -8616,6 +8620,7 @@ func receiveAckMessageFromProtocol(ack *protocol.Ack) (receiveAckMessage, error)
 		compactContractRecoverySupported: ack.CompactContractRecovery,
 		contractAheadSupported:           ack.ContractAhead,
 		deliveredImmediately:             ack.DeliveredImmediately,
+		connectedRaceReset:               ack.ConnectedRaceReset,
 	}
 	if ack.ImmediateSequenceNumber != nil {
 		receiveAck.immediateSequenceNumber = *ack.ImmediateSequenceNumber
@@ -8843,6 +8848,7 @@ func (self *SendSequence) coalesceReceivedAck(
 		tag:                              ack.tag,
 		compactContractRecoverySupported: ack.compactContractRecoverySupported,
 		receiverTiming:                   ack.receiverAckDelaySet,
+		connectedRaceReset:               ack.connectedRaceReset,
 	}
 	if ack.contractMissing {
 		sequenceAck.contractMissing = true
@@ -12769,6 +12775,7 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 		contractId = &self.sendContract.contractId
 	}
 	var head bool
+	var connectRace bool
 	var sequenceNumber uint64
 	if ack {
 		// An announcement is never a head: a head carries the current
@@ -12800,10 +12807,9 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 				self.rollbackUnwrittenContractDebit(MessageByteCount(sendFrames))
 				return false
 			}
-		} else if group, ok := disposition.target.(*parsedPacketGroup); ok &&
-			group.isSynRetry() && group.synRetry.openingSerial != 0 {
-			// A newer ordinary offer and this original's ordinal are ordered
-			// under the flow lock. Once assigned, normal reliable custody owns it.
+		} else if group, ok := disposition.target.(*parsedPacketGroup); ok && group.nativeSynOpeningChecksOrdinal() {
+			// A newer offer, a race winner and the first wire ordinal share
+			// the flow lock. Normal reliable custody owns each assigned item.
 			allowed := func() bool {
 				update := group.synRetry.update
 				update.stateLock.Lock()
@@ -12812,6 +12818,9 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 					return false
 				}
 				assign()
+				if disposition.start == 0 && disposition.end == 1 && len(sendFrames) == 1 && !item.deliverImmediately {
+					connectRace = group.noteConnectedRaceOpeningWithLock(self, sequenceNumber)
+				}
 				return true
 			}()
 			if !allowed {
@@ -12821,6 +12830,10 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			}
 		} else {
 			assign()
+			if group, ok := disposition.target.(*parsedPacketGroup); ok && group.nativeRaceReset != nil &&
+				disposition.start == 0 && disposition.end == 1 && len(sendFrames) == 1 && !item.deliverImmediately {
+				connectRace = group.solicitConnectedRaceReset(self, sequenceNumber)
+			}
 		}
 		if item.deliverImmediately && immediateIpHandshakeFrames(sendFrames) && !self.immediateGapYoung(sendTime) {
 			// The gap ahead is older than the bound: this SYN-ACK waits in
@@ -12930,6 +12943,7 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			head:               head,
 			nack:               !ack,
 			deliverImmediately: ack && item.deliverImmediately,
+			connectRace:        connectRace,
 			frames:             sendFrames,
 			contractFrame:      contractFrame,
 			tagSendTime:        uint64(sendTime.UnixMilli()),
@@ -12973,6 +12987,7 @@ func (self *SendSequence) sendPreparedWithSetContractDisposition(
 			LogicalLane:        self.logicalLane,
 			ContractAhead:      (aheadContract != nil),
 			DeliverImmediately: ack && item.deliverImmediately,
+			ConnectRace:        connectRace,
 		}
 		if contractId != nil && (!ack || compactContractHead || item.deliverImmediately) {
 			pack.ContractId = contractId.Bytes()
@@ -14597,6 +14612,17 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
 	promoteLanes := uint32(0)
+	// Resolve this optional result once before retiring its exact local reset.
+	// Ordinary cumulative progress pays no per-item receipt or lookup cost.
+	if len(immediateBoundary) == 1 && immediateBoundary[0].connectedRaceReset != 0 {
+		receipt := immediateBoundary[0]
+		distance := uint64(receipt.connectedRaceReset >> 16)
+		if distance <= ackSequenceNumber {
+			if reset := self.resendQueue.GetBySequenceNumber(ackSequenceNumber - distance); reset != nil {
+				self.applyConnectedRaceReset(reset, receipt, ackSequenceNumber)
+			}
+		}
+	}
 	// acks are cumulative
 	// implicitly ack all earlier items in the sequence
 	i := 0
@@ -16867,6 +16893,9 @@ type ReceiveSequence struct {
 	deliverItems  []*receiveItem
 	deliverFrames []*protocol.Frame
 	deliverPeer   Peer
+	// Lazily allocated after reliable ahead-of-gap delivery. This tiny
+	// token does not keep the ReceiveSequence or packet owner alive.
+	reliableReceiveToken *byte
 	// Owned by the receive worker. Once a batch is refused, cleanup must
 	// discard later controls too: their cumulative ACK would cover the gap.
 	keyHistoryDeliveryRefused bool
@@ -17674,6 +17703,10 @@ func (self *ReceiveSequence) Run() {
 				receiveWindowByteCount = self.receiveWindowAdvertisement()
 			}
 
+			connectedRaceReset := sendAck.connectedRaceReset
+			if sendAck.selective || sendAck.contractMissing || sendAck.deliveredImmediately || sendAck.immediateSequenceNumberSet {
+				connectedRaceReset = 0
+			}
 			var transferFrameBytes []byte
 			if 2 <= self.receiveBufferSettings.ProtocolVersion {
 				// hand-rolled marshal of the hot Ack TransferFrame; wire-identical
@@ -17699,9 +17732,13 @@ func (self *ReceiveSequence) Run() {
 					receiverAckDelaySet:        receiverDelaySet,
 					evictedSequenceNumbers:     evictedSequenceNumbers,
 					streamForwardingAcceptance: forwardingAcceptance,
+					connectedRaceReset:         connectedRaceReset,
 				}
 				if sendAck.contractMissing {
 					saf.missingContractId = &sendAck.missingContractId
+				}
+				if saf.connectedRaceReset != 0 && !nativeConnectedRaceAckFits(path, saf.size(), len(evictedSequenceNumbers)) {
+					saf.connectedRaceReset = 0
 				}
 				transferFrameBytes = marshalSendAckTransferFrame(&saf)
 			} else {
@@ -17715,6 +17752,7 @@ func (self *ReceiveSequence) Run() {
 					ContractAhead:              self.receiveBufferSettings.AcceptContractAhead,
 					LogicalLaneVersion:         transferLogicalLaneVersion,
 					StreamForwardingAcceptance: forwardingAcceptance,
+					ConnectedRaceReset:         connectedRaceReset,
 				}
 				if sendAck.immediateSequenceNumberSet {
 					ordinal := sendAck.immediateSequenceNumber
@@ -17734,7 +17772,6 @@ func (self *ReceiveSequence) Run() {
 					ack.MissingContractId = sendAck.missingContractId.Bytes()
 				}
 				ackBytes, _ := ProtoMarshal(ack)
-				defer MessagePoolReturn(ackBytes)
 				transferFrame := &protocol.TransferFrame{
 					TransferPath: path.ToProtobuf(),
 					Frame: &protocol.Frame{
@@ -17742,6 +17779,13 @@ func (self *ReceiveSequence) Run() {
 						MessageBytes: ackBytes,
 					},
 				}
+				if ack.ConnectedRaceReset != 0 && !nativeConnectedRaceAckFits(path, proto.Size(transferFrame), len(evictedSequenceNumbers)) {
+					MessagePoolReturn(ackBytes)
+					ack.ConnectedRaceReset = 0
+					ackBytes, _ = ProtoMarshal(ack)
+					transferFrame.Frame.MessageBytes = ackBytes
+				}
+				defer MessagePoolReturn(ackBytes)
 				transferFrameBytes, _ = ProtoMarshal(transferFrame)
 			}
 			defer MessagePoolReturn(transferFrameBytes)
@@ -18668,6 +18712,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		contractAhead:      receivePack.Pack.ContractAhead,
 		noBudget:           noBudget,
 		deliverImmediately: receivePack.Pack.DeliverImmediately,
+		connectRace:        receivePack.Pack.ConnectRace,
 		receiveCallback:    receivePack.ReceiveCallback,
 		head:               receivePack.Pack.Head,
 		ack:                !receivePack.Pack.Nack,
@@ -19210,6 +19255,7 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		contractAhead:      receivePack.Pack.ContractAhead,
 		noBudget:           noBudget,
 		deliverImmediately: receivePack.Pack.DeliverImmediately,
+		connectRace:        receivePack.Pack.ConnectRace,
 		receiveCallback:    receivePack.ReceiveCallback,
 		head:               receivePack.Pack.Head,
 		ack:                !receivePack.Pack.Nack,
@@ -19324,6 +19370,12 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			aheadOfGap:    item.aheadOfGap,
 		}
 	}
+	if item.ack {
+		if item.aheadOfGap && self.reliableReceiveToken == nil {
+			self.reliableReceiveToken = new(byte)
+		}
+		peer.reliableReceiveToken = self.reliableReceiveToken
+	}
 	// EncryptedControl frames are routed into the per-peer session instead
 	// of bubbling up to the receive callback. They carry the TLS handshake
 	// bytes that bootstrap the per-peer cipher; the application shouldn't
@@ -19369,8 +19421,14 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 			a.aheadOfGap == b.aheadOfGap &&
 			slices.Equal(a.Roles, b.Roles)
 	}
-	if 0 < len(self.deliverItems) && !peerEqual(peer, self.deliverPeer) {
-		self.flushDeliver()
+	if 0 < len(self.deliverItems) {
+		if !peerEqual(peer, self.deliverPeer) {
+			self.flushDeliver()
+		} else if peer.reliableReceiveToken != self.deliverPeer.reliableReceiveToken {
+			// Preserve the existing burst boundaries. A mixed callback cannot
+			// attest that a particular frame came from its reliable items.
+			peer.reliableReceiveToken = nil
+		}
 	}
 	self.deliverPeer = peer
 	item.deliverFrameCount = len(appFrames)
@@ -19953,6 +20011,7 @@ type receiveItem struct {
 	contractAhead      bool
 	noBudget           bool
 	deliverImmediately bool
+	connectRace        bool
 	// Immediate delivery handed this item over ahead of an undelivered
 	// earlier ordinal; see Peer.aheadOfGap.
 	aheadOfGap bool
@@ -20059,6 +20118,7 @@ type sequenceAck struct {
 	messageId                  Id
 	selective                  bool
 	deliveredImmediately       bool
+	connectedRaceReset         uint32
 	immediateSequenceNumber    uint64
 	immediateSequenceNumberSet bool
 	tag                        sequenceTag

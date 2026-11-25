@@ -144,13 +144,23 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 		assertProfile := func() {
 			t.Helper()
 			stats := budget.StatsWithRoot()
-			if connect.MemoryBudget() != 32*1024*1024 || debug.SetMemoryLimit(-1) != 32*1024*1024 ||
+			target, softLimit := connect.MemoryBudget(), debug.SetMemoryLimit(-1)
+			if target != 32*1024*1024 || softLimit != 32*1024*1024 ||
 				stats.Budget.TotalByteCount != 8*1024*1024 || stats.Budget.MaxTransportCount != 16 || stats.Root != stats.Budget ||
-				settings.H1BudgetByteCount != 256*1024 || settings.H3BudgetByteCount != 5696*1024 ||
-				settings.H3MaxConnectionReceiveWindowByteCount != 4*1024*1024 || settings.H3MaxStreamReceiveWindowByteCount != 3072*1024 ||
+				settings.H1BudgetByteCount != 256*1024 || settings.H3BudgetByteCount != 923532 ||
+				settings.H3MaxConnectionReceiveWindowByteCount != 256*1024 || settings.H3MaxStreamReceiveWindowByteCount != 192*1024 ||
 				settings.H3InitialConnectionReceiveWindowByteCount != 256*1024 || settings.H3InitialStreamReceiveWindowByteCount != 128*1024 ||
-				settings.H3SocketReadBufferByteCount != 64*1024 || settings.H3SocketWriteBufferByteCount != 64*1024 {
-				t.Fatalf("%s/%s: graph is not the exact target32/soft32/carrier8 profile: %+v", inner, outer, stats)
+				settings.H3SocketReadBufferByteCount != 32*1024 || settings.H3SocketWriteBufferByteCount != 16*1024 ||
+				settings.H3MaxUnprocessedPacketCount != 32 || settings.H3DatagramSendQueueCount != 8 ||
+				settings.H3DatagramReceiveQueueCount != 32 || settings.H3SendFlightFrameCount != 48 {
+				t.Fatalf("%s/%s: exact target32/soft32/carrier8 mismatch: target=%d soft=%d carrier=%d root=%d slots=%d root_matches=%t "+
+					"h1=%d h3=%d conn_initial=%d conn_max=%d stream_initial=%d stream_max=%d socket_read=%d socket_write=%d "+
+					"unprocessed=%d datagram_send=%d datagram_receive=%d stream_flight=%d",
+					inner, outer, target, softLimit, stats.Budget.TotalByteCount, stats.Root.TotalByteCount, stats.Budget.MaxTransportCount, stats.Root == stats.Budget,
+					settings.H1BudgetByteCount, settings.H3BudgetByteCount, settings.H3InitialConnectionReceiveWindowByteCount,
+					settings.H3MaxConnectionReceiveWindowByteCount, settings.H3InitialStreamReceiveWindowByteCount, settings.H3MaxStreamReceiveWindowByteCount,
+					settings.H3SocketReadBufferByteCount, settings.H3SocketWriteBufferByteCount,
+					settings.H3MaxUnprocessedPacketCount, settings.H3DatagramSendQueueCount, settings.H3DatagramReceiveQueueCount, settings.H3SendFlightFrameCount)
 			}
 		}
 		assertProfile()
@@ -187,7 +197,8 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 		if outer == connect.ExtenderCarrierTcp {
 			want += settings.H1BudgetByteCount
 		} else {
-			want += (512 + 512 + 256 + 128) * 1024
+			// Outer receive window, QUIC control, retained send, and raw socket buffers.
+			want += (256 + 512 + 256 + 32 + 16) * 1024
 			if outer == connect.ExtenderCarrierDns {
 				want += 144 * 1024
 			}

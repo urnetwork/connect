@@ -2029,6 +2029,9 @@ type tcpControlObservation struct {
 	windowScaleEnabled bool
 	// TCP ownership may complete ahead of a return gap without exit-health credit.
 	aheadOfGap bool
+	// The returned frame came from this channel's selected peer.
+	selectedSource       bool
+	reliableReceiveToken *byte
 }
 
 type pendingIngressTcpControl struct {
@@ -2041,17 +2044,18 @@ func tcpControlFromIpPath(ipPath *IpPath) tcpControlObservation {
 		return tcpControlObservation{}
 	}
 	return tcpControlObservation{
-		sequenceNumber:     ipPath.SequenceNumber,
-		ackSequenceNumber:  ipPath.AckSequenceNumber,
-		payloadByteCount:   uint32(max(0, ipPath.TcpPayloadByteCount)),
-		windowSize:         ipPath.TcpWindowSize,
-		ack:                ipPath.Ack,
-		fin:                ipPath.Fin,
-		rst:                ipPath.Rst,
-		valid:              true,
-		syn:                ipPath.Syn,
-		windowScaleEnabled: ipPath.TcpWindowScaleEnabled,
-		aheadOfGap:         ipPath.receiveAheadOfGap,
+		sequenceNumber:       ipPath.SequenceNumber,
+		ackSequenceNumber:    ipPath.AckSequenceNumber,
+		payloadByteCount:     uint32(max(0, ipPath.TcpPayloadByteCount)),
+		windowSize:           ipPath.TcpWindowSize,
+		ack:                  ipPath.Ack,
+		fin:                  ipPath.Fin,
+		rst:                  ipPath.Rst,
+		valid:                true,
+		syn:                  ipPath.Syn,
+		windowScaleEnabled:   ipPath.TcpWindowScaleEnabled,
+		aheadOfGap:           ipPath.receiveAheadOfGap,
+		reliableReceiveToken: ipPath.receiveReliableToken,
 	}
 }
 
@@ -8666,7 +8670,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					nativeTerminalError = true
 				}
 				sent = sent && sendErr == nil
-				var abandonedClients []*multiClientChannel
+				var abandonedClients []nativeAbandonedCandidate
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
 				var committedSelection *multiClientAffinitySelection
@@ -8731,7 +8735,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				if 0 < len(abandonedClients) {
 					if rstPacket, ok := ipOosRst(update.ipPath); ok {
 						for _, abandonedClient := range abandonedClients {
-							update.sendAffinityControl(abandonedClient, rstPacket, 0)
+							update.sendAffinityControl(abandonedClient.client, rstPacket, 0, abandonedClient.opening)
 						}
 					}
 				}
@@ -8877,7 +8881,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						successCount.Add(1)
 					}
 
-					var abandonedClients []*multiClientChannel
+					var abandonedClients []nativeAbandonedCandidate
 					retryRequested := false
 					func() {
 						update.stateLock.Lock()
@@ -8917,7 +8921,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							// QUIC/DNS window still require response evidence.
 							for abandonedClient := range race.clientStates {
 								if abandonedClient != client {
-									abandonedClients = append(abandonedClients, abandonedClient)
+									abandonedClients = append(abandonedClients, nativeAbandonedCandidate{client: abandonedClient})
 								}
 							}
 							update.selectAffinityClient(client)
@@ -8941,7 +8945,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					if 0 < len(abandonedClients) {
 						if rstPacket, ok := ipOosRst(update.ipPath); ok {
 							for _, abandonedClient := range abandonedClients {
-								update.sendAffinityControl(abandonedClient, rstPacket, 0)
+								update.sendAffinityControl(abandonedClient.client, rstPacket, 0, abandonedClient.opening)
 							}
 						}
 					}
@@ -10251,6 +10255,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		}
 	}
 
+	selectedSource := sourceClient.isConnectSynReturnSource(source)
 	for i := range packets {
 		ipPath := ipPaths[i]
 		packet := packets[i]
@@ -10280,6 +10285,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			self.ipAssoc.AddIngressPacket(ipPath)
 		}
 		tcpControl := tcpControlFromIpPath(ipPath)
+		tcpControl.selectedSource = selectedSource
 		// The committed-flow lookup is synchronous and does not retain its
 		// key. Keep the reversed value on the stack; only the rare resolution
 		// tail below needs a separately owned path for queued race packets.
@@ -10385,6 +10391,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacket(
 	}
 
 	tcpControl := tcpControlFromIpPath(ipPath)
+	tcpControl.selectedSource = sourceClient.isConnectSynReturnSource(source)
 	ipPath = ipPath.Reverse()
 
 	self.clientReceivePacketResolve(sourceClient, source, provideMode, ipPath, packet, tcpControl)
@@ -10402,7 +10409,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	packet []byte,
 	tcpControl tcpControlObservation,
 ) {
-	var abandonedClients []*multiClientChannel
+	var abandonedClients []nativeAbandonedCandidate
 	var receivePackets []*receivePacket
 	var returnPackets []*receivePacket
 	// connectSucceeded is set when this inbound packet is the first to resolve
@@ -10652,7 +10659,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
 				for _, abandonedClient := range abandonedClients {
-					resolvedUpdate.sendAffinityControl(abandonedClient, rstPacket, 0)
+					resolvedUpdate.sendAffinityControl(abandonedClient.client, rstPacket, 0, abandonedClient.opening)
 				}
 			}
 		}
@@ -10907,7 +10914,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		default:
 		}
 
-		var abandonedClients []*multiClientChannel
+		var abandonedClients []nativeAbandonedCandidate
 		var receivePackets []*receivePacket
 		var returnPackets []*receivePacket
 		// the race winner, recorded for the clientUpdates bookkeeping once the
@@ -10981,7 +10988,7 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
 				for _, abandonedClient := range abandonedClients {
-					boundUpdate.sendAffinityControl(abandonedClient, rstPacket, 0)
+					boundUpdate.sendAffinityControl(abandonedClient.client, rstPacket, 0, abandonedClient.opening)
 				}
 			}
 		}
@@ -11520,6 +11527,7 @@ type multiClientChannelUpdate struct {
 	// An ahead-of-gap first response establishes protocol ownership while its
 	// one health receipt waits for ordered progress. Guarded by stateLock.
 	deferredInboundHealth bool
+	connectSynReturn      tcpConnectSynReturn
 	// Set once the flow was torn down by removeClient, a send error or
 	// quarantine, each of which offers its source a reset. The connect
 	// attempt is then dead to the app, so later inbound for it is never
@@ -11886,6 +11894,7 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 		self.resetSynGenerationWithLock(ipPath.SequenceNumber,
 			tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, ipPath.TcpPayloadByteCount))
 	}
+	self.connectSynReturn = tcpConnectSynReturn{}
 	self.sequenceAdmissionEpoch++
 	self.sequenceCloseReady.Store(false)
 	self.sequenceCovered = false
@@ -12511,7 +12520,7 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 	client *multiClientChannel,
 ) (
 	receivePackets []*receivePacket,
-	abandonedClients []*multiClientChannel,
+	abandonedClients []nativeAbandonedCandidate,
 	returnPackets []*receivePacket,
 	connectSucceeded bool,
 ) {
@@ -12528,7 +12537,7 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 		if abandonedClient == client {
 			continue
 		}
-		abandonedClients = append(abandonedClients, abandonedClient)
+		abandonedClients = append(abandonedClients, nativeAbandonedCandidate{client: abandonedClient})
 		for _, packet := range abandonedState.packets {
 			if packet.Pooled {
 				packet.Pooled = false
@@ -12551,6 +12560,19 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 	}
 	self.sequenceCommittedRaceOrder = race.collapseOrder
 	self.commitCollapseClaimsWithLock(client)
+	if self.noteNativeOpeningRaceWinnerWithLock(client, receivePackets) {
+		for index := range abandonedClients {
+			abandoned := &abandonedClients[index]
+			state := race.clientStates[abandoned.client]
+			opening := state.connectedOpening
+			if opening != nil && !state.collapseControl.closed && !state.collapseControl.ambiguousSyn &&
+				opening.serial == self.synOpeningSerial && opening.isn == self.dialFailedSyn {
+				opening.winner = self.client.loadSelection()
+				opening.epoch = self.sequenceAdmissionEpoch
+				abandoned.opening = opening
+			}
+		}
+	}
 	self.clearRaceWithLock()
 	for _, packet := range receivePackets {
 		if self.markReceivedInboundWithLock(client, packet.tcpControl) {
@@ -12672,12 +12694,14 @@ func (self *multiClientChannelUpdateRace) Close() {
 			}
 		}
 		state.packets = nil
+		state.connectedOpening = nil
 		state.collapseControl = tcpCandidateControlState{}
 	}
 	clear(self.clientStates)
 }
 
 type multiClientChannelRaceClientState struct {
+	connectedOpening      *nativeRaceOpening
 	serviceRefreshCounted bool
 	sendTime              time.Time
 	receiveTime           time.Time
@@ -12719,6 +12743,7 @@ type parsedPacketGroup struct {
 	collapseOwner              *tcpCollapseGroup
 	completionClient           *multiClientChannel
 	connectSynOffer            *connectSynOffer
+	nativeRaceReset            *nativeRaceOpening
 	completionSelection        *multiClientAffinitySelection
 	collapseNext               *parsedPacketGroup
 	collapseSource             *SendSequence
@@ -18127,6 +18152,10 @@ type multiClientChannel struct {
 	connectSynEpoch         uint64
 	connectSynPending       *connectSynOffer
 	connectSynConfirmedTime time.Time
+	// Only completed openings with individual return receipts retain an
+	// offer. Overflow preserves strict opaque evidence in the scalar clock.
+	connectSynCompleted      [8]*connectSynOffer
+	connectSynAnswersPending atomic.Bool
 
 	// The same destination can be eligible in several retained event buckets.
 	// Entries exist only while at least one such bucket supplies evidence.
@@ -22429,6 +22458,10 @@ func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWind
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.connectSynAnswersPending.Load() && self.connectSynAnswersPending.Swap(false) {
+		self.recomputeConnectSynWithLock()
+	}
+
 	if coalesce {
 		self.coalesceEventBuckets()
 	}
@@ -22824,6 +22857,9 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 				ipPath, err := ParseIpPath(packet)
 				if err == nil {
 					ipPath.receiveAheadOfGap = !progress
+					if ipPath.Protocol == IpProtocolTcp {
+						ipPath.receiveReliableToken = peer.reliableReceiveToken
+					}
 					if progress {
 						self.addReceiveAck(ByteCount(len(packet)))
 						if ipPath.Syn {

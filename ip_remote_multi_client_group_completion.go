@@ -78,6 +78,10 @@ func (self *multiClientChannel) prepareGroupCompletion(group *parsedPacketGroup,
 		group.completionFlags.Or(groupCompletionTracked)
 		update := group.collapseAdmission.update
 		update.stateLock.Lock()
+		if offer := group.connectSynOffer; offer != nil && len(group.packets) == 1 && !update.isProbe() {
+			path := group.packets[0].ipPath
+			offer.orderedReturnEligible = path.Syn && !path.Ack && !path.Fin && !path.Rst && path.TcpPayloadByteCount == 0
+		}
 		if group.isSynRetry() && (!group.validSynRetryWithLock(update) || update.synRetryRemoteTailRefusedWithLock(self)) {
 			update.stateLock.Unlock()
 			return false
@@ -803,6 +807,17 @@ func (self *parsedPacketGroup) publishCollapseWithLock() {
 			packet := &self.packets[index]
 			if packet.ipPath.Syn {
 				update.sequenceSynSeen, update.sequenceSynNumber = true, packet.ipPath.SequenceNumber
+				offer, selection := self.connectSynOffer, self.completionSelection
+				if offer != nil && offer.orderedReturnEligible && offer.returnSource == (Id{}) && owner.sourceId != (Id{}) &&
+					update.synGenerationSeen && update.synGenerationNumber == packet.ipPath.SequenceNumber &&
+					selection != nil && selection == update.client.loadSelection() {
+					proof := &update.connectSynReturn
+					if proof.offer == nil || proof.selection != selection ||
+						proof.offer.returnEpoch != update.sequenceAdmissionEpoch || proof.offer.returnSource != owner.sourceId {
+						offer.returnSource, offer.returnEpoch = owner.sourceId, update.sequenceAdmissionEpoch
+						*proof = tcpConnectSynReturn{offer: offer, selection: selection}
+					}
+				}
 			}
 			update.updateMaterializedSequenceWithLock(packet, packet.ipPath.TcpPayloadByteCount)
 		}
