@@ -2180,9 +2180,11 @@ type ClientSendRecoveryStatsSnapshot struct {
 	// Packs written again at once for a receiver that lost the sequence's
 	// state, which said it has delivered no frame of the sequence
 	// (Ack.nothing_delivered) on a selective ack or a request for a compact
-	// head's contract: a receiver restarted in place (QD-1232).
-	// NothingDeliveredAckCount counts the acks and requests this client's
-	// receivers made that said so.
+	// head's contract, or whose peer nacked a wrap in a way that says it lost
+	// its session with this client, when the Packs it reads without that
+	// session, those last written in plaintext, go: a receiver restarted in
+	// place (QD-1232). NothingDeliveredAckCount counts the acks and requests
+	// this client's receivers made that said so.
 	ReceiverLostWriteCount   uint64
 	NothingDeliveredAckCount uint64
 	// Packs last sealed under another epoch than their session's established
@@ -7418,8 +7420,15 @@ type SendSequence struct {
 	// Set by the session once the peer, which nacked a wrap of the session it
 	// could not open, seals under the established epoch (requestReseal); the
 	// send worker takes it on its next pass and writes again what it last
-	// sealed under another epoch (resealUnreadable).
+	// sealed before the peer held that epoch (resealUnreadable).
 	resealRequested atomic.Bool
+	// Set by the session when a nack says the peer lost its session with this
+	// side (requestLostPeerRewrite); the send worker takes it on its next pass
+	// and writes again what the peer reads without it
+	// (rewritePlaintextForLostPeer). Every item below lostPeerRewrittenBelow
+	// has been made due so, each at most once; owned by the send worker.
+	lostPeerRewriteRequested atomic.Bool
+	lostPeerRewrittenBelow   uint64
 	// Nil in production; deterministically observes full-flight recovery work.
 	beforeSelectiveAckRecoveryForTest func()
 
@@ -10243,6 +10252,9 @@ sendSequenceLoop:
 			self.receiveContractMissingAck(messageId, ack)
 		}
 		// taken after the snapshot, which drains the wake a request made
+		if self.lostPeerRewriteRequested.Swap(false) {
+			self.rewritePlaintextForLostPeer(time.Now())
+		}
 		if self.resealRequested.Swap(false) {
 			self.resealUnreadable(time.Now())
 		}
@@ -12959,6 +12971,59 @@ func (self *SendSequence) rewriteForLostReceiver(below uint64, at time.Time) {
 	}
 }
 
+// Asks the send worker to make due what a peer that lost its session reads
+// without it, on its next pass (`rewritePlaintextForLostPeer`), and wakes it.
+func (self *SendSequence) requestLostPeerRewrite() {
+	self.lostPeerRewriteRequested.Store(true)
+	if self.ackWindow != nil {
+		self.ackWindow.Wake()
+	}
+}
+
+// Makes due at once every Pack this sequence holds unacknowledged that it last
+// wrote in plaintext, or has yet to write, as recovery for the receiver's state
+// that spends none of the Pack's backoff (sendRecoveryReceiverLost): the peer
+// lost its session with this side (`peerEncryptionSession.oweResealForNack`),
+// and a peer restarted in place, the case, lost the state of this sequence with
+// it. Such a receiver starts the sequence at the first Pack that reaches it and
+// that it can read, often one of these written again on its own timer, and once
+// it has delivered a frame its acknowledgements no longer say it lost the
+// sequence (Ack.nothing_delivered), so the rest of what its previous process
+// never acknowledged waited for timers that the restart backed off: the
+// listener's handshake records and identity proof on its control carrier among
+// them, behind which the restarted client's new handshake waited. What was
+// sealed under the epoch the peer lost is left to the reseal it is owed
+// (`resealUnreadable`), since it reads that only under an epoch it holds, and a
+// selectively acknowledged Pack, which the receiver holds, is left alone. A
+// Pack already due keeps its time, and an ordinary timer's Pack among them
+// becomes this recovery. Each Pack is written so at most once:
+// lostPeerRewrittenBelow records how far this has run, so a later nack writes
+// only what came after. Runs on the send worker, which owns the items.
+func (self *SendSequence) rewritePlaintextForLostPeer(at time.Time) {
+	from := self.lostPeerRewrittenBelow
+	if self.nextSequenceNumber <= from {
+		return
+	}
+	self.lostPeerRewrittenBelow = self.nextSequenceNumber
+	for _, item := range self.sendItems {
+		if item == nil || item.sequenceNumber < from {
+			continue
+		}
+		if item.selectiveAcked || item.sealGeneration != 0 {
+			continue
+		}
+		if item.resendTime.After(at) {
+			if !self.setResendTimeIfRetained(item, at) {
+				continue
+			}
+			item.recoveryKind = sendRecoveryReceiverLost
+		} else if item.recoveryKind == sendRecoveryNone &&
+			self.resendQueue.GetByMessageId(item.messageId) == item {
+			item.recoveryKind = sendRecoveryReceiverLost
+		}
+	}
+}
+
 /*
 func (self *SendSequence) setTag(item *sendItem) ([]byte, error) {
 	self.log.V(1).Infof("[s]set tag %s->%s...%s s(%s)\n", self.client.ClientTag(), self.intermediaryIds, self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -14858,6 +14923,9 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 	if err := self.verifyPeerCertAgainstContract(); err != nil {
 		return transferWriteDisposition{}, err
 	}
+	// before the seal: a write sealed before the peer is seen sealing under the
+	// epoch records so however late it completes
+	sealGeneration := cipher.writeGeneration()
 	wrapped, err := cipher.SealOuterFrame(
 		path,
 		transferFrameBytes,
@@ -14889,9 +14957,10 @@ func (self *SendSequence) writeMaybeWrappedBytes(
 		// see the plaintext branch: a failed write leaves ownership here
 		MessagePoolReturn(shared)
 	} else if item != nil {
-		// a peer that turns out not to hold this epoch gets the item resealed
+		// a peer that turns out not to hold this epoch, or to have dropped
+		// what went out before it held it, gets the item resealed
 		// (resealUnreadable)
-		item.sealGeneration = cipher.sealGeneration
+		item.sealGeneration = sealGeneration
 	}
 	return disposition, err
 }
@@ -15216,9 +15285,9 @@ const (
 	// flight on a dead route, so these ride the unbounded path.
 	sendRecoveryEviction
 	// the receiver lost the sequence's state, so it lacks this one
-	// (rewriteForLostReceiver): a receiver restarted in place (QD-1232).
-	// Receiver-state recovery, as a missing contract is, so the write spends
-	// none of the item's backoff.
+	// (rewriteForLostReceiver, rewritePlaintextForLostPeer): a receiver
+	// restarted in place (QD-1232). Receiver-state recovery, as a missing
+	// contract is, so the write spends none of the item's backoff.
 	sendRecoveryReceiverLost
 	// the receiver could not open this one, last sealed under an epoch it does
 	// not hold, and has since sealed under the established epoch, which this
@@ -15302,11 +15371,16 @@ type sendItem struct {
 	carrierChanged bool
 	// Two captured/current receiver-withdrawal bits, under queue.stateLock.
 	pendingEvictionPhases uint8
-	// The seal generation of the epoch this item's latest write was sealed
-	// under (`sequenceCipher.sealGeneration`), zero for a plaintext write or
-	// none, so that a reseal finds what went out under an epoch the peer may
-	// not hold (`SendSequence.resealUnreadable`). Owned by the send worker; it
-	// takes the byte of padding before schedulingKey, so the item does not grow.
+	// The seal generation this item's latest write recorded
+	// (`sequenceCipher.writeGeneration`), which names the epoch it was sealed
+	// under and whether the peer had been seen sealing under that epoch yet,
+	// zero for a plaintext write or none, so that a reseal finds what went out
+	// under an epoch the peer may not hold, or before it held it
+	// (`SendSequence.resealUnreadable`), and a rewrite for a peer that lost its
+	// session what went out in plaintext
+	// (`SendSequence.rewritePlaintextForLostPeer`). Owned by the send worker;
+	// it takes the byte of padding before schedulingKey, so the item does not
+	// grow.
 	sealGeneration uint8
 	schedulingKey  sendSchedulingKey
 	// carrierRoute is the route of the newest successful write, any carrier;

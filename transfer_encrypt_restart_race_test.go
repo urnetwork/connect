@@ -436,10 +436,12 @@ func TestTwoVerificationsOfOneHeldProofSealTheSessionOnce(t *testing.T) {
 }
 
 // A responder session, alone, whose reseal decisions tests drive through its nack
-// and unwrap entries, recording each reseal it asks for.
+// and unwrap entries, recording each reseal it asks for, and each rewrite for a
+// peer that lost its session.
 type resealTestSession struct {
-	session              *peerEncryptionSession
-	requestedGenerations []uint8
+	session                 *peerEncryptionSession
+	requestedGenerations    []uint8
+	lostPeerRewriteRequests int
 }
 
 func newResealTestSession() *resealTestSession {
@@ -447,6 +449,9 @@ func newResealTestSession() *resealTestSession {
 	settings := DefaultEncryptionSettings()
 	settings.resealRequestedForTest = func(peerId Id, role sequenceTlsRole, sealGeneration uint8) {
 		r.requestedGenerations = append(r.requestedGenerations, sealGeneration)
+	}
+	settings.lostPeerRewriteRequestedForTest = func(peerId Id, role sequenceTlsRole) {
+		r.lostPeerRewriteRequests += 1
 	}
 	r.session = &peerEncryptionSession{
 		peerId:   NewId(),
@@ -574,13 +579,18 @@ func TestNackFromAPeerOnThePriorEpochOwesNoReseal(t *testing.T) {
 }
 
 // A reseal makes due at once each unacknowledged Pack the sequence last sealed
-// under another epoch than the established one, as receiver-state recovery,
-// and leaves alone a Pack sealed under the established epoch, one written in
-// plaintext, which the peer reads, and one the peer acknowledged selectively,
-// which it holds. A second reseal before the write changes nothing.
-func TestResealMakesDueOnlyWhatWentOutUnderAnotherEpoch(t *testing.T) {
+// before the peer was seen sealing under the established epoch, under another
+// epoch or under that one, as receiver-state recovery, and leaves alone a Pack
+// sealed under the established epoch since the peer was seen sealing under it,
+// one written in plaintext, which the peer reads, and one the peer acknowledged
+// selectively, which it holds. A second reseal before the write changes
+// nothing. A Pack sealed under the established epoch before the peer held it
+// can have reached the peer ahead of this side's identity proof and been
+// dropped; before each epoch took two generations, it was left to its timer.
+func TestResealMakesDueOnlyWhatWentOutBeforeThePeerHeldTheEstablishedEpoch(t *testing.T) {
 	r := newResealTestSession()
 	old := r.establish()
+	r.session.observePeerSealed(old.derivedTlsCipher)
 	established := r.establish()
 	// the peer seals under the established epoch, which seals from here
 	r.session.observePeerSealed(established.derivedTlsCipher)
@@ -590,7 +600,9 @@ func TestResealMakesDueOnlyWhatWentOutUnderAnotherEpoch(t *testing.T) {
 		resealed       bool
 	}{
 		{sealGeneration: old.derivedTlsCipher.sealGeneration, resealed: true},
-		{sealGeneration: established.derivedTlsCipher.sealGeneration},
+		{sealGeneration: old.derivedTlsCipher.peerSealedGeneration, resealed: true},
+		{sealGeneration: established.derivedTlsCipher.sealGeneration, resealed: true},
+		{sealGeneration: established.derivedTlsCipher.peerSealedGeneration},
 		{sealGeneration: 0},
 		{sealGeneration: old.derivedTlsCipher.sealGeneration, selectiveAcked: true},
 	}
@@ -703,6 +715,125 @@ func TestResponderSealsUnderItsPriorEpochUntilThePeerSealsUnderTheNewOne(t *test
 	renewed := establishTestEpoch(initiator, false)
 	if initiator.Cipher() != renewed.derivedTlsCipher {
 		t.Fatal("an initiator does not seal under a new epoch at once")
+	}
+}
+
+// What a cipher seals records one of its epoch's two generations: the first,
+// which names the epoch, until the peer is seen sealing under the epoch, and the
+// second once it has been, whichever epoch the wrap opened under, the
+// established or the prior. Each epoch's two are its own and neither is zero.
+// With one generation an epoch could not say what went out before the peer held
+// it, which can have reached the peer ahead of this side's identity proof.
+func TestSealGenerationSaysWhetherThePeerWasSeenSealingUnderTheEpoch(t *testing.T) {
+	r := newResealTestSession()
+	prior := r.establish()
+	established := r.establish()
+	seen := map[uint8]bool{}
+	for _, e := range []*tlsHandshakeEpoch{prior, established} {
+		c := e.derivedTlsCipher
+		if c.sealGeneration == 0 || c.peerSealedGeneration == 0 || c.sealGeneration == c.peerSealedGeneration {
+			t.Fatalf("epoch %s took generations %d and %d", e.epochId, c.sealGeneration, c.peerSealedGeneration)
+		}
+		for _, generation := range []uint8{c.sealGeneration, c.peerSealedGeneration} {
+			if seen[generation] {
+				t.Fatalf("generation %d went to two epochs", generation)
+			}
+			seen[generation] = true
+		}
+		if c.writeGeneration() != c.sealGeneration {
+			t.Fatalf("before the peer sealed under epoch %s a write records %d, want %d", e.epochId, c.writeGeneration(), c.sealGeneration)
+		}
+	}
+	for _, e := range []*tlsHandshakeEpoch{prior, established} {
+		r.session.observePeerSealed(e.derivedTlsCipher)
+		if c := e.derivedTlsCipher; c.writeGeneration() != c.peerSealedGeneration {
+			t.Fatalf("once the peer sealed under epoch %s a write records %d, want %d", e.epochId, c.writeGeneration(), c.peerSealedGeneration)
+		}
+	}
+}
+
+// A responder that owes the peer a reseal seals under a new epoch as soon as it
+// establishes, rather than under its prior until the peer seals under the new
+// one: the nack that left the reseal owed came from a peer that cannot open
+// what this side seals, as a client restarted in place cannot open the epoch
+// its previous process held. Whether the nack comes before the new epoch
+// establishes or while the responder holds on its prior, the responder seals
+// under the new epoch from then, waking the senders waiting for a cipher, and
+// what it seals records the generation of before the peer held the epoch, which
+// the reseal the peer's first seal under it brings writes again. Before, the
+// responder held on its prior, which such a peer never reads, until that seal,
+// and a peer whose first seal the responder dropped waited for its own resend.
+func TestResponderOwingAResealSealsUnderTheNewEpochAtOnce(t *testing.T) {
+	for _, nackFirst := range []bool{true, false} {
+		r := newResealTestSession()
+		old := r.establish()
+		r.session.observePeerSealed(old.derivedTlsCipher)
+		if nackFirst {
+			// the restarted client names the attempt it is making
+			r.session.handleUnknownWrapNack(NewId())
+		}
+		renewed := r.establish()
+		if !nackFirst {
+			if r.session.Cipher() != old.derivedTlsCipher {
+				t.Fatal("with no reseal owed the responder does not hold on its prior")
+			}
+			_, changed, _, _ := r.session.requiredCipherState()
+			// the client, establishing the new epoch, could not open a wrap
+			// under the prior
+			r.session.handleUnknownWrapNack(renewed.epochId)
+			select {
+			case <-changed:
+			default:
+				t.Fatal("the senders waiting for a cipher were not woken")
+			}
+		}
+		if r.session.Cipher() != renewed.derivedTlsCipher {
+			t.Fatalf("nack first %t: a responder owing a reseal seals under its prior", nackFirst)
+		}
+		if generation := r.session.Cipher().writeGeneration(); generation != renewed.derivedTlsCipher.sealGeneration {
+			t.Fatalf("nack first %t: before the peer seals under the new epoch a write records %d, want %d",
+				nackFirst, generation, renewed.derivedTlsCipher.sealGeneration)
+		}
+		if requests := r.takeRequests(); len(requests) != 0 {
+			t.Fatalf("nack first %t: reseals %v before the peer sealed under the new epoch", nackFirst, requests)
+		}
+		r.session.observePeerSealed(renewed.derivedTlsCipher)
+		if requests := r.takeRequests(); len(requests) != 1 || requests[0] != renewed.derivedTlsCipher.sealGeneration {
+			t.Fatalf("nack first %t: once the peer sealed under the new epoch, reseals %v, want one under generation %d",
+				nackFirst, requests, renewed.derivedTlsCipher.sealGeneration)
+		}
+		if generation := r.session.Cipher().writeGeneration(); generation != renewed.derivedTlsCipher.peerSealedGeneration {
+			t.Fatalf("nack first %t: once the peer sealed under the new epoch a write records %d, want %d",
+				nackFirst, generation, renewed.derivedTlsCipher.peerSealedGeneration)
+		}
+	}
+}
+
+// A nack that says the peer lost its session with this side, naming an epoch
+// newer than the established one, as a client restarted in place names the
+// attempt it is making, or none, asks the session's send sequences to write
+// again at once what the peer reads without that session; a nack from a peer
+// that lags behind the established epoch, or that names it, asks for nothing,
+// since that peer holds its session.
+func TestNackFromAPeerThatLostItsSessionAsksForWhatWentOutInPlaintext(t *testing.T) {
+	cases := []struct {
+		name string
+		nack func(prior *tlsHandshakeEpoch, established *tlsHandshakeEpoch) Id
+		lost bool
+	}{
+		{name: "newer", nack: func(*tlsHandshakeEpoch, *tlsHandshakeEpoch) Id { return NewId() }, lost: true},
+		{name: "none", nack: func(*tlsHandshakeEpoch, *tlsHandshakeEpoch) Id { return Id{} }, lost: true},
+		{name: "prior", nack: func(prior *tlsHandshakeEpoch, _ *tlsHandshakeEpoch) Id { return prior.epochId }},
+		{name: "established", nack: func(_ *tlsHandshakeEpoch, established *tlsHandshakeEpoch) Id { return established.epochId }},
+	}
+	for _, c := range cases {
+		r := newResealTestSession()
+		prior := r.establish()
+		established := r.establish()
+		r.session.handleUnknownWrapNack(c.nack(prior, established))
+		if want := map[bool]int{true: 1, false: 0}[c.lost]; r.lostPeerRewriteRequests != want {
+			t.Fatalf("%s: %d rewrites for a lost peer asked for, want %d", c.name, r.lostPeerRewriteRequests, want)
+		}
 	}
 }
 

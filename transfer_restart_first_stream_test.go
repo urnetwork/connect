@@ -1160,6 +1160,59 @@ func TestSenderRebuildsOnlyTheHeadForAReceiverThatHasDelivered(t *testing.T) {
 	}
 }
 
+// A peer that lost its session with this side, as a client restarted in place
+// did, lost the state of this sequence with it, though its acknowledgements no
+// longer say so once it has delivered a frame, such as an old Pack written
+// again on its own timer. Every Pack the sequence holds unacknowledged that it
+// last wrote in plaintext, the listener's handshake records and identity proof
+// on its control carrier for one, is made due at once, as receiver-state
+// recovery, and each at most once: a later nack writes nothing again. A Pack
+// sealed under the epoch the peer lost waits for the reseal it is owed, and a
+// selectively acknowledged one, which the peer holds, keeps its time. Before,
+// each waited for its timer, backed off through the restart, and the restarted
+// client's new handshake waited behind the old proof that way.
+func TestSenderWritesWhatWentOutInPlaintextAtOnceForAPeerThatLostItsSession(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		backlog := newCompactHeadBacklog(t)
+		oneDue, twoDue := backlog.one.resendTime, backlog.two.resendTime
+		// sealed under the epoch the peer lost
+		backlog.two.sealGeneration = 3
+		backlog.one.selectiveAcked = held
+		at := time.Now()
+		backlog.sequence.rewritePlaintextForLostPeer(at)
+		if backlog.head.recoveryKind != sendRecoveryReceiverLost || backlog.head.resendTime.After(at) ||
+			backlog.sequence.resendQueue.GetByMessageId(backlog.head.messageId) != backlog.head {
+			t.Fatalf("held %t: the head, written in plaintext, is not due at once: kind %d", held, backlog.head.recoveryKind)
+		}
+		if held {
+			if backlog.one.recoveryKind != sendRecoveryNone || backlog.one.resendTime != oneDue {
+				t.Fatal("a Pack the peer holds was made due")
+			}
+		} else if backlog.one.recoveryKind != sendRecoveryReceiverLost || backlog.one.resendTime.After(at) {
+			t.Fatalf("the Pack written in plaintext is not due at once: kind %d", backlog.one.recoveryKind)
+		}
+		if backlog.two.recoveryKind != sendRecoveryNone || backlog.two.resendTime != twoDue {
+			t.Fatalf("held %t: a Pack sealed under the lost epoch was made due ahead of its reseal", held)
+		}
+		if backlog.sequence.lostPeerRewrittenBelow != 3 {
+			t.Fatalf("held %t: rewritten below %d, want every Pack sent", held, backlog.sequence.lostPeerRewrittenBelow)
+		}
+
+		// as the writes leave them: on their timers, with no recovery pending
+		later := at.Add(time.Minute)
+		for _, item := range []*sendItem{backlog.head, backlog.one} {
+			backlog.sequence.setResendTime(item, later)
+			item.recoveryKind = sendRecoveryNone
+		}
+		backlog.sequence.rewritePlaintextForLostPeer(time.Now())
+		for _, item := range []*sendItem{backlog.head, backlog.one} {
+			if item.recoveryKind != sendRecoveryNone || item.resendTime != later {
+				t.Fatalf("held %t: a later nack wrote Pack %d again", held, item.sequenceNumber)
+			}
+		}
+	}
+}
+
 // The ack window keeps a receiver's saying that it delivered nothing when a
 // later copy of the same acknowledgement, written after the sequence delivered,
 // coalesces with it, and when an unwritten response returns: the Packs below
