@@ -817,8 +817,12 @@ type Pack struct {
 	// receiver still validates identity, encryption, contracts and receipts.
 	// Older receivers ignore this field and keep ordinary ordered delivery.
 	DeliverImmediately bool `protobuf:"varint,14,opt,name=deliver_immediately,json=deliverImmediately,proto3" json:"deliver_immediately,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Solicits a connected-owner outcome for a reliable singleton native race
+	// opening or its generated reset. It changes neither application delivery
+	// nor ordinary acknowledgement. Older receivers ignore this field.
+	ConnectRace   bool `protobuf:"varint,15,opt,name=connect_race,json=connectRace,proto3" json:"connect_race,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Pack) Reset() {
@@ -945,6 +949,13 @@ func (x *Pack) GetContractAhead() bool {
 func (x *Pack) GetDeliverImmediately() bool {
 	if x != nil {
 		return x.DeliverImmediately
+	}
+	return false
+}
+
+func (x *Pack) GetConnectRace() bool {
+	if x != nil {
+		return x.ConnectRace
 	}
 	return false
 }
@@ -1114,6 +1125,12 @@ type Ack struct {
 	// not merely retained. It retires only that original, never predecessors.
 	// Older receivers omit this field and preserve ordered reliable custody.
 	DeliveredImmediately bool `protobuf:"varint,13,opt,name=delivered_immediately,json=deliveredImmediately,proto3" json:"delivered_immediately,omitempty"`
+	// Optional evidence that the named reliable prefix includes a requested
+	// reset that canceled its own already-connected upstream TCP generation.
+	// Lower 16 bits are the positive distance from opening SYN to reset.
+	// Upper 16 bits are the distance from that reset to the acknowledged head.
+	// Zero or unavailable evidence preserves ordinary acknowledgement.
+	ConnectedRaceReset uint32 `protobuf:"varint,16,opt,name=connected_race_reset,json=connectedRaceReset,proto3" json:"connected_race_reset,omitempty"`
 	// Actual ordinal of a deterministically identified immediate original.
 	// This is not independent ACK authority: the sender verifies the exact
 	// identity against its live original or known terminal-delivery range.
@@ -1245,6 +1262,13 @@ func (x *Ack) GetDeliveredImmediately() bool {
 		return x.DeliveredImmediately
 	}
 	return false
+}
+
+func (x *Ack) GetConnectedRaceReset() uint32 {
+	if x != nil {
+		return x.ConnectedRaceReset
+	}
+	return 0
 }
 
 func (x *Ack) GetImmediateSequenceNumber() uint64 {
@@ -3736,7 +3760,7 @@ const file_transfer_proto_rawDesc = "" +
 	"\r_session_roleB\x14\n" +
 	"\x12_session_companion\"U\n" +
 	"\x15FilteredTransferFrame\x12<\n" +
-	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xc4\x04\n" +
+	"\rtransfer_path\x18\x01 \x01(\v2\x17.bringyour.TransferPathR\ftransferPath\"\xe7\x04\n" +
 	"\x04Pack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3755,13 +3779,14 @@ const file_transfer_proto_rawDesc = "" +
 	"\x12companion_contract\x18\v \x01(\bR\x11companionContract\x12!\n" +
 	"\flogical_lane\x18\f \x01(\rR\vlogicalLane\x12%\n" +
 	"\x0econtract_ahead\x18\r \x01(\bR\rcontractAhead\x12/\n" +
-	"\x13deliver_immediately\x18\x0e \x01(\bR\x12deliverImmediatelyB\x11\n" +
+	"\x13deliver_immediately\x18\x0e \x01(\bR\x12deliverImmediately\x12!\n" +
+	"\fconnect_race\x18\x0f \x01(\bR\vconnectRaceB\x11\n" +
 	"\x0f_contract_frameB\x06\n" +
 	"\x04_tagB\x0e\n" +
 	"\f_contract_id\"_\n" +
 	"\fFilteredPack\x12<\n" +
 	"\x0econtract_frame\x18\a \x01(\v2\x10.bringyour.FrameH\x00R\rcontractFrame\x88\x01\x01B\x11\n" +
-	"\x0f_contract_frame\"\xca\a\n" +
+	"\x0f_contract_frame\"\xfc\a\n" +
 	"\x03Ack\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\fR\tmessageId\x12\x1f\n" +
@@ -3778,7 +3803,8 @@ const file_transfer_proto_rawDesc = "" +
 	"\x18evicted_sequence_numbers\x18\t \x03(\x04R\x16evictedSequenceNumbers\x12%\n" +
 	"\x0econtract_ahead\x18\n" +
 	" \x01(\bR\rcontractAhead\x123\n" +
-	"\x15delivered_immediately\x18\r \x01(\bR\x14deliveredImmediately\x12?\n" +
+	"\x15delivered_immediately\x18\r \x01(\bR\x14deliveredImmediately\x120\n" +
+	"\x14connected_race_reset\x18\x10 \x01(\rR\x12connectedRaceReset\x12?\n" +
 	"\x19immediate_sequence_number\x18\x0e \x01(\x04H\x05R\x17immediateSequenceNumber\x88\x01\x01\x12E\n" +
 	"\x1cstream_forwarding_acceptance\x18\x0f \x01(\fH\x06R\x1astreamForwardingAcceptance\x88\x01\x01B\x06\n" +
 	"\x04_tagB\x16\n" +

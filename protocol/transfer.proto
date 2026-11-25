@@ -149,6 +149,11 @@ message Pack {
     // receiver still validates identity, encryption, contracts and receipts.
     // Older receivers ignore this field and keep ordinary ordered delivery.
     bool deliver_immediately = 14;
+
+    // Solicits a connected-owner outcome for a reliable singleton native race
+    // opening or its generated reset. It changes neither application delivery
+    // nor ordinary acknowledgement. Older receivers ignore this field.
+    bool connect_race = 15;
 }
 
 
@@ -287,6 +292,13 @@ message Ack {
     // not merely retained. It retires only that original, never predecessors.
     // Older receivers omit this field and preserve ordered reliable custody.
     bool delivered_immediately = 13;
+
+    // Optional evidence that the named reliable prefix includes a requested
+    // reset that canceled its own already-connected upstream TCP generation.
+    // Lower 16 bits are the positive distance from opening SYN to reset.
+    // Upper 16 bits are the distance from that reset to the acknowledged head.
+    // Zero or unavailable evidence preserves ordinary acknowledgement.
+    uint32 connected_race_reset = 16;
 
     // Actual ordinal of a deterministically identified immediate original.
     // This is not independent ACK authority: the sender verifies the exact

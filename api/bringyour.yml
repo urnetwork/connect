@@ -49,7 +49,7 @@ info:
     the server-to-server webhooks (payment processors, app stores and the
     email provider), the operator's provider probe control plane, the admin
     reports, the operator's own evidence publishing, the validator's head
-    summary upload, the provider work intake (the signed originals the SDK
+    summary upload and rate class mint, the provider work intake (the signed originals the SDK
     and the independent work authorities post), the acceptance-test routes
     and the extender directory calls the SDK makes on its own. They stay in
     this document so the server's route and conformance checks cover them;
@@ -10372,6 +10372,54 @@ paths:
           description: Rate limited; `Retry-After` may be set.
         "5XX":
           description: A transient operator failure; the validator retries.
+
+  /sn/validator-class:
+    post:
+      x-internal: true
+      tags: [Other]
+      summary: Mint the validator's rate class token
+      description: |
+        A validator whose activation the operator's reserved upload admission
+        admits mints a short-lived SN25 validator rate class token here, and
+        sends it beside its bearer on each api request, in header
+        `X-UR-Validator-Class`. The operator's front charges a request whose
+        token names the client of its own verified bearer to the validator
+        rate class, in place of the per-client limit.
+
+        The bearer is the validator's API session, the client JWT it uploads
+        attempt artifacts with. Header `X-UR-Validator-Class-Intent` carries
+        the class consent (sn protocol `ValidatorClassIntent`): the
+        activation's VPK signs the activation hash, the VPK, the replica,
+        sha256 of this bearer and a `NotAfter` a few seconds ahead. The token
+        names the bearer's client and lives at most five minutes, never past
+        the admission's own expiry; a validator mints again before it ends.
+      operationId: snValidatorClass
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-UR-Validator-Class-Intent
+          in: header
+          required: true
+          description: The VPK-signed class consent, base64url.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The class token and its expiry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnValidatorClassResult"
+        "400":
+          description: The class consent header is missing or repeated.
+        "401":
+          description: Missing or invalid bearer token, or a token that names no client.
+        "403":
+          description: The admission does not admit this validator, or the consent does not verify for this bearer, replica or activation.
+        "429":
+          description: Rate limited; `Retry-After` may be set.
+        "503":
+          description: This instance's admission is not current or not running; the validator tries again.
 
   /sn/top:
     get:
@@ -22087,6 +22135,19 @@ components:
           type: integer
         error:
           $ref: "#/components/schemas/SnFleetAutoError"
+
+    SnValidatorClassResult:
+      type: object
+      description: A validator rate class token (POST /sn/validator-class).
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: The class token, sent in header `X-UR-Validator-Class` beside the same client's bearer.
+        expires_at:
+          type: string
+          format: date-time
+          description: When the token ends, at most five minutes after it was minted.
 
     SnHeadSummary:
       type: object

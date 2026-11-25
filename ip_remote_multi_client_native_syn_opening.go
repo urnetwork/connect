@@ -5,6 +5,7 @@ package connect
 
 import (
 	"errors"
+	"slices"
 	"unsafe"
 )
 
@@ -155,12 +156,69 @@ func (self *RemoteUserNatMultiClient) finishNativeSynOpening(group *parsedPacket
 	}
 }
 
-// Only the new optional opening carries this stamp. Ordinary accepted owners
-// keep their existing semantics; a stale retry cannot acquire a wire ordinal.
-func (self *parsedPacketGroup) nativeSynOpeningCurrentWithLock() bool {
+// This is the first ordinary bare SYN stamped before the wide race. Its
+// clones share the exact request. Internal retries have their own verifier.
+func (self *parsedPacketGroup) nativeRaceOpening() bool {
 	request := self.synRetry
-	if request == nil || request.serial == 0 || request.openingSerial == 0 {
+	return request != nil && request.update != nil && request.serial == 0 && request.openingSerial != 0 &&
+		request.openingSelection == nil && len(self.packets) == 1 && self.completionFlags.Load()&groupCompletionCandidate != 0
+}
+
+// Install a winner from the buffered response of the actual committing race.
+// A local source can withdraw an unwritten clone of this opening when it
+// still sees this same selection at the ordinal boundary.
+func (self *multiClientChannelUpdate) noteNativeOpeningRaceWinnerWithLock(client *multiClientChannel, packets []*receivePacket) bool {
+	race := self.race
+	if race == nil || race.single || !self.dialFailedSynSeen {
+		return false
+	}
+	state := race.clientStates[client]
+	if state == nil || state.collapseControl.synOrder == 0 || state.collapseControl.closed || state.collapseControl.ambiguousSyn ||
+		!state.collapseControl.synSeen || state.collapseControl.synNumber != self.dialFailedSyn {
+		return false
+	}
+	if !slices.ContainsFunc(packets, func(packet *receivePacket) bool {
+		control := packet.tcpControl
+		return packet.generation == self && control.valid && control.syn && control.ack && !control.fin && !control.rst &&
+			!control.aheadOfGap && control.ackSequenceNumber == self.dialFailedSyn+1 && client.isConnectSynReturnSource(packet.Source)
+	}) {
+		return false
+	}
+	const admittedCandidate = groupCompletionAdmitted | groupCompletionCandidate | groupCompletionTracked
+	const requiredState = admittedCandidate | groupCompletionAbandoned | groupCompletionDone
+	for group := self.sequenceClaims; group != nil; group = group.collapseNext {
+		if group.completionClient != client && race.clientStates[group.completionClient] != nil &&
+			group.completionFlags.Load()&requiredState == admittedCandidate && group.nativeRaceOpening() &&
+			group.synRetry.update == self && group.synRetry.openingSerial == self.synOpeningSerial &&
+			group.packets[0].ipPath.SequenceNumber == self.dialFailedSyn &&
+			group.connectSynOffer != nil && !group.connectSynOffer.materialized.Load() {
+			group.synRetry.openingRaceWinner = self.client.loadSelection()
+			group.synRetry.openingRaceWinnerEpoch = self.sequenceAdmissionEpoch
+			break
+		}
+	}
+	return true
+}
+
+func (self *parsedPacketGroup) nativeSynOpeningChecksOrdinal() bool {
+	request := self.synRetry
+	return request != nil && request.openingSerial != 0 && (request.serial != 0 || self.nativeRaceOpening())
+}
+
+// A stale retry or an original that lost its native opening race may retire
+// before assignment. Once assigned, reliable Transfer owns the original.
+func (self *parsedPacketGroup) nativeSynOpeningCurrentWithLock() bool {
+	if !self.nativeSynOpeningChecksOrdinal() {
 		return true
+	}
+	request := self.synRetry
+	if request.serial == 0 {
+		update, winner := request.update, request.openingRaceWinner
+		return winner == nil || winner.client == self.completionClient || update.client.loadSelection() != winner ||
+			request.openingRaceWinnerEpoch != update.sequenceAdmissionEpoch || request.openingSerial != update.synOpeningSerial ||
+			!update.dialFailedSynSeen || update.dialFailedSyn != self.packets[0].ipPath.SequenceNumber ||
+			!update.receivedInbound.Load() || update.race != nil || update.IsDone() || update.sourceReset.Load() ||
+			winner.client.IsDone() || self.completionClient.IsDone()
 	}
 	// This source already owns the admitted claim. Its own pending SYN is
 	// dequeued before checking source-reset claims. Every later ordinary
@@ -196,10 +254,10 @@ func (self *tcpSynRetry) synRetrySelectionCurrentWithLock(update *multiClientCha
 // Preparation can wait on contracts or routes after source dequeue. The final
 // ordinal assignment repeats this check under the same lock as newer offers.
 func (self *parsedPacketGroup) nativeSynOpeningCurrent() bool {
-	request := self.synRetry
-	if request == nil || request.serial == 0 || request.openingSerial == 0 {
+	if !self.nativeSynOpeningChecksOrdinal() {
 		return true
 	}
+	request := self.synRetry
 	request.update.stateLock.Lock()
 	defer request.update.stateLock.Unlock()
 	return self.nativeSynOpeningCurrentWithLock()

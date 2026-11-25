@@ -20,7 +20,15 @@ type connectSynOffer struct {
 	finished bool
 	// Source range disposition precedes its chunk's terminal callback. A
 	// successful SYN prefix must survive a different chunk's local expiry.
-	materialized atomic.Bool
+	materialized  atomic.Bool
+	orderedAnswer atomic.Bool
+	// Immutable when the group starts. The remaining scalars belong to its
+	// exact flow's stateLock, separate from the channel's admission lock.
+	orderedReturnEligible bool
+	returnSource          Id
+	returnReceiveToken    *byte
+	returnEpoch           uint64
+	returnNext            uint32
 }
 
 // Mixed exact local proof types remain local; any ambiguous leaf preserves
@@ -83,14 +91,14 @@ func (self *multiClientChannel) observeConnectSynAdmission(offer *connectSynOffe
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if offer.finished || offer.linked || offer.epoch != self.connectSynEpoch {
+	if offer.finished || offer.linked || offer.orderedAnswer.Load() || offer.epoch != self.connectSynEpoch {
 		return
 	}
 	if offer.started.IsZero() {
 		offer.started = self.packetTransferNow()
 	}
-	// Earlier completed evidence can no longer be retracted. This offer
-	// cannot move its clock, so only its existing callback needs the token.
+	// Earlier opaque completed evidence cannot be retired individually. This
+	// offer cannot move its clock, so only its existing callback needs the token.
 	if !self.connectSynConfirmedTime.IsZero() && !offer.started.Before(self.connectSynConfirmedTime) {
 		return
 	}
@@ -135,23 +143,25 @@ func (self *multiClientChannel) finishConnectSynOffer(offer *connectSynOffer, re
 		}
 		offer.previous, offer.next, offer.linked = nil, nil, false
 	}
-	if retain {
-		self.confirmConnectSynWithLock(offer.started)
-	} else if wasEarliest {
-		// Admission and completion can arrive in either order. Recompute only
-		// when retracting the minimum, without resetting another offer's age.
-		first := self.connectSynConfirmedTime
-		for pending := self.connectSynPending; pending != nil; pending = pending.next {
-			if first.IsZero() || pending.started.Before(first) {
-				first = pending.started
+	if retain && !offer.orderedAnswer.Load() {
+		if offer.orderedReturnEligible {
+			for index, completed := range self.connectSynCompleted {
+				if completed == nil || completed.orderedAnswer.Load() {
+					self.connectSynCompleted[index] = offer
+					self.recordConnectSynTimeWithLock(offer.started)
+					return
+				}
 			}
 		}
-		self.packetStats.firstUnansweredSendSynTime = first
+		self.confirmConnectSynWithLock(offer.started)
+	} else if wasEarliest {
+		self.recomputeConnectSynWithLock()
 	}
 }
 
-// A completed SYN cannot later become a local refusal. Retain just its earliest
-// time until a received SYN clears the episode, independent of stats rotation.
+// Completed opens without an individually tracked return retain their
+// earliest clock until a received ordered SYN clears the episode. This also
+// preserves stock evidence when the bounded exact-receipt slots are full.
 func (self *multiClientChannel) confirmConnectSynWithLock(started time.Time) {
 	if self.connectSynConfirmedTime.IsZero() || started.Before(self.connectSynConfirmedTime) {
 		self.connectSynConfirmedTime = started
@@ -180,5 +190,93 @@ func (self *multiClientChannel) clearConnectSynWithLock() {
 	}
 	self.connectSynPending = nil
 	self.connectSynConfirmedTime = time.Time{}
+	clear(self.connectSynCompleted[:])
 	self.packetStats.firstUnansweredSendSynTime = time.Time{}
+}
+
+// Recompute only when exact evidence was retracted or acquired an ordered
+// answer. A different pending, completed or conservatively aggregated offer
+// keeps its own original time.
+func (self *multiClientChannel) recomputeConnectSynWithLock() {
+	first := self.connectSynConfirmedTime
+	for index, offer := range self.connectSynCompleted {
+		if offer == nil {
+			continue
+		}
+		if offer.orderedAnswer.Load() {
+			self.connectSynCompleted[index] = nil
+			continue
+		}
+		if first.IsZero() || offer.started.Before(first) {
+			first = offer.started
+		}
+	}
+	for offer := self.connectSynPending; offer != nil; offer = offer.next {
+		if !offer.orderedAnswer.Load() && (first.IsZero() || offer.started.Before(first)) {
+			first = offer.started
+		}
+	}
+	self.packetStats.firstUnansweredSendSynTime = first
+}
+
+// A loan of the already-owned SYN token to its exact flow selection. The
+// corresponding channel stores only the offer, never the flow or selection.
+type tcpConnectSynReturn struct {
+	offer     *connectSynOffer
+	selection *multiClientAffinitySelection
+}
+
+func (self *multiClientChannel) isConnectSynReturnSource(source TransferPath) bool {
+	return source.SourceId != (Id{}) && self != nil && self.args != nil && self.args.Destination.Len() != 0 &&
+		source.SourceId == self.args.Destination.Tail()
+}
+
+// A SYN-ACK ahead of a Transfer gap may establish the application handshake,
+// while its connect-health debt remains. Retire only this original opening
+// once its own ordered payload proves both TCP directions through that edge.
+func (update *multiClientChannelUpdate) observeConnectSynReturnWithLock(client *multiClientChannel, control tcpControlObservation, firstInbound bool) {
+	proof := &update.connectSynReturn
+	offer := proof.offer
+	if offer.returnEpoch != update.sequenceAdmissionEpoch || offer.returnSource != update.sequenceSourceId ||
+		proof.selection != update.client.loadSelection() || update.sourceReset.Load() || update.IsDone() {
+		*proof = tcpConnectSynReturn{}
+		return
+	}
+	if !control.selectedSource || !control.valid {
+		return
+	}
+	if control.rst {
+		*proof = tcpConnectSynReturn{}
+		return
+	}
+	if !control.ack || control.fin || control.reliableReceiveToken == nil {
+		return
+	}
+	wantAck := update.synGenerationNumber + 1
+	if control.syn {
+		if control.ackSequenceNumber != wantAck || control.payloadByteCount != 0 {
+			return
+		}
+		if control.aheadOfGap && firstInbound {
+			offer.returnReceiveToken = control.reliableReceiveToken
+			offer.returnNext = control.sequenceNumber + 1
+		} else if !control.aheadOfGap {
+			*proof = tcpConnectSynReturn{}
+		}
+		return
+	}
+	if control.aheadOfGap || offer.returnReceiveToken != control.reliableReceiveToken ||
+		control.payloadByteCount == 0 ||
+		control.sequenceNumber != offer.returnNext ||
+		(control.ackSequenceNumber != wantAck &&
+			(!update.sequenceCovered || !tcpSequenceAtOrAfter(control.ackSequenceNumber, wantAck) ||
+				!tcpSequenceAtOrAfter(wantAck, update.sequenceCoveredFrom) ||
+				!tcpSequenceAtOrAfter(update.sequenceCoveredTo, control.ackSequenceNumber))) {
+		return
+	}
+	offer.orderedAnswer.Store(true)
+	// Do not take the channel lock under the flow lock. The same channel
+	// observes this proof under its stateLock before judging a new verdict.
+	client.connectSynAnswersPending.Store(true)
+	*proof = tcpConnectSynReturn{}
 }

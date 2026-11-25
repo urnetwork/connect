@@ -52,6 +52,20 @@ func newReceiptAdmissionFixture(t *testing.T, count int, configure ...func(*Rece
 func newReceiptAdmissionFixtureWithProvider(t *testing.T, count int, withProvider bool, configure ...func(*ReceiveBufferSettings)) *receiptAdmissionFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	return newReceiptAdmissionFixtureWithClientParent(t, ctx, cancel, ctx, count, withProvider, configure...)
+}
+
+// A separate Client parent lets a control hold its real cancellation propagation.
+func newReceiptAdmissionFixtureWithClientParent(
+	t *testing.T,
+	ctx context.Context,
+	cancel context.CancelFunc,
+	clientParent context.Context,
+	count int,
+	withProvider bool,
+	configure ...func(*ReceiveBufferSettings),
+) *receiptAdmissionFixture {
+	t.Helper()
 	f := &receiptAdmissionFixture{t: t, ctx: ctx, cancel: cancel, source: SourceId(NewId()),
 		sequenceId: NewId(), captured: make(chan *TcpSequence, 8), route: make(Route, 64),
 		receiveBudget: NewTransferMemoryBudget(256 * 1024), packBudget: NewTransferMemoryBudget(64 * 1024),
@@ -59,7 +73,8 @@ func newReceiptAdmissionFixtureWithProvider(t *testing.T, count int, withProvide
 	settings := DefaultClientSettings()
 	settings.Log = NewNoopLogger()
 	settings.EncryptionSettings.Mode = EncryptionModeOff
-	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	// The receipt gateway carries only this peer's evidence. Keep the fixture key local.
+	settings.SkipClientKeyPublication = true
 	receive := DefaultReceiveBufferSettingsWithBufferSize(count)
 	receive.IdleTimeout, receive.GapTimeout, receive.MaxPeerAuditDuration = time.Hour, time.Hour, time.Hour
 	receive.AckCompressTimeout, receive.WriteTimeout = 0, 0
@@ -71,7 +86,7 @@ func newReceiptAdmissionFixtureWithProvider(t *testing.T, count int, withProvide
 		apply(receive)
 	}
 	settings.ReceiveBufferSettings = receive
-	f.client = NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	f.client = NewClient(clientParent, NewId(), NewNoContractClientOob(), settings)
 	f.client.ContractManager().AddNoContractPeer(f.source.SourceId)
 	transport := NewSendGatewayTransport()
 	f.client.RouteManager().UpdateTransport(transport, []Route{f.route})

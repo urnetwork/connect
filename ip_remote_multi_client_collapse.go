@@ -163,6 +163,9 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 	// Preserve protocol establishment and ACK custody ahead of a gap without
 	// spending the first ordered health receipt for this same generation.
 	firstInbound := update.receivedInbound.CompareAndSwap(false, true)
+	if update.connectSynReturn.offer != nil {
+		update.observeConnectSynReturnWithLock(client, control, firstInbound)
+	}
 	if control.aheadOfGap {
 		update.deferredInboundHealth = update.deferredInboundHealth || firstInbound
 		return false

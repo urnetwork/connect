@@ -169,6 +169,7 @@ type sendPackFrame struct {
 	// when true, and only to a receiver that advertised the capability, so a
 	// legacy peer's wire is unchanged.
 	contractAhead      bool
+	connectRace        bool
 	deliverImmediately bool
 }
 
@@ -218,6 +219,9 @@ func (m *sendPackFrame) sizePack() int {
 	}
 	if m.deliverImmediately {
 		n += protoSizeTag(14) + 1
+	}
+	if m.connectRace {
+		n += protoSizeTag(15) + 1
 	}
 	return n
 }
@@ -279,6 +283,10 @@ func (m *sendPackFrame) appendPack(b []byte) []byte {
 	}
 	if m.deliverImmediately {
 		b = protoAppendTag(b, 14, protoWireVarint)
+		b = append(b, 1)
+	}
+	if m.connectRace {
+		b = protoAppendTag(b, 15, protoWireVarint)
 		b = append(b, 1)
 	}
 	return b
@@ -376,6 +384,7 @@ type sendAckFrame struct {
 	deliveredImmediately       bool
 	immediateSequenceNumber    uint64
 	immediateSequenceNumberSet bool
+	connectedRaceReset         uint32
 	streamForwardingAcceptance []byte
 }
 
@@ -427,6 +436,9 @@ func (m *sendAckFrame) sizeAck() int {
 	}
 	if m.streamForwardingAcceptance != nil {
 		n += protoSizeTag(15) + protowire.SizeBytes(len(m.streamForwardingAcceptance))
+	}
+	if m.connectedRaceReset != 0 {
+		n += protoSizeTag(16) + protoSizeVarint(uint64(m.connectedRaceReset))
 	}
 	return n
 }
@@ -495,6 +507,10 @@ func (m *sendAckFrame) appendAck(b []byte) []byte {
 	if m.streamForwardingAcceptance != nil {
 		b = protoAppendTag(b, 15, protoWireBytes)
 		b = protowire.AppendBytes(b, m.streamForwardingAcceptance)
+	}
+	if m.connectedRaceReset != 0 {
+		b = protoAppendTag(b, 16, protoWireVarint)
+		b = protoAppendVarint(b, uint64(m.connectedRaceReset))
 	}
 	return b
 }
@@ -1150,6 +1166,19 @@ func consumeStreamForwardingRecord(b []byte, typ protowire.Type, size int) ([]by
 	return record, n
 }
 
+// A peer can omit an optional race outcome or request. An otherwise valid
+// protobuf field of another type or beyond the scalar range carries no proof.
+func consumeConnectRaceField(number protowire.Number, typ protowire.Type, b []byte) (uint32, int) {
+	if typ != protowire.VarintType {
+		return 0, protowire.ConsumeFieldValue(number, typ, b)
+	}
+	value, n := protowire.ConsumeVarint(b)
+	if value > 1<<32-1 {
+		return 0, n
+	}
+	return uint32(value), n
+}
+
 func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 	pack = &protocol.Pack{}
 	defer func() {
@@ -1265,6 +1294,13 @@ func decodePack(b []byte) (pack *protocol.Pack, success bool) {
 				return nil, false
 			}
 			pack.Tag = tg
+		case 15:
+			value, n := consumeConnectRaceField(num, typ, b)
+			if n < 0 {
+				return nil, false
+			}
+			b = b[n:]
+			pack.ConnectRace = value == 1
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1417,6 +1453,13 @@ func decodePackOwned(b []byte, prepaid ...*decodedPackOwner) (owner *decodedPack
 				return nil, false
 			}
 			pack.Tag = &owner.tag
+		case 15:
+			value, n := consumeConnectRaceField(num, typ, b)
+			if n < 0 {
+				return nil, false
+			}
+			b = b[n:]
+			pack.ConnectRace = value == 1
 		default:
 			fn := protowire.ConsumeFieldValue(num, typ, b)
 			if fn < 0 {
@@ -1588,6 +1631,13 @@ func decodeAck(b []byte) (*protocol.Ack, bool) {
 			b = b[vn:]
 			micros := uint32(v)
 			ack.ReceiverAckDelayMicros = &micros
+		case 16:
+			value, n := consumeConnectRaceField(num, typ, b)
+			if n < 0 {
+				return nil, false
+			}
+			b = b[n:]
+			ack.ConnectedRaceReset = value
 		case 15:
 			value, vn := consumeStreamForwardingRecord(b, typ, streamForwardingAnswerByteCount)
 			if vn < 0 {
@@ -1776,6 +1826,13 @@ func decodeAckOwned(b []byte, decoded *decodedTransferFrame) bool {
 			b = b[vn:]
 			decoded.ackReceiverDelayMicros = uint32(v)
 			ack.ReceiverAckDelayMicros = &decoded.ackReceiverDelayMicros
+		case 16:
+			value, n := consumeConnectRaceField(num, typ, b)
+			if n < 0 {
+				return false
+			}
+			b = b[n:]
+			ack.ConnectedRaceReset = value
 		case 15:
 			value, vn := consumeStreamForwardingRecord(b, typ, streamForwardingAnswerByteCount)
 			if vn < 0 {
