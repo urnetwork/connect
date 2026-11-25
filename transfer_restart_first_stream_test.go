@@ -21,11 +21,14 @@ package connect
 
 import (
 	"context"
+	"crypto/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -1245,6 +1248,140 @@ func TestSenderWritesWhatWentOutInPlaintextAtOnceForAPeerThatLostItsSession(t *t
 				t.Fatalf("held %t: a later nack wrote Pack %d again", held, item.sequenceNumber)
 			}
 		}
+	}
+}
+
+// A client restarted in place can receive a moment before its host provides
+// the mode its kept contracts name, as sidecar's edge pool provides Service only
+// once its platform client is open. A listener's head carrying such a contract
+// that reaches it first is refused, since nothing verifies under a mode the
+// client does not provide, and its sequence is tombstoned, so its copies are
+// dropped while the client's provide configuration stays as it was, with no
+// loop; once the client provides the mode, the next copy is heard and its frame
+// delivered. Before, the tombstone held as for a contract that does not verify,
+// and every later Pack of the listener's sequence was dropped: the restarted
+// open had no answer at the edge's call timeout, in about one restart in ten
+// thousand, more often as the listener's backlog reached it sooner. The test
+// takes FriendsAndFamily, which a client provides no more than Service until
+// it is told to, and whose frames reach the generic callbacks.
+func TestReceiveBufferHearsAContractAgainOnceItProvidesTheContractsMode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exited := make(chan receiveSequenceId, 4)
+	settings := DefaultClientSettings()
+	settings.Log = NewNoopLogger()
+	settings.ReceiveBufferSettings.afterRunReceiveSequenceForTest = func(id receiveSequenceId) {
+		exited <- id
+	}
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+	defer client.Cancel()
+	delivered := make(chan restartFirstStreamMessage, 4)
+	client.AddReceiveCallback(restartFirstStreamCollect(delivered))
+
+	// the key the restarted client kept, loaded before it provides the mode
+	provideMode := protocol.ProvideMode_FriendsAndFamily
+	provideKey := make([]byte, 32)
+	if _, err := rand.Read(provideKey); err != nil {
+		t.Fatal(err)
+	}
+	client.ContractManager().LoadProvideSecretKeys(map[protocol.ProvideMode][]byte{provideMode: provideKey})
+	source := SourceId(NewId())
+	stored, err := proto.Marshal(&protocol.StoredContract{
+		ContractId:        NewId().Bytes(),
+		SourceId:          source.SourceId.Bytes(),
+		DestinationId:     client.ClientId().Bytes(),
+		TransferByteCount: 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract := &protocol.Contract{
+		StoredContractBytes: stored,
+		StoredContractHmac:  SignStoredContract(client.ContractManager().settings, provideKey, stored),
+		ProvideMode:         provideMode,
+	}
+	sequenceId := NewId()
+	headMessageId := NewId()
+	// each copy owns its bytes, as each copy off the wire does
+	offerHead := func() (bool, error) {
+		contractFrame, err := ToFrame(contract, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := RequireToFrameWithDefaultProtocolVersion(&protocol.SimpleMessage{Content: "after the restart"})
+		receivePack := &ReceivePack{
+			Source:     source,
+			SequenceId: sequenceId,
+			Pack: &protocol.Pack{
+				MessageId:      headMessageId.Bytes(),
+				SequenceId:     sequenceId.Bytes(),
+				SequenceNumber: 0,
+				Head:           true,
+				ContractFrame:  contractFrame,
+				Frames:         []*protocol.Frame{payload},
+			},
+			ReceiveCallback:  client.receiveCallback,
+			MessageByteCount: ByteCount(len(payload.MessageBytes)),
+			Unwrapped:        true,
+			EncryptionRole:   sequenceTlsRoleServer,
+		}
+		accepted, err := client.receiveBuffer.Pack(receivePack, time.Second)
+		if !accepted {
+			receivePack.messagePoolReturn()
+		}
+		return accepted, err
+	}
+	headKey := receiveSequenceHeadKey{Source: source, EncryptionRole: sequenceTlsRoleServer}
+	tombstoned := func() bool {
+		client.receiveBuffer.mutex.Lock()
+		defer client.receiveBuffer.mutex.Unlock()
+		rejectedSequenceId, ok := client.receiveBuffer.rejectedReceiveSequenceIds[headKey]
+		return ok && rejectedSequenceId == sequenceId
+	}
+	awaitExit := func(what string) {
+		t.Helper()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: the receive sequence did not exit", what)
+		}
+	}
+
+	if ok, err := offerHead(); !ok || err != nil {
+		t.Fatalf("the first head was not taken: %t %v", ok, err)
+	}
+	awaitExit("the head under a mode the client does not provide")
+	if !tombstoned() {
+		t.Fatal("a contract under a mode the client does not provide left no tombstone")
+	}
+	// a copy while the provide configuration is as it was is dropped with no
+	// worker: the tombstone still stops a loop
+	if ok, err := offerHead(); !ok || err != nil {
+		t.Fatalf("a dropped copy reported %t %v", ok, err)
+	}
+	if !tombstoned() {
+		t.Fatal("a copy under the same provide configuration lifted the tombstone")
+	}
+	select {
+	case message := <-delivered:
+		t.Fatalf("delivered %q under a mode the client does not provide", message.content)
+	default:
+	}
+
+	client.ContractManager().SetProvideModes(map[protocol.ProvideMode]bool{provideMode: true})
+	if ok, err := offerHead(); !ok || err != nil {
+		t.Fatalf("the head after the client provides the mode was not taken: %t %v", ok, err)
+	}
+	select {
+	case message := <-delivered:
+		if message.content != "after the restart" {
+			t.Fatalf("delivered %q", message.content)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("once the client provides the mode the listener's head was not heard")
+	}
+	if tombstoned() {
+		t.Fatal("the tombstone outlived the change to what the client provides")
 	}
 }
 

@@ -15824,6 +15824,11 @@ type ReceiveBuffer struct {
 	// process-long succession of hostile or stale peers.
 	rejectedReceiveSequenceIds   map[receiveSequenceHeadKey]Id
 	rejectedReceiveSequenceOrder []receiveSequenceHeadKey
+	// For a tombstone whose contract was refused only because this client did
+	// not provide its mode, the provide configuration version it was refused
+	// under (`ContractManager.verifyProvided`): the tombstone lifts once that
+	// version has moved.
+	rejectedUnprovidedVersions map[receiveSequenceHeadKey]uint64
 	// activeReceiveSequences retains workers through their final Pack-channel
 	// drain, which occurs after their public head/index entries are removed.
 	activeReceiveSequences map[*ReceiveSequence]bool
@@ -15875,6 +15880,7 @@ func (self *ReceiveBuffer) removeRejectedReceiveSequenceWithLock(
 		return
 	}
 	delete(self.rejectedReceiveSequenceIds, headKey)
+	delete(self.rejectedUnprovidedVersions, headKey)
 	for i, key := range self.rejectedReceiveSequenceOrder {
 		if key != headKey {
 			continue
@@ -15918,6 +15924,7 @@ func (self *ReceiveBuffer) rejectReceiveSequenceWithLock(
 	if rejectedReceiveSequenceCapacity <= len(self.rejectedReceiveSequenceOrder) {
 		oldestHeadKey := self.rejectedReceiveSequenceOrder[0]
 		delete(self.rejectedReceiveSequenceIds, oldestHeadKey)
+		delete(self.rejectedUnprovidedVersions, oldestHeadKey)
 		copy(
 			self.rejectedReceiveSequenceOrder,
 			self.rejectedReceiveSequenceOrder[1:],
@@ -15944,6 +15951,14 @@ func (self *ReceiveBuffer) rejectReceiveSequenceRetransmitWithLock(
 	if !ok {
 		return false
 	}
+	if version, unprovided := self.rejectedUnprovidedVersions[headKey]; unprovided &&
+		self.client != nil && self.client.contractManager != nil &&
+		self.client.contractManager.provideConfigurationVersion.Load() != version {
+		// what this client provides changed since a contract for a mode it did
+		// not provide was refused: the sequence is heard again
+		self.removeRejectedReceiveSequenceWithLock(headKey)
+		return false
+	}
 	if sequenceId == rejectedSequenceId ||
 		sequenceId.LessThan(rejectedSequenceId) {
 		return true
@@ -15968,6 +15983,16 @@ func (self *ReceiveBuffer) removeReceiveSequenceWithLock(
 			headKey,
 			receiveSequenceId.SequenceId,
 		)
+		if self.rejectedReceiveSequenceIds[headKey] == receiveSequenceId.SequenceId {
+			if receiveSequence.rejectUnprovided {
+				if self.rejectedUnprovidedVersions == nil {
+					self.rejectedUnprovidedVersions = map[receiveSequenceHeadKey]uint64{}
+				}
+				self.rejectedUnprovidedVersions[headKey] = receiveSequence.rejectProvideConfigurationVersion
+			} else {
+				delete(self.rejectedUnprovidedVersions, headKey)
+			}
+		}
 	}
 	delete(self.receiveSequences, receiveSequenceId)
 	if self.headReceiveSequenceIds[headKey] == receiveSequenceId {
@@ -16576,7 +16601,13 @@ type ReceiveSequence struct {
 	// rejectRetransmits is set when this sequence presents a malformed,
 	// unverifiable, or otherwise unusable contract. The owning ReceiveBuffer
 	// reads it after Run returns and tombstones the deterministic failure.
-	rejectRetransmits bool
+	// rejectUnprovided says the contract was refused only because this client
+	// did not provide its mode, as of the provide configuration version
+	// rejectProvideConfigurationVersion: deterministic only until that
+	// configuration changes, so the tombstone lifts then.
+	rejectRetransmits                 bool
+	rejectUnprovided                  bool
+	rejectProvideConfigurationVersion uint64
 
 	// deliverItems/deliverFrames buffer consecutive in-order head items so
 	// their app frames dispatch in ONE receive callback per drain burst
@@ -18959,11 +18990,20 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 	}
 
 	// check the hmac with the local provider secret key
-	if !self.client.ContractManager().Verify(
+	verified, provided, provideConfigurationVersion := self.client.ContractManager().verifyProvided(
 		contract.StoredContractHmac,
 		contract.StoredContractBytes,
-		contract.ProvideMode) {
+		contract.ProvideMode)
+	if !verified {
 		self.rejectRetransmits = true
+		if !provided {
+			// refused for this client's provide configuration, not for the
+			// contract's bytes: a client restarted in place provides its modes
+			// a moment after it can receive, and the contract that reaches it
+			// first verifies once it does (ReceiveBuffer lifts the tombstone)
+			self.rejectUnprovided = true
+			self.rejectProvideConfigurationVersion = provideConfigurationVersion
+		}
 		self.log.Errorf("[r]%s<-%s s(%s) exit contract verification failed (%s)\n", self.client.ClientTag(), self.source.SourceId, self.source.StreamId, contract.ProvideMode)
 		// Close only a stream authenticated by the last verified contract. The
 		// callback source is a local mask, and the failing bytes are untrusted;
@@ -18976,11 +19016,13 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		if self.client.streamManager != nil && verifiedStreamId != (Id{}) {
 			self.client.streamManager.streamBuffer.CloseStream(verifiedStreamId)
 		}
-		// bad contract
+		if provided {
+			// bad contract
+			self.peerAudit.Update(func(a *PeerAudit) {
+				a.badContract()
+			})
+		}
 		// close sequence
-		self.peerAudit.Update(func(a *PeerAudit) {
-			a.badContract()
-		})
 		return errors.New("Contract verification failed.")
 	}
 

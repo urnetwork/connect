@@ -647,6 +647,11 @@ type ContractManager struct {
 	// provide paused overrides the set provide modes
 	providePaused  bool
 	provideMonitor *Monitor
+	// Moves under mutex at each change to what Verify can accept: the provide
+	// modes, the provide keys, the pause. A receive sequence whose contract was
+	// refused only because this client did not provide its mode then may hear
+	// it again once this has moved (`ReceiveBuffer.rejectReceiveSequenceRetransmitWithLock`).
+	provideConfigurationVersion atomic.Uint64
 
 	destinationContracts map[ContractKey]*contractQueue
 	// Protected by mutex. Contract-free clients need no expiry worker; once
@@ -1369,6 +1374,7 @@ func (self *ContractManager) LoadProvideSecretKeys(provideSecretKeys map[protoco
 	for provideMode, provideSecretKey := range provideSecretKeys {
 		self.provideSecretKeys[provideMode] = provideSecretKey
 	}
+	self.provideConfigurationVersion.Add(1)
 }
 
 func (self *ContractManager) InitProvideSecretKeys() {
@@ -1394,6 +1400,7 @@ func (self *ContractManager) InitProvideSecretKeys() {
 			self.provideSecretKeys[provideMode] = provideSecretKey
 		}
 	}
+	self.provideConfigurationVersion.Add(1)
 }
 
 func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
@@ -1404,6 +1411,7 @@ func (self *ContractManager) SetProvidePaused(providePaused bool) bool {
 
 		if self.providePaused != providePaused {
 			self.providePaused = providePaused
+			self.provideConfigurationVersion.Add(1)
 			self.provideMonitor.NotifyAll()
 			changed = true
 		}
@@ -1569,6 +1577,7 @@ func (self *ContractManager) applyProvideModes(provideModes map[protocol.Provide
 	}
 
 	self.provideModes = maps.Clone(provideModes)
+	self.provideConfigurationVersion.Add(1)
 	self.provideMonitor.NotifyAll()
 	self.mutex.Unlock()
 
@@ -1628,30 +1637,46 @@ func (self *ContractManager) GetProvideModes() map[protocol.ProvideMode]bool {
 }
 
 func (self *ContractManager) Verify(storedContractHmac []byte, storedContractBytes []byte, provideMode protocol.ProvideMode) bool {
+	verified, _, _ := self.verifyProvided(storedContractHmac, storedContractBytes, provideMode)
+	return verified
+}
+
+// Verify, and whether this client provides the contract's mode now, with the
+// provide configuration version that answer holds for. A contract refused
+// because the mode is paused, not provided or has no key is refused for this
+// client's configuration, not for its own bytes: a client restarted in place
+// provides its modes a moment after it can receive, and a contract for one of
+// them that reaches it first verifies once it does.
+func (self *ContractManager) verifyProvided(
+	storedContractHmac []byte,
+	storedContractBytes []byte,
+	provideMode protocol.ProvideMode,
+) (verified bool, provided bool, provideConfigurationVersion uint64) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
+	provideConfigurationVersion = self.provideConfigurationVersion.Load()
 
 	// when paused, only allow ProvideMode_Stream for return traffic and
 	// ProvideMode_Network for network peers (pause stops public/ff only)
 	if self.providePaused && provideMode != protocol.ProvideMode_Stream && provideMode != protocol.ProvideMode_Network {
-		return false
+		return false, false, provideConfigurationVersion
 	}
 
 	if !self.provideModes[provideMode] {
-		return false
+		return false, false, provideConfigurationVersion
 	}
 
 	provideSecretKey, ok := self.provideSecretKeys[provideMode]
 	if !ok {
 		// provide mode is not enabled
-		return false
+		return false, false, provideConfigurationVersion
 	}
 
-	verified := VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	verified = VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
 	if verified {
 		self.admitOriginalWork(storedContractBytes)
 	}
-	return verified
+	return verified, true, provideConfigurationVersion
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
