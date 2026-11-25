@@ -176,6 +176,105 @@ EOF
     cp "$run_dir/fixtures/tag-$mr_tag.json" "$run_dir/fixtures/latest.json"
 }
 
+# sig_test_openssl: an OpenSSL 3 that signs raw Ed25519, the same search the
+# installer does (macOS /usr/bin/openssl is LibreSSL)
+sig_test_openssl ()
+{
+    for st_bin in "$(command -v openssl 2>/dev/null)" /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+        [ -n "$st_bin" ] && [ -x "$st_bin" ] || continue
+        "$st_bin" version 2>/dev/null | grep -q '^OpenSSL [3-9]' || continue
+        "$st_bin" pkeyutl -help 2>&1 | grep -q -- '-rawin' || continue
+        echo "$st_bin"
+        return 0
+    done
+    return 1
+}
+
+# sign_release TAG MODE: adds SHA256SUMS and SHA256SUMS.sig, signed with the
+# test key, to TAG's release. MODE: good, badsig (signed by another key),
+# badsum (a wrong sha256 for the tarball), noentry (no line for it)
+sign_release ()
+{
+    sr_tag="$1"
+    sr_name="urnetwork-provider-$sr_tag.tar.gz"
+    sr_sum="$(shasum -a 256 "$run_dir/fixtures/$sr_name" | cut -d' ' -f1)"
+    case "$2" in
+        badsum) sr_sum="1111111111111111111111111111111111111111111111111111111111111111" ;;
+    esac
+    {
+        echo "2222222222222222222222222222222222222222222222222222222222222222  urnetwork-provider-$sr_tag-windows-amd64.zip"
+        [ "$2" = noentry ] || echo "$sr_sum  $sr_name"
+    } > "$run_dir/fixtures/SHA256SUMS"
+    sr_key="$run_dir/sig/key.pem"
+    [ "$2" = badsig ] && sr_key="$run_dir/sig/other.pem"
+    "$sig_ssl" pkeyutl -sign -inkey "$sr_key" -rawin -in "$run_dir/fixtures/SHA256SUMS" | base64 > "$run_dir/fixtures/SHA256SUMS.sig"
+    sed "s|\"assets\": \[|\"assets\": [{\"name\": \"SHA256SUMS\", \"browser_download_url\": \"https://dl.test/SHA256SUMS\"}, {\"name\": \"SHA256SUMS.sig\", \"browser_download_url\": \"https://dl.test/SHA256SUMS.sig\"},|" \
+        "$run_dir/fixtures/tag-$sr_tag.json" > "$run_dir/fixtures/latest.json"
+    cp "$run_dir/fixtures/latest.json" "$run_dir/fixtures/tag-$sr_tag.json"
+}
+
+# sig_tests: the second, signature check on SHA256SUMS
+sig_tests ()
+{
+    # no signature in the release: staged, so a warning and the install goes on
+    make_release s1
+    $sh_cmd "$script" -y > "$run_dir/out" 2>&1 || fail "install without a signature failed: $(cat "$run_dir/out")"
+    grep -q "warning: the release has no signed SHA256SUMS" "$run_dir/out" || fail "no warning for a missing signature: $(cat "$run_dir/out")"
+    tools uninstall -y > /dev/null 2>&1
+
+    if ! sig_ssl="$(sig_test_openssl)"; then
+        echo "SKIP [$sh_name] signature tests: no OpenSSL 3 with Ed25519 here" >&2
+        return 0
+    fi
+    mkdir -p "$run_dir/sig"
+    "$sig_ssl" genpkey -algorithm ed25519 -out "$run_dir/sig/key.pem" 2>/dev/null || fail "test key"
+    "$sig_ssl" genpkey -algorithm ed25519 -out "$run_dir/sig/other.pem" 2>/dev/null || fail "other test key"
+    URNETWORK_TEST_RELEASE_SIG_KEY="$("$sig_ssl" pkey -in "$run_dir/sig/key.pem" -pubout -outform DER | tail -c 32 | base64)"
+    export URNETWORK_TEST_RELEASE_SIG_KEY
+
+    # a good signature
+    make_release s2
+    sign_release s2 good
+    $sh_cmd "$script" -y > "$run_dir/out" 2>&1 || fail "signed install failed: $(cat "$run_dir/out")"
+    grep -q "Signature OK" "$run_dir/out" || fail "good signature not reported: $(cat "$run_dir/out")"
+    grep -q "fake provider s2 arm64" "$(install_dir)/bin/urnetwork" || fail "signed install put the wrong binary"
+    tools uninstall -y > /dev/null 2>&1
+
+    # a good signature stands in for a missing release digest, even for a
+    # scheduled update
+    make_release s3 "" nodigest
+    sign_release s3 good
+    $sh_cmd "$script" -y > "$run_dir/out" 2>&1 || fail "signed install without a digest failed: $(cat "$run_dir/out")"
+    grep -q "skipping the checksum check" "$run_dir/out" && fail "signed SHA256SUMS not used as the checksum"
+    tools uninstall -y > /dev/null 2>&1
+
+    # every failure refuses and installs nothing
+    for sr_mode in badsig badsum noentry; do
+        make_release s4
+        sign_release s4 "$sr_mode"
+        $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "$sr_mode: install went ahead"
+        [ -e "$(install_dir)/bin/urnetwork" ] && fail "$sr_mode: a binary was installed"
+        case "$sr_mode" in
+            badsig) grep -q "signature does not match" "$run_dir/out" || fail "badsig reason: $(cat "$run_dir/out")" ;;
+            badsum) grep -q "signed SHA256SUMS says 1111" "$run_dir/out" || fail "badsum reason: $(cat "$run_dir/out")" ;;
+            noentry) grep -q "has no sha256 for urnetwork-provider-s4.tar.gz" "$run_dir/out" || fail "noentry reason: $(cat "$run_dir/out")" ;;
+        esac
+        tools uninstall -y > /dev/null 2>&1
+        rm -rf "$(install_dir)"
+    done
+
+    # an update to a tampered release keeps the installed provider
+    make_release s5
+    sign_release s5 good
+    $sh_cmd "$script" -y > /dev/null 2>&1 || fail "install s5"
+    make_release s6
+    sign_release s6 badsum
+    tools update > "$run_dir/out" 2>&1 && fail "update to a tampered release went ahead"
+    grep -q "fake provider s5 " "$(install_dir)/bin/urnetwork" || fail "a tampered update replaced the binary"
+    tools uninstall -y > /dev/null 2>&1
+    unset URNETWORK_TEST_RELEASE_SIG_KEY
+}
+
 install_dir () { echo "$HOME/.local/share/urnetwork-provider"; }
 tools () { URNETWORK_PROVIDER_INSTALL="" $sh_cmd "$(install_dir)/bin/urnet-tools" "$@"; }
 loaded () { [ -f "$run_dir/launchd/$1" ]; }
@@ -519,6 +618,8 @@ run_tests ()
     MOCK_ARCH=ppc $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "ppc accepted"
     MOCK_UNAME=Linux $sh_cmd "$script" -y > "$run_dir/out" 2>&1 && fail "Linux accepted"
     grep -q "Provider_Install_Linux.sh" "$run_dir/out" || fail "Linux refusal does not point to the Linux installer"
+
+    sig_tests
 
     rm -rf "$run_dir"
 }
