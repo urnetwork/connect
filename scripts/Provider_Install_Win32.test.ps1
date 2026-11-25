@@ -97,6 +97,59 @@ Check "digest" (Get-AssetSha256 $AllPlatform) ("ab" * 32)
 Check "no digest" (Get-AssetSha256 $WinArm) ""
 Check "bad digest" (Get-AssetSha256 ([pscustomobject]@{ digest = "sha512:00" })) ""
 
+# SHA256SUMS and its Ed25519 signature.
+& {
+    . (Get-ScriptFunction "Provider_Install_Win32.ps1" @("Get-ReleaseSigKey", "Get-SumsSha256", "Get-SigOpenSsl", "Test-ReleaseSignature"))
+    $Name = "urnetwork-provider-v1-windows-amd64.tar.gz"
+    $Sums = ("22" * 32) + "  urnetwork-provider-v1-linux-amd64.tar.gz`n" + ("AB" * 32) + "  $Name`n"
+    Check "sums line" (Get-SumsSha256 $Sums $Name) ("ab" * 32)
+    Check "sums binary-mode line" (Get-SumsSha256 (("cd" * 32) + " *$Name`r`n") $Name) ("cd" * 32)
+    Check "sums no line" (Get-SumsSha256 $Sums "urnetwork-provider-v1.tar.gz") ""
+    Check "sums name is exact" (Get-SumsSha256 $Sums $Name.ToUpper()) ""
+    Check "release key" (Get-ReleaseSigKey) "Qm4V/UTZcuIRMFJuAzDhxf2CK6ycwxF0HFOcFhXBIYQ="
+    Check "no verifier" (Test-ReleaseSignature -SumsPath "x" -SigPath "y" -KeyBase64 "AA==" -OpenSsl "") $null
+
+    $OpenSsl = Get-SigOpenSsl
+    if (-not $OpenSsl) {
+        Write-Host "SKIP: signature tests (no OpenSSL 3 with Ed25519 on PATH)"
+        return
+    }
+    $Dir = Join-Path ([IO.Path]::GetTempPath()) "urnetwork-sig-test-$PID"
+    $null = New-Item -ItemType Directory -Force -Path $Dir
+    try {
+        $KeyPem = Join-Path $Dir "key.pem"
+        $OtherPem = Join-Path $Dir "other.pem"
+        & $OpenSsl genpkey -algorithm ed25519 -out $KeyPem 2>$null
+        & $OpenSsl genpkey -algorithm ed25519 -out $OtherPem 2>$null
+        $Der = Join-Path $Dir "pub.der"
+        & $OpenSsl pkey -in $KeyPem -pubout -outform DER -out $Der
+        $Raw = [IO.File]::ReadAllBytes($Der)
+        $Key = [Convert]::ToBase64String($Raw[($Raw.Length - 32)..($Raw.Length - 1)])
+        $SumsPath = Join-Path $Dir "SHA256SUMS"
+        $SigPath = Join-Path $Dir "SHA256SUMS.sig"
+        [IO.File]::WriteAllText($SumsPath, $Sums)
+        function Write-Sig([string]$Pem) {
+            $Bin = Join-Path $Dir "sig.bin"
+            & $OpenSsl pkeyutl -sign -inkey $Pem -rawin -in $SumsPath -out $Bin
+            [IO.File]::WriteAllText($SigPath, [Convert]::ToBase64String([IO.File]::ReadAllBytes($Bin)) + "`n")
+        }
+        Write-Sig $KeyPem
+        Check "good signature" (Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath -KeyBase64 $Key -OpenSsl $OpenSsl) $true
+        $env:URNETWORK_TEST_RELEASE_SIG_KEY = $Key
+        Check "test key override" (Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath) $true
+        Remove-Item Env:URNETWORK_TEST_RELEASE_SIG_KEY
+        Check "release key rejects a test signature" (Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath -OpenSsl $OpenSsl) $false
+        Write-Sig $OtherPem
+        Check "other key's signature" (Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath -KeyBase64 $Key -OpenSsl $OpenSsl) $false
+        Write-Sig $KeyPem
+        [IO.File]::WriteAllText($SumsPath, $Sums.Replace("22", "33"))
+        Check "changed SHA256SUMS" (Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath -KeyBase64 $Key -OpenSsl $OpenSsl) $false
+    }
+    finally {
+        Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # urnet-tools helpers.
 . (Get-ScriptFunction "urnet-tools.ps1" @("ConvertTo-Interval", "Remove-PathEntry"))
 Check "interval daily" (ConvertTo-Interval "daily") "day"

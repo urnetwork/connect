@@ -374,6 +374,111 @@ release_asset ()
     fi
 }
 
+# release_named_url NAME < JSON: the download URL of the asset named NAME
+release_named_url ()
+{
+    rn_json="$(tr -d '\000-\037')"
+    if command -v jq > /dev/null 2>&1; then
+        printf '%s' "$rn_json" | jq -r --arg n "$1" '[.assets[]? | select(.name == $n)][0].browser_download_url // empty'
+    elif command -v plutil > /dev/null 2>&1; then
+        rn_i=0
+        while rn_name="$(printf '%s' "$rn_json" | plutil -extract "assets.$rn_i.name" raw -o - - 2>/dev/null)"; do
+            if [ "$rn_name" = "$1" ]; then
+                printf '%s' "$rn_json" | plutil -extract "assets.$rn_i.browser_download_url" raw -o - - 2>/dev/null
+                return 0
+            fi
+            rn_i=$((rn_i + 1))
+        done
+    else
+        printf '%s' "$rn_json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*/'"$1"'"' |
+            sed 's/.*"\(http[^"]*\)"$/\1/' | head -n 1
+    fi
+}
+
+# ---------------------------------------------------------------- signature
+
+# The release signs SHA256SUMS ("<sha256>  <name>" lines) with this Ed25519
+# key; SHA256SUMS.sig holds the base64 signature. Staged: until every
+# release carries it, a missing signature or a missing verifier only warns.
+# URNETWORK_TEST_RELEASE_SIG_KEY exists for the tests, which sign with a
+# key they generate.
+release_sig_key="${URNETWORK_TEST_RELEASE_SIG_KEY:-Qm4V/UTZcuIRMFJuAzDhxf2CK6ycwxF0HFOcFhXBIYQ=}"
+release_sig_required=0
+
+# sig_openssl: prints an openssl that verifies raw Ed25519 (OpenSSL 3+;
+# LibreSSL, the macOS /usr/bin/openssl, cannot)
+sig_openssl ()
+{
+    for so_bin in "$(command -v openssl 2>/dev/null)" /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+        [ -n "$so_bin" ] && [ -x "$so_bin" ] || continue
+        "$so_bin" version 2>/dev/null | grep -q '^OpenSSL [3-9]' || continue
+        "$so_bin" pkeyutl -help 2>&1 | grep -q -- '-rawin' || continue
+        echo "$so_bin"
+        return 0
+    done
+    return 1
+}
+
+# release_sig_check FILE NAME SUMS SIG: checks SIG over SUMS with the release
+# key, then FILE's sha256 against the SUMS line for NAME. SUMS and SIG are
+# downloaded files, or empty when the release has none.
+# Returns 0 verified, 1 refuse (reason on stderr), 2 not checked (warned).
+release_sig_check ()
+{
+    rs_file="$1"
+    rs_name="$2"
+    rs_sums="$3"
+    rs_sig="$4"
+    if [ -z "$rs_sums" ] || [ ! -s "$rs_sums" ] || [ -z "$rs_sig" ] || [ ! -s "$rs_sig" ]; then
+        rs_why="the release has no signed SHA256SUMS"
+    elif ! rs_ssl="$(sig_openssl)"; then
+        rs_why="no OpenSSL 3 here to check the release signature"
+    else
+        rs_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-sig.XXXXXX")" || {
+            echo "could not create a temporary folder to check the release signature" >&2
+            return 1
+        }
+        # SPKI DER: the Ed25519 prefix 302a300506032b6570032100 + the raw key
+        rs_ok=0
+        {
+            printf '\060\052\060\005\006\003\053\145\160\003\041\000'
+            printf '%s' "$release_sig_key" | "$rs_ssl" base64 -d -A
+        } > "$rs_dir/key.der" 2>/dev/null &&
+            tr -d ' \t\r\n' < "$rs_sig" | "$rs_ssl" base64 -d -A > "$rs_dir/sig.bin" 2>/dev/null &&
+            "$rs_ssl" pkeyutl -verify -pubin -keyform DER -inkey "$rs_dir/key.der" -rawin \
+                -in "$rs_sums" -sigfile "$rs_dir/sig.bin" > /dev/null 2>&1 &&
+            rs_ok=1
+        rm -rf "$rs_dir"
+        if [ "$rs_ok" -ne 1 ]; then
+            echo "the release signature does not match SHA256SUMS; the release may have been changed" >&2
+            return 1
+        fi
+        rs_want="$(awk -v n="$rs_name" '$2 == n || $2 == "*" n { print $1; exit }' "$rs_sums" | tr 'A-F' 'a-f')"
+        if [ "${#rs_want}" -ne 64 ]; then
+            echo "the signed SHA256SUMS has no sha256 for $rs_name" >&2
+            return 1
+        fi
+        if command -v sha256sum > /dev/null 2>&1; then
+            rs_have="$(sha256sum "$rs_file" | awk '{ print $1 }')"
+        elif command -v shasum > /dev/null 2>&1; then
+            rs_have="$(shasum -a 256 "$rs_file" | awk '{ print $1 }')"
+        else
+            rs_have="$("$rs_ssl" dgst -sha256 "$rs_file" | awk '{ print $NF }')"
+        fi
+        if [ "$rs_have" != "$rs_want" ]; then
+            echo "the download is damaged or was changed: sha256 is $rs_have, the signed SHA256SUMS says $rs_want" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$release_sig_required" = 1 ]; then
+        echo "$rs_why; a signature is required" >&2
+        return 1
+    fi
+    echo "warning: $rs_why; continuing with the release checksum only" >&2
+    return 2
+}
+
 # ---------------------------------------------------------------- locking
 
 lock_dir ()
@@ -1053,7 +1158,28 @@ do_install ()
         else
             curl -fsSL --retry 3 --retry-delay 2 -o "$workdir/provider.tar.gz" "$dl_url" || die "download failed: $dl_url"
         fi
-        verify_sha256 "$workdir/provider.tar.gz" "$dl_digest"
+        # the signed SHA256SUMS, when the release has one
+        sums_url="$(printf '%s' "$release" | release_named_url SHA256SUMS)"
+        sums_sig_url="$(printf '%s' "$release" | release_named_url SHA256SUMS.sig)"
+        sums_file=""
+        sums_sig_file=""
+        if [ -n "$sums_url" ] && [ -n "$sums_sig_url" ]; then
+            fetch "$sums_url" > "$workdir/SHA256SUMS" &&
+                fetch "$sums_sig_url" > "$workdir/SHA256SUMS.sig" ||
+                die "could not download the release's SHA256SUMS and its signature"
+            sums_file="$workdir/SHA256SUMS"
+            sums_sig_file="$workdir/SHA256SUMS.sig"
+        fi
+        sig_status=0
+        release_sig_check "$workdir/provider.tar.gz" "${dl_url##*/}" "$sums_file" "$sums_sig_file" || sig_status=$?
+        [ "$sig_status" -eq 1 ] && die "refusing this download (see above); nothing was installed"
+        if [ "$sig_status" -eq 0 ]; then
+            say "Signature OK"
+            # the signed SHA256SUMS stands in for a missing release digest
+            [ -n "$dl_digest" ] && verify_sha256 "$workdir/provider.tar.gz" "$dl_digest"
+        else
+            verify_sha256 "$workdir/provider.tar.gz" "$dl_digest"
+        fi
         # extract only this Mac's binary, not all twelve platforms; a
         # per-platform tarball may hold just `provider'
         mkdir "$workdir/x" || die "could not create a temporary folder"

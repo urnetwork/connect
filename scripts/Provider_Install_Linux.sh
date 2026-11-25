@@ -283,6 +283,94 @@ file_sha256 ()
     fi
 }
 
+# The release signs SHA256SUMS ("<sha256>  <name>" lines) with this Ed25519
+# key; SHA256SUMS.sig holds the base64 signature. Staged: until every
+# release carries it, a missing signature or a missing verifier only warns.
+# URNETWORK_TEST_RELEASE_SIG_KEY exists for the tests, which sign with a
+# key they generate.
+release_sig_key="${URNETWORK_TEST_RELEASE_SIG_KEY:-Qm4V/UTZcuIRMFJuAzDhxf2CK6ycwxF0HFOcFhXBIYQ=}"
+release_sig_required=0
+
+# sig_openssl: prints an openssl that verifies raw Ed25519 (OpenSSL 3+)
+sig_openssl ()
+{
+    for so_bin in "$(command -v openssl 2>/dev/null)" /usr/bin/openssl /usr/local/bin/openssl; do
+        [ -n "$so_bin" ] && [ -x "$so_bin" ] || continue
+        "$so_bin" version 2>/dev/null | grep -q '^OpenSSL [3-9]' || continue
+        "$so_bin" pkeyutl -help 2>&1 | grep -q -- '-rawin' || continue
+        echo "$so_bin"
+        return 0
+    done
+    return 1
+}
+
+# release_sig_check FILE NAME SUMS SIG: checks SIG over SUMS with the release
+# key, then FILE's sha256 against the SUMS line for NAME. SUMS and SIG are
+# downloaded files, or empty when the release has none.
+# Returns 0 verified, 1 refuse (reason on stderr), 2 not checked (warned).
+release_sig_check ()
+{
+    rs_file="$1"
+    rs_name="$2"
+    rs_sums="$3"
+    rs_sig="$4"
+    if [ -z "$rs_sums" ] || [ ! -s "$rs_sums" ] || [ -z "$rs_sig" ] || [ ! -s "$rs_sig" ]; then
+        rs_why="the release has no signed SHA256SUMS"
+    elif ! rs_ssl="$(sig_openssl)"; then
+        rs_why="no OpenSSL 3 here to check the release signature"
+    else
+        rs_dir="$(mktemp -d "${TMPDIR:-/tmp}/urnetwork-sig.XXXXXX")" || {
+            echo "could not create a temporary folder to check the release signature" >&2
+            return 1
+        }
+        # SPKI DER: the Ed25519 prefix 302a300506032b6570032100 + the raw key
+        rs_ok=0
+        {
+            printf '\060\052\060\005\006\003\053\145\160\003\041\000'
+            printf '%s' "$release_sig_key" | "$rs_ssl" base64 -d -A
+        } > "$rs_dir/key.der" 2>/dev/null &&
+            tr -d ' \t\r\n' < "$rs_sig" | "$rs_ssl" base64 -d -A > "$rs_dir/sig.bin" 2>/dev/null &&
+            "$rs_ssl" pkeyutl -verify -pubin -keyform DER -inkey "$rs_dir/key.der" -rawin \
+                -in "$rs_sums" -sigfile "$rs_dir/sig.bin" > /dev/null 2>&1 &&
+            rs_ok=1
+        rm -rf "$rs_dir"
+        if [ "$rs_ok" -ne 1 ]; then
+            echo "the release signature does not match SHA256SUMS; the release may have been changed" >&2
+            return 1
+        fi
+        rs_want="$(awk -v n="$rs_name" '$2 == n || $2 == "*" n { print $1; exit }' "$rs_sums" | tr 'A-F' 'a-f')"
+        if [ "${#rs_want}" -ne 64 ]; then
+            echo "the signed SHA256SUMS has no sha256 for $rs_name" >&2
+            return 1
+        fi
+        rs_have="$(file_sha256 "$rs_file" | tr 'A-F' 'a-f')"
+        [ -n "$rs_have" ] || rs_have="$("$rs_ssl" dgst -sha256 "$rs_file" | awk '{ print $NF }')"
+        if [ "$rs_have" != "$rs_want" ]; then
+            echo "the download is damaged or was changed: sha256 is $rs_have, the signed SHA256SUMS says $rs_want" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$release_sig_required" = 1 ]; then
+        echo "$rs_why; a signature is required" >&2
+        return 1
+    fi
+    echo "warning: $rs_why; continuing with the release checksum only" >&2
+    return 2
+}
+
+# $1 url, $2 output file: a quiet download with curl or wget
+download_quiet ()
+{
+    if command -v curl > /dev/null; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget > /dev/null; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
 installed_version ()
 {
     if [ -f "$install_path/.version" ]; then
@@ -1537,6 +1625,8 @@ do_install ()
     all_name=""
     all_url=""
     all_digest=""
+    sums_url=""
+    sums_sig_url=""
     tab="$(printf '\t')"
 
     assets="$(release_assets "$release_json")"
@@ -1550,6 +1640,14 @@ do_install ()
                 ;;
 
             urnetwork-provider-*-linux-*|urnetwork-provider-*-darwin-*|urnetwork-provider-*-windows-*)
+                ;;
+
+            SHA256SUMS)
+                sums_url="$a_url"
+                ;;
+
+            SHA256SUMS.sig)
+                sums_sig_url="$a_url"
                 ;;
 
             urnetwork-provider-*.tar.gz)
@@ -1610,6 +1708,29 @@ EOF
         exit 1
     fi
 
+    # the signed SHA256SUMS, when the release has one
+    sums_file=""
+    sums_sig_file=""
+    if [ -n "$sums_url" ] && [ -n "$sums_sig_url" ]; then
+        if download_quiet "$sums_url" "$workdir/SHA256SUMS" &&
+            download_quiet "$sums_sig_url" "$workdir/SHA256SUMS.sig"; then
+            sums_file="$workdir/SHA256SUMS"
+            sums_sig_file="$workdir/SHA256SUMS.sig"
+        else
+            pr_err "Failed to download the release's SHA256SUMS and its signature"
+            exit 1
+        fi
+    fi
+
+    sig_status=0
+    release_sig_check "$tarball" "$dl_name" "$sums_file" "$sums_sig_file" || sig_status=$?
+    if [ "$sig_status" -eq 1 ]; then
+        pr_err "Nothing was installed; try again later"
+        exit 1
+    elif [ "$sig_status" -eq 0 ]; then
+        pr_info "Signature OK (signed SHA256SUMS)"
+    fi
+
     if [ -n "$expected_sha256" ]; then
         actual_sha256="$(file_sha256 "$tarball")"
 
@@ -1624,6 +1745,8 @@ EOF
         else
             pr_info "Checksum OK (sha256 %s)" "$actual_sha256"
         fi
+    elif [ "$sig_status" -eq 0 ]; then
+        :
     elif [ "$operation" = "update" ]; then
         pr_err "The release lists no checksum for %s; not updating without one" "$dl_name"
         pr_err "Run \`urnet-tools reinstall --tag %s' to install it anyway" "$version_to_install"

@@ -243,4 +243,56 @@ PATH="$run_dir:$PATH" me=urnet-tools operation=update install_path=/x system_uni
 [ -e "$home/user/urnetwork-update.timer" ] || fail "an update dropped the update timer"
 rm -f "$run_dir/systemctl" "$run_dir/sudo" "$run_dir/id"
 
+# the signed SHA256SUMS check: staged, so a release without one only warns
+awk '/^(pr_err|pr_info|file_sha256|sig_openssl|release_sig_check) \(\)$/ { on=1 } on { print } on && /^}$/ { on=0 }' \
+    "$here/Provider_Install_Linux.sh" > "$run_dir/sig.sh"
+sig_dir="$run_dir/sigtest"
+mkdir -p "$sig_dir/bin"
+echo "provider tarball" > "$sig_dir/urnetwork-provider-v1-linux-amd64.tar.gz"
+# $1 SUMS ('' none), $2 SIG ('' none); prints the status, reasons in $sig_dir/out
+sig_case ()
+{
+    PATH="$sig_dir/bin:$PATH" release_sig_key="${sig_key:-}" release_sig_required=0 \
+        sh -c ". '$run_dir/sig.sh'; release_sig_check '$sig_dir/urnetwork-provider-v1-linux-amd64.tar.gz' urnetwork-provider-v1-linux-amd64.tar.gz '$1' '$2'; echo \$?" 2> "$sig_dir/out"
+}
+[ "$(sig_case "" "")" = 2 ] || fail "a release without SHA256SUMS was not a warning"
+grep -q "warning: the release has no signed SHA256SUMS" "$sig_dir/out" || fail "no warning: $(cat "$sig_dir/out")"
+
+sig_ssl=""
+for c in "$(command -v openssl 2>/dev/null)" /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+    [ -n "$c" ] && [ -x "$c" ] && "$c" version 2>/dev/null | grep -q '^OpenSSL [3-9]' && "$c" pkeyutl -help 2>&1 | grep -q -- -rawin && { sig_ssl="$c"; break; }
+done
+if [ -z "$sig_ssl" ]; then
+    echo "SKIP signature tests: no OpenSSL 3 with Ed25519 here" >&2
+else
+    # the installer looks for openssl on PATH
+    ln -s "$sig_ssl" "$sig_dir/bin/openssl"
+    "$sig_ssl" genpkey -algorithm ed25519 -out "$sig_dir/key.pem" 2>/dev/null
+    "$sig_ssl" genpkey -algorithm ed25519 -out "$sig_dir/other.pem" 2>/dev/null
+    sig_key="$("$sig_ssl" pkey -in "$sig_dir/key.pem" -pubout -outform DER | tail -c 32 | base64)"
+    sum="$("$sig_ssl" dgst -sha256 "$sig_dir/urnetwork-provider-v1-linux-amd64.tar.gz" | awk '{ print $NF }')"
+    # $1 key, $2 sums content
+    sign_sums ()
+    {
+        printf '%s\n' "$2" > "$sig_dir/SHA256SUMS"
+        "$sig_ssl" pkeyutl -sign -inkey "$1" -rawin -in "$sig_dir/SHA256SUMS" | base64 > "$sig_dir/SHA256SUMS.sig"
+    }
+    other_line="2222222222222222222222222222222222222222222222222222222222222222  urnetwork-provider-v1-linux-arm64.tar.gz"
+    sign_sums "$sig_dir/key.pem" "$other_line
+$sum  urnetwork-provider-v1-linux-amd64.tar.gz"
+    [ "$(sig_case "$sig_dir/SHA256SUMS" "$sig_dir/SHA256SUMS.sig")" = 0 ] || fail "a good signature was refused: $(cat "$sig_dir/out")"
+    # one changed byte in SHA256SUMS after signing
+    sed 's/^2/3/' "$sig_dir/SHA256SUMS" > "$sig_dir/SHA256SUMS.t" && mv "$sig_dir/SHA256SUMS.t" "$sig_dir/SHA256SUMS"
+    [ "$(sig_case "$sig_dir/SHA256SUMS" "$sig_dir/SHA256SUMS.sig")" = 1 ] || fail "a changed SHA256SUMS was accepted"
+    grep -q "signature does not match" "$sig_dir/out" || fail "changed SHA256SUMS reason: $(cat "$sig_dir/out")"
+    sign_sums "$sig_dir/other.pem" "$sum  urnetwork-provider-v1-linux-amd64.tar.gz"
+    [ "$(sig_case "$sig_dir/SHA256SUMS" "$sig_dir/SHA256SUMS.sig")" = 1 ] || fail "another key's signature was accepted"
+    sign_sums "$sig_dir/key.pem" "1111111111111111111111111111111111111111111111111111111111111111  urnetwork-provider-v1-linux-amd64.tar.gz"
+    [ "$(sig_case "$sig_dir/SHA256SUMS" "$sig_dir/SHA256SUMS.sig")" = 1 ] || fail "a tarball with the wrong sha256 was accepted"
+    grep -q "signed SHA256SUMS says 1111" "$sig_dir/out" || fail "wrong sha256 reason: $(cat "$sig_dir/out")"
+    sign_sums "$sig_dir/key.pem" "$other_line"
+    [ "$(sig_case "$sig_dir/SHA256SUMS" "$sig_dir/SHA256SUMS.sig")" = 1 ] || fail "a SHA256SUMS without the tarball was accepted"
+    grep -q "has no sha256 for urnetwork-provider-v1-linux-amd64.tar.gz" "$sig_dir/out" || fail "missing line reason: $(cat "$sig_dir/out")"
+fi
+
 echo "Provider_Install_Linux: OK"

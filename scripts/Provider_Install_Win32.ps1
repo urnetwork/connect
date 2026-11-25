@@ -199,6 +199,92 @@ function Test-FileSha256 {
     return ($Actual -eq $Expected)
 }
 
+# The release signs SHA256SUMS ("<sha256>  <name>" lines) with this Ed25519
+# key; SHA256SUMS.sig holds the base64 signature. Staged: until every release
+# carries it, a missing signature or verifier only warns.
+# URNETWORK_TEST_RELEASE_SIG_KEY exists for the tests, which sign with a key
+# they generate.
+$ReleaseSigRequired = $false
+function Get-ReleaseSigKey {
+    if ($env:URNETWORK_TEST_RELEASE_SIG_KEY) {
+        return $env:URNETWORK_TEST_RELEASE_SIG_KEY
+    }
+    return "Qm4V/UTZcuIRMFJuAzDhxf2CK6ycwxF0HFOcFhXBIYQ="
+}
+
+# Get-SumsSha256 returns the lowercase hex SHA-256 the SHA256SUMS text lists
+# for Name, or "" when it lists none.
+function Get-SumsSha256 {
+    param(
+        [String]$SumsText,
+        [String]$Name
+    )
+    foreach ($Line in ($SumsText -split "`n")) {
+        if ($Line.TrimEnd("`r") -match "^([0-9a-fA-F]{64}) [ *](.+)$" -and $Matches[2] -ceq $Name) {
+            return $Matches[1].ToLower()
+        }
+    }
+    return ""
+}
+
+# Get-SigOpenSsl returns an openssl.exe that verifies raw Ed25519 (OpenSSL 3;
+# Git for Windows ships one), or $null. Neither Windows PowerShell's .NET
+# Framework nor .NET 8+ has Ed25519 built in, and the installer adds no
+# dependencies, so without one the signature can't be checked.
+function Get-SigOpenSsl {
+    # openssl prints its help on stderr, which Windows PowerShell 5.1 turns
+    # into an error under "Stop"
+    $ErrorActionPreference = "Continue"
+    foreach ($Command in @(Get-Command openssl -All -CommandType Application -ErrorAction SilentlyContinue)) {
+        try {
+            $Version = & $Command.Source version 2>$null
+            $Help = (& $Command.Source pkeyutl -help 2>&1 | Out-String)
+            if ("$Version" -match "^OpenSSL [3-9]" -and $Help -match "-rawin") {
+                return $Command.Source
+            }
+        }
+        catch {
+        }
+    }
+    return $null
+}
+
+# Test-ReleaseSignature checks the base64 Ed25519 signature in SigPath over
+# the exact bytes of SumsPath. It returns $true when it verifies, $false when
+# it fails, and $null when there is no verifier here.
+function Test-ReleaseSignature {
+    param(
+        [String]$SumsPath,
+        [String]$SigPath,
+        [String]$KeyBase64 = (Get-ReleaseSigKey),
+        [String]$OpenSsl = (Get-SigOpenSsl)
+    )
+    if (-not $OpenSsl) {
+        return $null
+    }
+    $Dir = Join-Path ([IO.Path]::GetTempPath()) -ChildPath "urnetwork-sig-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $null = New-Item -Path $Dir -ItemType Directory -Force
+    try {
+        # SPKI DER: the Ed25519 prefix 302a300506032b6570032100 + the raw key
+        [Byte[]]$Prefix = 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00
+        $Key = [Convert]::FromBase64String($KeyBase64)
+        $Sig = [Convert]::FromBase64String(((Get-Content -LiteralPath $SigPath -Raw) -replace "\s", ""))
+        $KeyPath = Join-Path $Dir "key.der"
+        $SigBinPath = Join-Path $Dir "sig.bin"
+        [IO.File]::WriteAllBytes($KeyPath, [Byte[]]($Prefix + $Key))
+        [IO.File]::WriteAllBytes($SigBinPath, $Sig)
+        $ErrorActionPreference = "Continue"
+        $null =& $OpenSsl pkeyutl -verify -pubin -keyform DER -inkey $KeyPath -rawin -in $SumsPath -sigfile $SigBinPath 2>&1
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Save-Download {
     param(
         [String]$URL,
@@ -518,12 +604,71 @@ function Invoke-Install {
             Save-Download -URL $Asset.browser_download_url -Destination $ArchivePath
         }
 
+        # The release's SHA256SUMS: its line for the archive must match, and
+        # its signature must verify when it can be checked here.
+        $SumsChecked = $false
+        $SumsAsset = @($ReleaseInfo.assets | Where-Object { $_.name -ceq "SHA256SUMS" }) | Select-Object -First 1
+        $SigAsset = @($ReleaseInfo.assets | Where-Object { $_.name -ceq "SHA256SUMS.sig" }) | Select-Object -First 1
+        $SigWhy = ""
+        if ($SumsAsset) {
+            $SumsPath = Join-Path $WorkDir -ChildPath "SHA256SUMS"
+            Remove-Item -LiteralPath $SumsPath -Force -ErrorAction SilentlyContinue
+            Save-Download -URL $SumsAsset.browser_download_url -Destination $SumsPath
+            $SigOk = $null
+            if ($SigAsset) {
+                $SigPath = Join-Path $WorkDir -ChildPath "SHA256SUMS.sig"
+                Remove-Item -LiteralPath $SigPath -Force -ErrorAction SilentlyContinue
+                Save-Download -URL $SigAsset.browser_download_url -Destination $SigPath
+                $SigOk = Test-ReleaseSignature -SumsPath $SumsPath -SigPath $SigPath
+                if ($SigOk -eq $false) {
+                    throw "The release signature doesn't match SHA256SUMS; the release may have been changed. Nothing was installed."
+                }
+                if ($null -eq $SigOk) {
+                    $SigWhy = "there is no OpenSSL 3 here to check the release signature (.NET has no built-in Ed25519)"
+                }
+            }
+            else {
+                $SigWhy = "the release has no SHA256SUMS.sig"
+            }
+            $SumsSha256 = Get-SumsSha256 -SumsText ([IO.File]::ReadAllText($SumsPath)) -Name $Asset.name
+            if ($SumsSha256) {
+                if (-not (Test-FileSha256 $ArchivePath $SumsSha256)) {
+                    Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
+                    throw "The download of $($Asset.name) is damaged or was changed: its SHA-256 doesn't match the release's SHA256SUMS. Nothing was installed."
+                }
+                $SumsChecked = $true
+                if ($SigOk) {
+                    Write-Host "Checked the signed SHA256SUMS for $($Asset.name)"
+                }
+                else {
+                    Write-Host "Checked $($Asset.name) against the release's SHA256SUMS"
+                }
+            }
+            elseif ($SigOk) {
+                throw "The signed SHA256SUMS has no SHA-256 for $($Asset.name). Nothing was installed."
+            }
+            else {
+                Write-Host "Warning: the release's SHA256SUMS has no SHA-256 for $($Asset.name)"
+            }
+        }
+        else {
+            $SigWhy = "the release has no signed SHA256SUMS"
+        }
+        if ($SigWhy) {
+            if ($ReleaseSigRequired) {
+                throw "$SigWhy, and a signature is required. Nothing was installed."
+            }
+            Write-Host "Warning: $SigWhy; continuing with the release checksum only"
+        }
+
         if ($ExpectedSha256) {
             if (-not (Test-FileSha256 $ArchivePath $ExpectedSha256)) {
                 Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
                 throw "The download of $($Asset.name) is damaged: its SHA-256 doesn't match the release. Nothing was installed. Run the installer again."
             }
             Write-Host "Checked the SHA-256 of $($Asset.name)"
+        }
+        elseif ($SumsChecked) {
         }
         elseif ($env:URNETWORK_REQUIRE_CHECKSUM -eq "1") {
             # Set by the background updater: unattended, nothing is installed unchecked.
