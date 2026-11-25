@@ -39,6 +39,16 @@ package connect
 // exchange, so each drives its race's ordering every run; their bounds are real
 // time, each a broken run's, and the timers a broken run waits for are set past
 // them. The session tests drive the same decisions directly.
+//
+// A responder holding on its prior epoch until the peer sealed under the new
+// one left a deadlock behind it: a restarted client whose first seal the
+// listener dropped, racing the listener's own establishment, waited to see the
+// listener seal under the new epoch before it resealed, and the listener waited
+// to see that seal, so the open waited for the client's own timer. A responder
+// that owes a reseal, from a peer that cannot open what it seals, now seals
+// under the new epoch at once, and each epoch's second seal generation lets the
+// reseal write again what went out under it before the peer held it
+// (`sequenceCipher.writeGeneration`).
 
 import (
 	"context"
@@ -48,6 +58,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // Hooks on the listener's identity exchange with one peer, armed once the pair
@@ -256,6 +270,118 @@ func TestListenerResealsAtOnceWhatTheRestartedClientCouldNotOpen(t *testing.T) {
 		t.Fatal("the restarted edge's send did not return")
 	}
 	t.Logf("the write sealed under the old session reached the restarted edge %s after the new session's completion was released", time.Since(releaseTime))
+}
+
+// Whether a wire message is a TransferFrame wrapped under a session's cipher.
+func restartRaceWrapped(message []byte) bool {
+	var frame protocol.TransferFrame
+	return proto.Unmarshal(message, &frame) == nil && 0 < len(frame.EncryptedTransferFrame)
+}
+
+// The restarted edge nacks the listener's write sealed under the old session,
+// so the listener owes it a reseal, and from there every wrap the edge writes
+// toward the listener is lost, as the edge's first open was when it reached the
+// listener as the listener's own establishment raced it: the listener never
+// sees the edge seal under the new session. Once both have established the new
+// session, the listener's next write reaches the edge sealed under it, and the
+// edge opens it within ReachTimeout: a responder owing a reseal seals under the
+// new epoch at once. Before, it sealed under the old epoch, which the edge
+// cannot open, until it saw the edge seal under the new one, which it never
+// did, so the edge never read the listener again within the bound, and the
+// listener never wrote the old write again; in the restart this left the
+// edge's open to its own resend timer. Both sides' timers are set past the
+// bound.
+func TestListenerOwingAResealReachesTheRestartedClientUnderTheNewSessionAtOnce(t *testing.T) {
+	settings := defaultRestartFirstStreamTestSettings()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*settings.StepTimeout)
+	defer cancel()
+
+	hooks := &restartRaceHooks{}
+	completionHeld := make(chan struct{}, 1)
+	nackHandled := make(chan struct{}, 1)
+	listenerEstablished := make(chan struct{}, 1)
+	var listenerId atomic.Pointer[Id]
+	var edgeWatching atomic.Bool
+	edgeEstablished := make(chan struct{}, 1)
+	edgeOpened := make(chan struct{}, 1)
+	release := make(chan struct{})
+	coldTimers := func(s *ClientSettings) {
+		s.SendBufferSettings.MinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.RttMinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.MaxResendInterval = settings.ColdResendInterval
+	}
+	// the restarted edge's session with the listener
+	edgeMatches := func(peerId Id, role sequenceTlsRole) bool {
+		watched := listenerId.Load()
+		return edgeWatching.Load() && role == sequenceTlsRoleClient && watched != nil && *watched == peerId
+	}
+	pair := newRestartFirstStreamPair(t, ctx, settings, func(s *ClientSettings) {
+		coldTimers(s)
+		s.EncryptionSettings.beforeHandshakeCompletionForTest = func(peerId Id, role sequenceTlsRole) {
+			if !hooks.matches(peerId, role) {
+				return
+			}
+			restartRaceSignal(completionHeld)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		s.EncryptionSettings.unknownWrapNackHandledForTest = func(peerId Id, role sequenceTlsRole, nackEpochId Id) {
+			if hooks.matches(peerId, role) {
+				restartRaceSignal(nackHandled)
+			}
+		}
+		s.EncryptionSettings.afterEpochEstablishedForTest = func(peerId Id, role sequenceTlsRole) {
+			if hooks.matches(peerId, role) {
+				restartRaceSignal(listenerEstablished)
+			}
+		}
+	}, func(s *ClientSettings) {
+		coldTimers(s)
+		s.EncryptionSettings.afterEpochEstablishedForTest = func(peerId Id, role sequenceTlsRole) {
+			if edgeMatches(peerId, role) {
+				restartRaceSignal(edgeEstablished)
+			}
+		}
+		s.EncryptionSettings.peerSealedEstablishedForTest = func(peerId Id, role sequenceTlsRole) {
+			if edgeMatches(peerId, role) {
+				restartRaceSignal(edgeOpened)
+			}
+		}
+	})
+	defer pair.close()
+	listenerId.Store(&pair.listenerId)
+	var releaseOnce sync.Once
+	releaseCompletion := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	defer releaseCompletion()
+
+	kept, key := pair.runToRestart()
+	hooks.arm(pair.edgeId)
+	edgeWatching.Store(true)
+	// the edge's seals never reach the listener; its handshake and nacks,
+	// written in plaintext, do
+	pair.setDropTowardListener(restartRaceWrapped)
+	pair.startEdge(kept)
+	restarted := pair.currentEdge()
+	go func() {
+		restarted.SendWithTimeout(requiredGateFrame(t, "open after the restart"), pair.listenerId, func(error) {}, settings.StepTimeout)
+	}()
+
+	restartRaceAwait(t, completionHeld, settings.StepTimeout, "the listener's completion of the restarted edge's handshake")
+	// sealed under the old session, the only one the listener has established
+	pair.listenerSends("held", key)
+	restartRaceAwait(t, nackHandled, settings.StepTimeout, "the restarted edge's nack of the write it could not open")
+	releaseCompletion()
+	restartRaceAwait(t, listenerEstablished, settings.StepTimeout, "the listener's establishment of the new session")
+	restartRaceAwait(t, edgeEstablished, settings.StepTimeout, "the restarted edge's establishment of the new session")
+
+	writeTime := time.Now()
+	pair.listenerSends("after the new session", key)
+	restartRaceAwait(t, edgeOpened, settings.ReachTimeout, "the restarted edge's opening of the listener's seal under the new session")
+	t.Logf("the restarted edge opened the listener's write under the new session %s after it was written", time.Since(writeTime))
 }
 
 // A responder's session with a peer, on a real client, whose newest epoch has

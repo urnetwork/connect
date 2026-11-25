@@ -518,6 +518,9 @@ type restartFirstStreamPair struct {
 	// while set, the listener's writes toward the edge are lost, as they are
 	// to a process that has exited
 	edgeDown bool
+	// while set, the edge's writes toward the listener that it answers true for
+	// are lost; it borrows each wire message
+	dropTowardListener func([]byte) bool
 
 	edgeSend    chan []byte
 	edgeReceive chan []byte
@@ -560,7 +563,25 @@ func newRestartFirstStreamPair(
 		edgeGot:     make(chan restartFirstStreamMessage, 64),
 	}
 	listenerSend := make(chan []byte)
-	_, listenerReceive := newConditioner(ctx, pair.edgeSend)
+	_, towardListener := newConditioner(ctx, pair.edgeSend)
+	listenerReceive := make(chan []byte)
+	// the tap owns each frame it takes until it forwards or returns it
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case message := <-towardListener:
+				if drop := pair.dropTowardListenerFunc(); drop != nil && drop(message) {
+					MessagePoolReturn(message)
+					continue
+				}
+				if !forwardOwnedTestWire(ctx, listenerReceive, message) {
+					return
+				}
+			}
+		}
+	}()
 	_, towardEdge := newConditioner(ctx, listenerSend)
 	// the tap owns each frame it takes until it forwards or returns it
 	go func() {
@@ -683,6 +704,20 @@ func (self *restartFirstStreamPair) isEdgeDown() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.edgeDown
+}
+
+func (self *restartFirstStreamPair) dropTowardListenerFunc() func([]byte) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.dropTowardListener
+}
+
+// Loses, from here, every write of the edge's toward the listener that drop
+// answers true for; nil loses none.
+func (self *restartFirstStreamPair) setDropTowardListener(drop func([]byte) bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.dropTowardListener = drop
 }
 
 // Stops the edge as a killed process stops, joins it, and answers the identity

@@ -985,6 +985,10 @@ type EncryptionSettings struct {
 	// (`peerEncryptionSession.requestLostPeerRewrite`), called outside the
 	// session lock.
 	lostPeerRewriteRequestedForTest func(peerId Id, role sequenceTlsRole)
+	// Nil test observer of a session's first sight of the peer sealing under
+	// its established epoch (`observePeerSealed`), called outside the session
+	// lock.
+	peerSealedEstablishedForTest func(peerId Id, role sequenceTlsRole)
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -5703,6 +5707,7 @@ func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 	if self.peerSealsEstablished.Load() && !self.resealOwed.Load() {
 		return
 	}
+	firstSeal := false
 	generation := func() uint8 {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -5713,7 +5718,7 @@ func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 			// sealed under an epoch the peer has said it does not hold
 			return 0
 		}
-		self.peerSealsEstablished.Store(true)
+		firstSeal = !self.peerSealsEstablished.Swap(true)
 		if self.establishedEpoch.awaitingPeerSeal {
 			// a responder seals under the established epoch from here
 			// (sealingEpochWithLock)
@@ -5725,6 +5730,9 @@ func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 		}
 		return self.takeResealWithLock()
 	}()
+	if firstSeal && self.settings != nil && self.settings.peerSealedEstablishedForTest != nil {
+		self.settings.peerSealedEstablishedForTest(self.peerId, self.role)
+	}
 	if generation != 0 {
 		self.requestReseal(generation)
 	}
