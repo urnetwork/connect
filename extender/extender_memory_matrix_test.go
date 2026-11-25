@@ -103,7 +103,8 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				if outer == connect.ExtenderCarrierTcp {
 					want += settings.H1BudgetByteCount
 				} else {
-					want += (512 + 512 + 256 + 128) * 1024
+					// Outer receive window, QUIC control, retained send, and raw socket buffers.
+					want += (256 + 512 + 256 + 32 + 16) * 1024
 					if outer == connect.ExtenderCarrierDns {
 						want += 144 * 1024
 					}

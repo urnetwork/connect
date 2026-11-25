@@ -157,7 +157,8 @@ func runReceiptBurstBenchmarkOwner(cancelQueued bool) (result receiptBurstBenchm
 	settings := DefaultClientSettings()
 	settings.Log = NewNoopLogger()
 	settings.EncryptionSettings.Mode = EncryptionModeOff
-	settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+	// The receipt gateway carries only this peer's evidence. Keep the fixture key local.
+	settings.SkipClientKeyPublication = true
 	receive := DefaultReceiveBufferSettingsWithBufferSize(receiptBurstBenchmarkCount)
 	receive.ProgressObserver = nil
 	receive.IdleTimeout, receive.GapTimeout, receive.MaxPeerAuditDuration = time.Hour, time.Hour, time.Hour

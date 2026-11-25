@@ -298,8 +298,8 @@ func TestAuthCancellationIsNotBackendFailure(t *testing.T) {
 		method string
 		guards []string
 	}{
-		{method: "runH1", guards: []string{"ctx.Err() == nil", "refusal == 0"}},
-		{method: "runH3", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
+		{method: "runH1", guards: []string{"ctx.Err() == nil", "refusal == 0", "!kickedDuringDial", "!heldDuringDial"}},
+		{method: "runH3", guards: []string{"ctx.Err() == nil", "refusal == 0", "!kickedDuringDial", "!heldDuringDial", "!attemptCanceled"}},
 	} {
 		if err := authFailureSourceGuards(source, test.method, test.guards); err != nil {
 			t.Errorf("%s: %v", test.method, err)
@@ -463,7 +463,7 @@ func TestAuthFailureSourceGuardAcceptsMandatoryConjuncts(t *testing.T) {
 		guards             []string
 	}{
 		{name: "old bare guard", method: "runH1", body: "if self.ctx.Err() == nil { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil"}},
-		{name: "current h1 guard", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
+		{name: "current h1 guard", method: "runH1", body: "if ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial { self.noteDialFailure() }", guards: []string{"ctx.Err() == nil", "refusal == 0", "!kickedDuringDial", "!heldDuringDial"}},
 		{name: "reordered and parenthesized", method: "runH1", body: "if ((refusal == 0) && ((self.ctx.Err()) == (nil))) { self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
 		{name: "nested h3 attempt", method: "runH3", body: "if ctx.Err() == nil && refusal == 0 { if !attemptCanceled { self.noteDialFailure() } }", guards: []string{"ctx.Err() == nil", "refusal == 0", "!attemptCanceled"}},
 		{name: "both guarded calls", method: "runH1", body: "if self.ctx.Err() == nil && refusal == 0 { self.noteDialFailure(); self.noteDialFailure() }", guards: []string{"self.ctx.Err() == nil", "refusal == 0"}},
@@ -496,6 +496,17 @@ func TestAuthFailureSourceGuardRejectsUnsafeMutants(t *testing.T) {
 		source := "package connect\nfunc (self *PlatformTransport) runH1() { " + test.body + " }\n"
 		if err := authFailureSourceGuards(source, "runH1", []string{"self.ctx.Err() == nil", "refusal == 0"}); err == nil {
 			t.Fatalf("%s admitted unsafe auth accounting", test.name)
+		}
+	}
+	for _, condition := range []string{
+		"self.ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial",
+		"dialCtx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial",
+		"ctx.Err() == nil && refusal == 0 && !heldDuringDial",
+		"ctx.Err() == nil && refusal == 0 && !kickedDuringDial",
+	} {
+		source := "package connect\nfunc (self *PlatformTransport) runH1() { if " + condition + " { self.noteDialFailure() } }\n"
+		if err := authFailureSourceGuards(source, "runH1", []string{"ctx.Err() == nil", "refusal == 0", "!kickedDuringDial", "!heldDuringDial"}); err == nil {
+			t.Fatalf("h1 accounting admitted an unsafe runner guard %q", condition)
 		}
 	}
 	for _, body := range []string{

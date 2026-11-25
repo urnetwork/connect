@@ -246,6 +246,9 @@ func (self *sequenceAckWindow) Restore(acks []sequenceAck) {
 			}
 			ack = newer
 		}
+		if self.hasHeadAck && ack.connectedRaceReset != 0 && !ack.selective && !ack.contractMissing {
+			self.headAck.inheritConnectedRaceReset(ack)
+		}
 		if ack.contractMissing {
 			self.updateContractMissingWithLock(ack)
 		} else {
@@ -304,6 +307,9 @@ func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCoun
 			// single plaintext pack anywhere under the head keeps the
 			// ack plaintext. Selective acks at or below the new head are
 			// already dropped by the Snapshot pass.
+			if self.hasHeadAck && self.headAck.connectedRaceReset != 0 {
+				ack.inheritConnectedRaceReset(self.headAck)
+			}
 			if self.hasHeadAck && self.headAck.unwrapped {
 				ack.unwrapped = true
 			}
@@ -420,6 +426,7 @@ func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
 	if reset {
 		// keep the head ack in place. clear() reuses the live map's storage
 		// instead of allocating a fresh map; the caller holds only a copy.
+		self.headAck.connectedRaceReset = 0
 		self.ackUpdateCount = 0
 		self.cumulativeProgressPending = false
 		self.headDeliveredByteCount = 0
@@ -467,6 +474,7 @@ func (self *sequenceAckWindow) takeResponseKeepingBurstCredit(scratch []sequence
 	acks := scratch[:0]
 	if self.ackUpdateCount != 0 {
 		acks = append(acks, self.headAck)
+		self.headAck.connectedRaceReset = 0
 		self.ackUpdateCount = 0
 		self.cumulativeProgressPending = false
 		if !keepBurstCredit {
@@ -547,6 +555,7 @@ func (self *sequenceAckWindow) takeQuietHead(now time.Time, quiet time.Duration)
 		return sequenceAck{}, false, deadline
 	}
 	ack := self.headAck
+	self.headAck.connectedRaceReset = 0
 	self.ackUpdateCount = 0
 	self.cumulativeProgressPending = false
 	self.headDeliveredByteCount = 0

@@ -25,12 +25,14 @@ type tcpSynRetryRequest struct {
 	// Nonzero only for a continuation of this exact unanswered wide race.
 	raceOrder uint64
 	// The flow lock guards tentative first-offer custody shared by race clones.
-	openingSerial    uint64
-	openingSelection *multiClientAffinitySelection
-	openingEpoch     uint64
-	openingWidth     int
-	openingOwner     *tcpSynRetry
-	openingOverflow  bool
+	openingSerial          uint64
+	openingSelection       *multiClientAffinitySelection
+	openingEpoch           uint64
+	openingWidth           int
+	openingOwner           *tcpSynRetry
+	openingOverflow        bool
+	openingRaceWinner      *multiClientAffinitySelection
+	openingRaceWinnerEpoch uint64
 }
 
 // The flow lock guards cache/queue references. Packet and credit remain live
