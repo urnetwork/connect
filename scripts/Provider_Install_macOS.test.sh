@@ -30,7 +30,7 @@ setup ()
     export MOCK_UID=501
     export SHELL=/bin/zsh
     unset URNETWORK_PROVIDER_INSTALL URNETWORK_TOOLS_MODE
-    export URNETWORK_API_BASE="https://api.test/repos/urnetwork/build"
+    export URNETWORK_API_BASE="https://api.test/repos/urfoundation/sn"
     export URNETWORK_TOOLS_URL="https://raw.test/Provider_Install_macOS.sh"
 
     cat > "$run_dir/bin/uname" <<'EOF'
