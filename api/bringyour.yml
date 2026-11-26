@@ -2376,6 +2376,195 @@ paths:
         "503":
           description: No stored bundle verifies
 
+  /compute/models/{sha256}/index:
+    get:
+      tags: [Other]
+      summary: A local model file's chunk index
+      description: |
+        The chunk index of a local model file the api mirrors (DESIGN-COMPUTE
+        §14.3, §6.5, CO-49), byte for byte as the release tooling computed it
+        from the mirrored file: the RFC 8785 canonical JSON of the file's
+        `byte_count`, its `chunk_byte_count` (16 MiB, the last chunk shorter),
+        each chunk's lowercase hex SHA-256 in order (`chunks`), the file's
+        `sha256` and the format's `version`, 1. A device checks the bytes
+        against the index pin its signed manifest carries before it parses
+        them, and each chunk against the index, so neither the api nor a cache
+        between is trusted for a byte.
+
+        No auth, and no credential is read: a bearer or a cookie sent here is
+        ignored and never decoded, so the api learns a file and an address and
+        never a member. Each request counts against its caller address's
+        limit, 60 a minute for the address's /29 (IPv6: /56), apart from the
+        chunk route's, and a request past it answers `429`.
+
+        A file answers only once the mirror serves it, after every chunk was
+        checked against the index and the index against the manifest's pin; a
+        file the mirror is still copying or indexing answers `404` as one it
+        does not have. The answer is immutable and cacheable:
+        `Cache-Control: public, max-age=31536000, immutable`, and a strong
+        `ETag`, the quoted hex SHA-256 of the body, which `If-None-Match`
+        answers `304`. A refusal is plain text with `Cache-Control: no-store`.
+      operationId: computeModelIndex
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeModelSha256"
+      responses:
+        "200":
+          description: The index's bytes, as the mirror stores them
+          headers:
+            ETag:
+              description: The quoted lowercase hex SHA-256 of the body.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeModelIndex"
+        "304":
+          description: The index named by `If-None-Match`, which never changes
+        "400":
+          description: The SHA-256 is not 64 lowercase hex digits, or the request has a query. Plain text body.
+        "404":
+          description: The mirror serves no such file. Plain text body.
+        "429":
+          description: The caller address's limit for this window is spent. Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until the window ends.
+              schema:
+                type: integer
+        "500":
+          description: The mirror's objects for the file disagree; the file is not served. Plain text body.
+        "503":
+          description: The mirror or the count is unavailable; retry. Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a retry.
+              schema:
+                type: integer
+    head:
+      tags: [Other]
+      summary: A local model file's chunk index, its headers alone
+      description: |
+        `GET /compute/models/{sha256}/index`'s status and headers, with no
+        body. Counted against the caller address's limit as a `GET` is.
+      operationId: computeModelIndexHead
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeModelSha256"
+      responses:
+        "200":
+          description: The index's headers, `Content-Length` its size
+        "304":
+          description: The index named by `If-None-Match`
+        "400":
+          description: The SHA-256 is not 64 lowercase hex digits, or the request has a query.
+        "404":
+          description: The mirror serves no such file.
+        "429":
+          description: The caller address's limit for this window is spent.
+        "500":
+          description: The mirror's objects for the file disagree.
+        "503":
+          description: The mirror or the count is unavailable; retry.
+
+  /compute/models/{sha256}/chunks/{n}:
+    get:
+      tags: [Other]
+      summary: A chunk of a local model file
+      description: |
+        Chunk `n` of a local model file the api mirrors (DESIGN-COMPUTE
+        §14.3, §6.5, CO-49): the file's bytes from `n` times its index's
+        `chunk_byte_count` to the next chunk or the file's end, whole; a
+        `Range` header is ignored. A device fetches a file's chunks up to four
+        at a time, checks each against the index before it writes it at its
+        offset, and after a dropped connection, a crash or a reload resumes at
+        the first chunk it had not finished.
+
+        No auth, and no credential is read, as for the index. Each request
+        counts against its caller address's limit, 600 a minute for the
+        address's /29 (IPv6: /56), apart from the index route's.
+
+        A chunk answers only from a file the mirror serves; a chunk past the
+        file's last answers `404`. The answer is immutable and cacheable:
+        `Cache-Control: public, max-age=31536000, immutable`, and a strong
+        `ETag`, the quoted hex SHA-256 of the chunk as the index lists it,
+        which `If-None-Match` answers `304`. A refusal is plain text with
+        `Cache-Control: no-store`.
+      operationId: computeModelChunk
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeModelSha256"
+        - $ref: "#/components/parameters/ComputeModelChunk"
+      responses:
+        "200":
+          description: The chunk's bytes
+          headers:
+            ETag:
+              description: The quoted lowercase hex SHA-256 of the body, as the index lists it.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The chunk named by `If-None-Match`, which never changes
+        "400":
+          description: The SHA-256 is not 64 lowercase hex digits, the chunk number is not a decimal from 0 without leading zeros, or the request has a query. Plain text body.
+        "404":
+          description: The mirror serves no such file, or the file has no such chunk. Plain text body.
+        "429":
+          description: The caller address's limit for this window is spent. Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until the window ends.
+              schema:
+                type: integer
+        "500":
+          description: The mirror's objects for the file disagree; the chunk is not served. Plain text body.
+        "503":
+          description: The mirror or the count is unavailable; retry. Plain text body.
+          headers:
+            Retry-After:
+              description: Seconds until a retry.
+              schema:
+                type: integer
+    head:
+      tags: [Other]
+      summary: A chunk of a local model file, its headers alone
+      description: |
+        `GET /compute/models/{sha256}/chunks/{n}`'s status and headers, from
+        the served index, with no body. Counted against the caller address's
+        limit as a `GET` is.
+      operationId: computeModelChunkHead
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeModelSha256"
+        - $ref: "#/components/parameters/ComputeModelChunk"
+      responses:
+        "200":
+          description: The chunk's headers, `Content-Length` its size
+        "304":
+          description: The chunk named by `If-None-Match`
+        "400":
+          description: The SHA-256 or the chunk number is malformed, or the request has a query.
+        "404":
+          description: The mirror serves no such file, or the file has no such chunk.
+        "429":
+          description: The caller address's limit for this window is spent.
+        "500":
+          description: The mirror's objects for the file disagree.
+        "503":
+          description: The mirror or the count is unavailable; retry.
+
   /network/extender-lag-report:
     post:
       tags: [Network]
@@ -18154,6 +18343,22 @@ components:
         by another key is refused (see `SidecarProofRefused`).
       schema:
         type: string
+    ComputeModelSha256:
+      in: path
+      name: sha256
+      schema:
+        type: string
+        pattern: "^[0-9a-f]{64}$"
+      required: true
+      description: A local model file's SHA-256, 64 lowercase hex digits, as the signed manifest pins it.
+    ComputeModelChunk:
+      in: path
+      name: "n"
+      schema:
+        type: integer
+        minimum: 0
+      required: true
+      description: The chunk's number, decimal from 0 with no leading zeros.
   responses:
     SessionOperationResult:
       description: Authoritative outcome, including asynchronous cleanup progress.
@@ -27845,6 +28050,44 @@ components:
           properties:
             message:
               type: string
+
+    ComputeModelIndex:
+      description: |
+        A local model file's chunk index (compute-plan-model-index-format):
+        RFC 8785 canonical JSON, so its bytes, which the signed manifest pins
+        by their SHA-256, are the same wherever they are computed. Chunk `n`
+        covers the file's bytes from `n` times `chunk_byte_count` to the
+        lesser of the next such offset and `byte_count`.
+      type: object
+      additionalProperties: false
+      required:
+        - byte_count
+        - chunk_byte_count
+        - chunks
+        - sha256
+        - version
+      properties:
+        byte_count:
+          description: The file's size in bytes.
+          type: integer
+          minimum: 0
+        chunk_byte_count:
+          description: The size of every chunk but the last, 16 MiB.
+          type: integer
+          minimum: 1
+        chunks:
+          description: Each chunk's SHA-256 in lowercase hex, in order.
+          type: array
+          items:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+        sha256:
+          description: The whole file's SHA-256 in lowercase hex.
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        version:
+          description: The format's version, 1.
+          type: integer
 
     GetClientKeyResult:
       type: object
