@@ -2565,6 +2565,1197 @@ paths:
         "503":
           description: The mirror or the count is unavailable; retry.
 
+  /compute/balance:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The network's compute balance
+      description: |
+        The network's compute balance (DESIGN-COMPUTE §9.7, §9.9, §14.3):
+        what is available, what is held, the balance the states read, the
+        state, both auto-renew modes, whether the caller may buy and whether
+        credits are on sale, so the apps offer credit only to one who may
+        (§9.10). Ids and typed numbers alone; money in nano-USD.
+
+        Takes a sidecar's client JWT, for the sidecar its client is bound to
+        (§5.15), its rights read from the network's verified config state, or
+        the network's own credential. Answers `503` while the network's state
+        is not loaded. The handler is BAL-M12-15's; until it lands the route
+        answers `501` `not_built`.
+      operationId: computeBalance
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The balance, as the sidecar's compute client reads it (`ComputeBalance`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: |
+            `credential_refused`: neither a sidecar's token nor the network's
+            credential, a client JWT bound to no admitted sidecar, or an
+            agent's scoped credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/checkout:
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Buy compute credits through Stripe Checkout
+      description: |
+        A Stripe Checkout session for a pack, or the monthly plan alone, with
+        the auto-renew mode the paying person turns on in that act (§9.5,
+        §9.8, §9.11): its card is captured only once it passes the payer's
+        limits, and saved for off-session use only where its payer turns on a
+        mode here.
+
+        Takes a caller who may buy (§9.10): an Owner, a Billing admin or a
+        member the policy grants `compute:buy`, from an untagged member
+        device's sidecar or the network's own credential; never an agent, a
+        tagged sidecar or an enclave. The body is a JSON object of at most
+        64 KiB, and the route takes no query. The handler is BAL-M12-08's.
+      operationId: computeCheckout
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The pack and mode (`ComputeCheckoutArgs`, sidecar/compute_client_api.go).
+              type: object
+      responses:
+        "200":
+          description: The session's url, which the person opens in their browser, and its expiry; logged nowhere.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`may_not_buy` or `credential_refused`: the caller may not buy (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "409":
+          $ref: "#/components/responses/ComputeApiConflict"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/auto-renew:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The network's auto-renew settings
+      description: |
+        §9.8's two modes, threshold and monthly, as they stand. Takes a caller
+        who may buy, as `POST /compute/checkout` does. The handler is
+        BAL-M12-11's; until it lands the route answers `501` `not_built`.
+      operationId: computeAutoRenew
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Both modes (`ComputeAutoRenew`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`may_not_buy` or `credential_refused`: the caller may not buy (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Change one auto-renew mode
+      description: |
+        One change of one of §9.8's modes; a mode turned on names a card the
+        person turning it on saved for it (§9.5). Takes a caller who may buy,
+        and a JSON object of at most 64 KiB with no query. The handler is
+        BAL-M12-11's; until it lands the route answers `501` `not_built`.
+      operationId: computeSetAutoRenew
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The change (`ComputeAutoRenewChange`, sidecar/compute_client_api.go).
+              type: object
+      responses:
+        "200":
+          description: Both modes after the change (`ComputeAutoRenew`).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`may_not_buy` or `credential_refused`: the caller may not buy (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "409":
+          $ref: "#/components/responses/ComputeApiConflict"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/charges:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The network's per-request compute charges
+      description: |
+        Per-request charges, a page at a time, as ids and numbers (§9.4,
+        §9.10): every charge to an Owner, Billing admin, Admin, Network
+        admin, IT admin or Auditor, and a Member only the charges whose
+        stored member is theirs, from a person's surface (an untagged member
+        device's sidecar or the network's credential). The handler is
+        BAL-M12-15's; until it lands the route answers `501` `not_built`.
+      operationId: computeCharges
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: The page after the one that answered this cursor; none for the first page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of charges (`ComputeCharges`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`may_not_see` or `credential_refused`: the caller sees no charges (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/statement:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: A month's compute statement
+      description: |
+        A UTC month's day rows by kind, model, enclave, member and agent, the
+        lots bought or redeemed, and what of a promotion lapsed (§9.13), to
+        the callers `GET /compute/charges` takes. The handler is
+        BAL-M12-15's; until it lands the route answers `501` `not_built`.
+      operationId: computeStatement
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: month
+          in: query
+          required: true
+          description: The UTC month, YYYY-MM.
+          schema:
+            type: string
+            pattern: "^[0-9]{4}-[0-9]{2}$"
+      responses:
+        "200":
+          description: The month's statement (`ComputeStatement`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`may_not_see` or `credential_refused`: the caller sees no statements (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/spend:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The compute spend view
+      description: |
+        §9.13's spend view: each service's total since `first_charge_day`
+        and each of its last 7 UTC days, in nano-USD, net of refunds with the
+        refunds apart, with counts and typed units, broken down by `by` as
+        opaque ids and catalog ids, with the settlement time the figures are
+        exact to. Only from a member's consented device (DESIGN §8.5, owner
+        decision 126): refused to tagged sidecars, enclaves included, to
+        ephemeral and Delegation-admitted ones and to the network's
+        credential, and then to the callers `GET /compute/charges` refuses.
+        The handler is BAL-M12-15's; until it lands the route answers `501`
+        `not_built`.
+      operationId: computeSpend
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: by
+          in: query
+          required: false
+          description: The breakdown, provider, model, enclave, member or agent (the last for the 7 days only).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The spend view (`ComputeSpend`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`consented_device_required`, `may_not_see` or `credential_refused` (§9.10, §14.3)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/refund:
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Refund a compute lot
+      description: |
+        §9.12's refund of a Stripe lot's unspent part, within 30 days of its
+        purchase, by an Owner or a Billing admin from a person's surface. The
+        body is a JSON object of at most 64 KiB naming the lot, with no
+        query. The handler is BAL-M12-14's; until it lands the route answers
+        `501` `not_built`.
+      operationId: computeRefund
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The lot, `{"lot_id"}`.
+              type: object
+      responses:
+        "200":
+          description: The lot and what of it went back to the card (`ComputeRefund`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`role_required`: not an Owner or a Billing admin on a person's surface."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "409":
+          $ref: "#/components/responses/ComputeApiConflict"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/promo/redeem:
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Redeem a promotion code
+      description: |
+        Redeems one promotion code for the network (§9.11): the code's and
+        the network's checks, the load limits counted with the day's
+        purchases, and the redemption and its lot in one transaction; a retry
+        answers the same lot. Five failed codes a network a UTC day, then
+        `429` `rate_limited` until the next UTC midnight. Takes a caller who
+        may buy, as `POST /compute/checkout` does, and the code in a JSON
+        body, never a query. The handler is BAL-M12-13's.
+      operationId: computePromoRedeem
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The code, `{"code"}`, 8 to 32 letters and digits.
+              type: object
+      responses:
+        "200":
+          description: The redemption's lot (`ComputeRedemption`, sidecar/compute_client_api.go).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "402":
+          description: "`compute_balance`: a chargeback's suspension (§9.9)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "403":
+          description: "`may_not_buy` or `credential_refused`: the caller may not buy (§9.10)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "409":
+          $ref: "#/components/responses/ComputeApiConflict"
+        "429":
+          description: "`rate_limited`: five failed codes today; `retry_after_ms` and `Retry-After` give the next UTC midnight."
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/ComputeRetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /compute/terms:
+    get:
+      x-status: planned
+      tags: [Other]
+      summary: The compute terms the network accepted
+      description: |
+        The compute terms' version and the clauses the network accepted, by
+        whom and when (`compute_terms`, §21.9). Takes any member device's
+        sidecar, untagged, or the network's credential. The handler is
+        BAL-M13-03's; until it lands the route answers `501` `not_built`.
+      operationId: computeTerms
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The terms' version and the accepted clauses.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`credential_refused`: no member device's sidecar, or not the network's credential."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Accept a compute terms clause
+      description: |
+        Accepts the web search clause (§21.9), which the broker's projection
+        then carries; a checkout records the same with a first purchase. Takes
+        an Owner or an Admin, from an untagged sidecar or the network's
+        credential, and a JSON object of at most 64 KiB with no query. The
+        handler is BAL-M13-03's; until it lands the route answers `501`
+        `not_built`.
+      operationId: computeAcceptTerms
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The clause accepted, BAL-M13-03's format.
+              type: object
+      responses:
+        "200":
+          description: The terms' version and the accepted clauses after the acceptance.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/ComputeApiBadRequest"
+        "401":
+          $ref: "#/components/responses/ComputeApiUnauthenticated"
+        "403":
+          description: "`role_required`: not an Owner or an Admin on a person's surface."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeApiRefusal"
+        "501":
+          $ref: "#/components/responses/ComputeApiNotBuilt"
+        "503":
+          $ref: "#/components/responses/ComputeApiUnavailable"
+
+  /v1/catalog:
+    servers:
+      - url: https://compute.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The remote model catalog
+      description: |
+        compute's remote catalog entries and their prices, versioned
+        (DESIGN-COMPUTE §6.3): INFER's format, from protocol/infer.proto.
+
+        Every compute route takes a sidecar's service token for the `compute`
+        audience (§14.2), checked before its handler runs, in order: the
+        token, the sidecar's admission in its network's verified state, the
+        network's `compute` gate, the migration groups the route reads, then
+        the route's own requirements. Every answer but a route's own success
+        is a `ComputeRefusal`, JSON, whose code fixes the status; a `503`
+        carries `Retry-After`. A route whose handler has not landed answers
+        `503` `not_built`. The handler is INFER's.
+      operationId: computeCatalog
+      security:
+        - ServiceTokenAuth: []
+      responses:
+        "200":
+          description: The catalog.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/tunnel:
+    servers:
+      - url: https://compute.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A WebSocket byte relay to a provider or an enclave's setup address
+      description: |
+        A WebSocket byte relay to an allowlisted provider host on 443, inside
+        which the device runs its own TLS, or to an enclave VM's setup address
+        while its incarnation is set up, for a sidecar of its network, inside
+        which the device runs its own SSH (§5.7, §11.7). compute sees the
+        host, sizes and times, never the contents (compute-5). The handler is
+        ATTEST's, which upgrades the connection.
+      operationId: computeTunnel
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - name: host
+          in: query
+          required: true
+          description: The provider host on the allowlist, or the enclave's setup address.
+          schema:
+            type: string
+      responses:
+        "101":
+          description: Switching to the WebSocket relay.
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/infer/prepare:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A model's instance keys and one-use nonces
+      description: |
+        A model's instance E2E keys and one-use nonces, fetched with
+        URnetwork's provider key (§6.6). INFER's messages, from
+        protocol/infer.proto; the handler is INFER's.
+      operationId: computeInferPrepare
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The keys and nonces.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/infer:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: One remote inference call
+      description: |
+        One remote call: `ComputeInferHeader` and the sealed envelope, from
+        protocol/infer.proto; streams the provider's chunks and `ur_usage` as
+        server-sent events, with a comment every 15 s under the load
+        balancer's stall timeouts (§6.6, §14.2). Admission reads the
+        network's holds and region before the handler. The handler is
+        INFER's.
+      operationId: computeInfer
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The provider's chunks and `ur_usage`, as server-sent events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "402":
+          $ref: "#/components/responses/ComputeInsufficientQuota"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "429":
+          $ref: "#/components/responses/ComputeHeld"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/infer/dispute:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Dispute a call's charge
+      description: |
+        A `charge_mismatch`: the device's usage numbers against the
+        provider's for one request (§6.7, compute-8). INFER's message; the
+        handler is INFER's.
+      operationId: computeInferDispute
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The dispute is recorded.
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/infer/authorize:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A direct call's authorization headers
+      description: |
+        A direct call's btauth/1 headers, after the floor, the providers, the
+        budget and the hold (§6.6). Admission reads the network's holds and
+        region before the handler. INFER's messages; the handler is INFER's.
+      operationId: computeInferAuthorize
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The call's headers.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "402":
+          $ref: "#/components/responses/ComputeInsufficientQuota"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "429":
+          $ref: "#/components/responses/ComputeHeld"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/search/authorize:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: One web search's admission
+      description: |
+        One search's admission, after the asset, the policy's ceiling, the web
+        search clause, grace state, budgets, the daily cap and the search cap
+        (§9.11), rate and hold; it relays the device's payee and nonce, sealed
+        to searchsigner, and the signer's sealed authorization back, reading
+        neither, and carries the device's unreported outcome counts (§21.5,
+        §21.8). No log line is written per call, only metrics. SRCH's
+        messages, from protocol/websearch.proto; the handler is SRCH's.
+      operationId: computeSearchAuthorize
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The signer's sealed authorization.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "402":
+          $ref: "#/components/responses/ComputeInsufficientQuota"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "429":
+          $ref: "#/components/responses/ComputeHeld"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/search/outcomes:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A device's search outcome counts
+      description: |
+        A device's search outcome counts by class not yet reported, at most
+        once a day, added to the hourly counts across all networks and never
+        kept by network (§21.8, compute-11). SRCH's message; the handler is
+        SRCH's.
+      operationId: computeSearchOutcomes
+      security:
+        - ServiceTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The counts are added.
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/budget/raise:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Raise a budget past its default
+      description: |
+        A raise past a default budget, with the approved
+        `compute_budget_raise` decision (§16.3's kind 21), under
+        `Idempotency-Key: <effect_key>`; the use and the new amount are
+        stored in one transaction. The approval is checked before the
+        handler, which is BAL's; its message is from protocol/compute.proto.
+      operationId: computeBudgetRaise
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The raise, or the stored result for a repeated key.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/collateral/{vendor}/{item}:
+    servers:
+      - url: https://compute.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Vendor-signed attestation collateral
+      description: |
+        Vendor-signed collateral from compute's cache (§5.7, compute-9):
+        public vendor data, each item kept to its own expiry, and no
+        requester recorded. Takes no credential; only whether the `compute`
+        gate is enabled at all is asked. The handler is ATTEST's.
+      operationId: computeCollateral
+      security: []
+      parameters:
+        - name: vendor
+          in: path
+          required: true
+          description: The collateral's vendor.
+          schema:
+            type: string
+        - name: item
+          in: path
+          required: true
+          description: The vendor's item.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The vendor's signed bytes.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Create an enclave
+      description: |
+        Creates an enclave (§11.7), with the approved `enclave_create`
+        decision (§16.3's kind 19), under `Idempotency-Key: <effect_key>`,
+        the use kept with the enclave's row. Admission reads the network's
+        holds and region before the handler; the enclave routes answer `503`
+        while this binary does not link MG-C3. ENC's messages, from
+        protocol/enclave.proto; the handler is ENC's.
+      operationId: computeEnclaveCreate
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The enclave, or the stored result for a repeated key.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/ComputeInvalid"
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "402":
+          $ref: "#/components/responses/ComputeInsufficientQuota"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: The network's enclaves the caller may see
+      description: |
+        The network's enclaves the caller may see (§11.6). ENC's message; the
+        handler is ENC's.
+      operationId: computeEnclaveList
+      security:
+        - ServiceTokenAuth: []
+      responses:
+        "200":
+          description: The enclaves.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves/{id}:
+    servers:
+      - url: https://compute.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: One enclave
+      description: |
+        One of the network's enclaves the caller may see (§11.6). ENC's
+        message; the handler is ENC's.
+      operationId: computeEnclaveGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      responses:
+        "200":
+          description: The enclave.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+    delete:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Remove an enclave
+      description: |
+        Removes an enclave, per §16.2's rules (§11.11); a removal's cause
+        stays in the record, not here. The handler is ENC's.
+      operationId: computeEnclaveDelete
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      responses:
+        "200":
+          description: The enclave is being removed.
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves/{id}/evidence:
+    servers:
+      - url: https://compute.bringyour.com
+    get:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: An enclave VM's evidence for a nonce
+      description: |
+        The VM's evidence for the nonce, to a member device of the enclave's
+        sponsor (§11.7), relayed and never stored (compute-5). ENC's message;
+        the handler is ENC's.
+      operationId: computeEnclaveEvidenceGet
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+        - name: nonce
+          in: query
+          required: true
+          description: The device's nonce.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The evidence.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: A VM posts its evidence and reads nonces
+      description: |
+        The enclave VM's init posts its evidence and reads the nonces asked
+        of it, by long poll (§11.7), under the per-VM token the orchestrator
+        gave the provider, which the handler checks; no sidecar token is
+        read. Only whether the `compute` gate is enabled at all is asked
+        before the handler, which is ENC's.
+      operationId: computeEnclaveEvidencePost
+      security:
+        - ComputeEnclaveVmAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The nonces asked, once one is.
+          content:
+            application/x-protobuf:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves/{id}/provision:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Relay a sealed provisioning bundle
+      description: |
+        The sealed bundle from a device of the enclave's sponsor, relayed
+        once to the VM and never stored (§11.7, compute-5). ENC's message;
+        the handler is ENC's.
+      operationId: computeEnclaveProvision
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: The bundle reached the VM.
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves/{id}/stop:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Stop an enclave
+      description: |
+        Stops an enclave, per §16.2's rules (§11.11); a stop's cause stays in
+        the record, not here. The handler is ENC's.
+      operationId: computeEnclaveStop
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      responses:
+        "200":
+          description: The enclave is stopping.
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
+  /v1/enclaves/{id}/start:
+    servers:
+      - url: https://compute.bringyour.com
+    post:
+      x-internal: true
+      x-status: planned
+      tags: [Other]
+      summary: Start an enclave
+      description: |
+        Starts a stopped enclave, per §16.2's rules, with its approved kind 19
+        where a tool asked for it (§7.5, §11.11). Admission reads the
+        network's holds and region before the handler, which is ENC's.
+      operationId: computeEnclaveStart
+      security:
+        - ServiceTokenAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ComputeEnclaveId"
+      responses:
+        "200":
+          description: The enclave is starting.
+        "401":
+          $ref: "#/components/responses/ComputeUnauthenticated"
+        "402":
+          $ref: "#/components/responses/ComputeInsufficientQuota"
+        "403":
+          $ref: "#/components/responses/ComputeScope"
+        "404":
+          $ref: "#/components/responses/ComputeNotFound"
+        "503":
+          $ref: "#/components/responses/ComputeUnavailable"
+
   /network/extender-lag-report:
     post:
       tags: [Network]
@@ -18366,6 +19557,23 @@ components:
         minimum: 0
       required: true
       description: The chunk's number, decimal from 0 with no leading zeros.
+    ComputeIdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: |
+        The approved decision's effect key (§16.3): compute answers a repeated
+        key with what it stored for the first, and a request without one
+        `400` `idempotency_key_required`.
+      schema:
+        type: string
+    ComputeEnclaveId:
+      in: path
+      name: id
+      required: true
+      description: The enclave's id.
+      schema:
+        type: string
   responses:
     SessionOperationResult:
       description: Authoritative outcome, including asynchronous cleanup progress.
@@ -18479,6 +19687,116 @@ components:
           schema:
             type: string
           example: A sidecar token needs a proof of its client key on this route.
+    ComputeApiBadRequest:
+      description: |
+        `bad_request`: a GET's query names a key the route does not take or
+        one twice, or carries a body; a POST carries a query, or its body is
+        no JSON object or is past 64 KiB.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeApiRefusal"
+    ComputeApiUnauthenticated:
+      description: "`unauthenticated`: no credential, or one that does not authenticate."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeApiRefusal"
+    ComputeApiConflict:
+      description: |
+        The ledger's refusal, its code the route's own: `sales_closed`,
+        `balance_cap`, `daily_limit`, `card_required`, `not_refundable`, or a
+        promotion code's `code_unknown`, `code_ended`, `code_redeemed`,
+        `redeemed_recently` or `paid_lot_required` (§9.5, §9.8, §9.11, §9.12).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeApiRefusal"
+    ComputeApiNotBuilt:
+      description: "`not_built`: the route's handler has not landed."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeApiRefusal"
+    ComputeApiUnavailable:
+      description: |
+        `unavailable`: the api cannot answer now: this binary does not link
+        the compute ledger's tables, the network's verified state is not
+        loaded, the credential could not be checked, or the host holds no key
+        the route needs. The same request goes again after `Retry-After`.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/ComputeRetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeApiRefusal"
+    ComputeUnauthenticated:
+      description: |
+        `unauthenticated`: no token, one that does not verify for the
+        `compute` audience, or one a revocation voids; the device mints a new
+        token and asks again.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeScope:
+      description: |
+        `scope`, `disclosure_required` or `suspended`: the token is no admitted
+        sidecar's of its network, a disclosure is not acknowledged (§2.8), or
+        the network's compute is suspended (§9.9).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeInvalid:
+      description: |
+        `invalid` or `idempotency_key_required`: a body past its route's
+        bound or one its handler cannot read, or a route that takes
+        `Idempotency-Key` asked without one.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeInsufficientQuota:
+      description: "`insufficient_quota`: a hold refused for the balance or a budget, its reason naming which (§6.6, §9.9, §16.4)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeHeld:
+      description: |
+        `held` or `rate_limited`: open holds stand in the way, or the
+        network's rate is spent (§9.7, §9.11).
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/ComputeRetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeNotFound:
+      description: "`not_found`: no such route, enclave or item."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeUnavailable:
+      description: |
+        `unavailable`, `not_built`, `upgrade_required`, `capacity` or
+        `tee_unverified`: compute cannot answer now, its gate is closed to
+        the network, this binary does not link a group the route reads, the
+        route's handler has not landed, the network's newest base turns on a
+        feature this release does not implement (§16.6), or no passing
+        instance can take the call. The same request goes again after
+        `Retry-After`.
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/ComputeRetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
   headers:
     GkmRetryAfter:
       description: |
@@ -18490,6 +19808,11 @@ components:
         ready, the process hosting it answers every route 503 too, with 1 and
         the plain-text body `Service not ready.`.
       required: true
+      schema:
+        type: integer
+        minimum: 1
+    ComputeRetryAfter:
+      description: Seconds before the same request goes again.
       schema:
         type: integer
         minimum: 1
@@ -18582,6 +19905,14 @@ components:
         with its service, compares in constant time, and each internal gate
         route takes only the services it lists. Not a URnetwork JWT, and
         never a user's.
+
+    ComputeEnclaveVmAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An enclave VM's own token, which compute's orchestrator gave the
+        provider when it created the VM, for that VM's evidence route alone
+        (DESIGN-COMPUTE §11.7). Not a URnetwork JWT and never a sidecar's.
 
   schemas:
     ClientInfo:
@@ -28095,6 +29426,45 @@ components:
         version:
           description: The format's version, 1.
           type: integer
+
+    ComputeApiRefusal:
+      description: |
+        A refusal of an api compute route (DESIGN-COMPUTE §14.3), as the
+        sidecar's api client reads one: the code, and where a retry time is
+        given, `retry_after_ms`, which `Retry-After` repeats.
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          description: The refusal's code, the route's own or the frame's.
+          type: string
+        retry_after_ms:
+          description: Milliseconds before the same request goes again; 0 for none.
+          type: integer
+          minimum: 0
+
+    ComputeRefusal:
+      description: |
+        A refusal of a compute route (DESIGN-COMPUTE §14.3), JSON whatever
+        message the route's success answers with, so a device reads it before
+        it knows which: the code, which fixes the status, a reason from the
+        code's own closed set where it has one, and `retry_after_ms` where a
+        retry time is given, which `Retry-After` repeats.
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          description: The refusal's code.
+          type: string
+        reason:
+          description: The code's reason, where it has one.
+          type: string
+        retry_after_ms:
+          description: Milliseconds before the same request goes again.
+          type: integer
+          minimum: 0
 
     GetClientKeyResult:
       type: object

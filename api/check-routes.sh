@@ -38,12 +38,15 @@
 # skipped with a note rather than failed.
 #
 # More generally, a path whose own `servers:` entry names none of the document's
-# top-level servers is served on another host: /gkm/'s, /evs/'s at evs, and
-# /socket/'s at sockets. Its operations are not api's, planned or not, so they
-# are left out of the comparison with api's table, and api registering one is
-# drift. Each such host holds them to its own table: gkm's here, below, and evs's
-# in server/evshost's route table test, which reads this file against the
-# engine's routes.
+# top-level servers is served on another host: /gkm/'s, /evs/'s at evs,
+# /socket/'s at sockets, and compute's /v1/ routes at compute (DESIGN-COMPUTE
+# §14.3). Its operations are not api's, planned or not, so they are left out of
+# the comparison with api's table, and api registering one is drift. Each such
+# host holds them to its own table: gkm's here, below, evs's in server/evshost's
+# route table test, which reads this file against the engine's routes, and
+# compute's in computeservice's TestComputeRoutesMatchOpenApi, which holds the
+# engine's whole route table to the operations this file gives compute's host,
+# both ways, beside api's /v1/seed.bin under the same prefix.
 #
 # The source-only check uses zsh, awk, grep, sed, sort and comm.
 #
@@ -108,8 +111,8 @@ if (( ! source_only )); then
             -run '^Test(Spec|CompetitionSpec|EngineRoutesAreBringyourYmlsEvsOperations$|EveryRouteIsClassified$)'
     ) || exit $?
     (
-        cd "${server_dir:a:h}/sidecar" && go test -count=1 ./gkmservice ./socketsservice \
-            -run '^Test(Gkm|Sockets)RoutesMatchOpenApi$'
+        cd "${server_dir:a:h}/sidecar" && go test -count=1 ./gkmservice ./socketsservice ./computeservice \
+            -run '^Test(Gkm|Sockets|Compute)RoutesMatchOpenApi$'
     )
     exit $?
 fi
