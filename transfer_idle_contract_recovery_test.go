@@ -126,6 +126,20 @@ func exerciseIdleContractRecovery(t *testing.T, testSettings idleContractRecover
 						MessagePoolReturn(wire)
 						continue
 					}
+					// Sustained loss takes the receiver's other saying that it lost
+					// the sequence's state too, a selective ack's
+					// (Ack.nothing_delivered), which brings the head with its whole
+					// contract as the request does (receiverLostContract). The
+					// acknowledgement itself still arrives.
+					if lostRequests < 0 && transfer.Ack != nil && transfer.Ack.NothingDelivered {
+						transfer.Ack.NothingDelivered = false
+						rewritten, err := ProtoMarshal(&transfer)
+						MessagePoolReturn(wire)
+						if err != nil {
+							panic(err)
+						}
+						wire = rewritten
+					}
 					select {
 					case reverseDelivered <- wire:
 					case <-ctx.Done():
@@ -354,7 +368,15 @@ func exerciseIdleContractRecovery(t *testing.T, testSettings idleContractRecover
 		} else {
 			send(prefix)
 		}
-		if delivered.Load() != expectedDelivered || receiver.missingContractRequestCount.Load() != uint64(lostRequests+1) || sender.missingContractWriteCount.Load() != 1 || droppedRequests.Load() != int32(lostRequests) {
+		wantRequests, wantRecoveries := uint64(lostRequests+1), uint64(1)
+		if testSettings.loseEncryptionState {
+			// A receiver that lost its session with the sender lost the
+			// sequence's state with it, which its nack says: the sender's
+			// reseal writes the head with its whole contract
+			// (receiverLostContract), and the receiver asks for none.
+			wantRequests, wantRecoveries = 0, 0
+		}
+		if delivered.Load() != expectedDelivered || receiver.missingContractRequestCount.Load() != wantRequests || sender.missingContractWriteCount.Load() != wantRecoveries || droppedRequests.Load() != int32(lostRequests) {
 			t.Fatalf("recovery did not deliver exactly once: delivered=%d requests=%d recoveries=%d errors=%v", delivered.Load(), receiver.missingContractRequestCount.Load(), sender.missingContractWriteCount.Load(), log.messages())
 		}
 	})

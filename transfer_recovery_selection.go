@@ -370,23 +370,43 @@ func (self *SendSequence) selectDueRecovery(
 
 	// resend
 	var transferFrameBytes []byte
-	if self.sendItems[0].sequenceNumber == item.sequenceNumber &&
-		!item.head {
+	if self.sendItems[0].sequenceNumber == item.sequenceNumber {
 		// Set head after cumulative progress. A negotiated compact head stays
-		// compact through every loss recovery; only an explicit receiver
-		// request reconstructs its complete contract.
-		var err error
-		var hasContractFrame bool
-		transferFrameBytes, hasContractFrame, err = self.setHead(item, false)
-		if err != nil {
-			self.log.Errorf("[s]%s->%s...%s s(%s) exit could not set head = %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, err)
-			self.recordSendSequenceExit("head_rewrite", item, time.Time{}, err)
-			return sendRecoverySelection{}, sendRecoverySelectionDeferred, err
+		// compact through every loss recovery, unless the receiver lost the
+		// sequence's state (receiverLostContract): it holds none of the
+		// sequence's contracts, so the head it gets next carries the whole
+		// contract, a compact head already written included, rather than cost
+		// it a request for the contract and the answer to it, a round trip
+		// behind the receiver's ack compression (QD-1232). Otherwise only an
+		// explicit receiver request reconstructs the complete contract.
+		fullContract := self.receiverLostContract
+		compactHead := item.head && item.contractId != nil && !item.hasContractFrame
+		if !item.head || fullContract && compactHead {
+			promoted := !item.head
+			var err error
+			var hasContractFrame bool
+			transferFrameBytes, hasContractFrame, err = self.setHead(item, fullContract)
+			if err != nil && fullContract && errors.Is(err, ErrSendPackNotAdmitted) {
+				// the retained budget took no frame that large: the head goes
+				// compact, as it did, and the receiver asks for its contract
+				transferFrameBytes, hasContractFrame, err = nil, false, nil
+				if promoted {
+					transferFrameBytes, hasContractFrame, err = self.setHead(item, false)
+				}
+			}
+			if err != nil {
+				self.log.Errorf("[s]%s->%s...%s s(%s) exit could not set head = %s\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId, err)
+				self.recordSendSequenceExit("head_rewrite", item, time.Time{}, err)
+				return sendRecoverySelection{}, sendRecoverySelectionDeferred, err
+			}
+			if transferFrameBytes != nil {
+				self.replaceSendItemFrame(item, transferFrameBytes)
+				item.head = true
+				item.hasContractFrame = hasContractFrame
+				item.promotedHead = item.promotedHead || promoted
+			}
 		}
-		self.replaceSendItemFrame(item, transferFrameBytes)
-		item.head = true
-		item.hasContractFrame = hasContractFrame
-		item.promotedHead = true
+		self.receiverLostContract = false
 	}
 
 	// Selection keeps the exact item in its one ACK/retention owner while a

@@ -20,6 +20,7 @@ package connect
 // run's, and never a sleep.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"sync"
@@ -1137,7 +1138,14 @@ func newCompactHeadBacklog(t *testing.T) *compactHeadBacklog {
 		t.Fatal("the Packs behind the head are already due")
 	}
 	t.Cleanup(func() {
-		items := []*sendItem{backlog.head, backlog.one, backlog.two}
+		// an item a test had acknowledged, which the acknowledgement returned,
+		// is nil here
+		items := []*sendItem{}
+		for _, item := range []*sendItem{backlog.head, backlog.one, backlog.two} {
+			if item != nil {
+				items = append(items, item)
+			}
+		}
 		for _, item := range items {
 			sequence.resendQueue.RemoveByMessageId(item.messageId)
 		}
@@ -1147,6 +1155,64 @@ func newCompactHeadBacklog(t *testing.T) *compactHeadBacklog {
 		}
 	})
 	return backlog
+}
+
+// A receiver that said it lost the sequence's state holds none of its
+// contracts, so the head it gets next carries the whole contract, whether the
+// first Pack it lacks is promoted to the head or was written as a compact head
+// already, and the sequence notes that it is done. Before, the head went
+// compact, the receiver asked for its contract, and the answer came a round
+// trip later, behind the receiver's ack compression: in a client restarted in
+// place, once on the listener's control carrier and once on its data
+// sequence, about 10 ms each. A head written for a receiver that said nothing
+// of the kind stays compact through loss recovery.
+func TestHeadForAReceiverThatLostTheSequenceCarriesTheWholeContract(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		for _, promoted := range []bool{false, true} {
+			backlog := newCompactHeadBacklog(t)
+			sequence := backlog.sequence
+			first := backlog.head
+			if promoted {
+				// acknowledged, so the Pack behind it is the first, not a head yet
+				sequence.receiveAck(backlog.head.messageId, false, sequenceTag{}, true)
+				backlog.head = nil
+				first = backlog.one
+				if len(sequence.sendItems) != 2 || sequence.sendItems[0] != first || first.head {
+					t.Fatalf("lost %t promoted %t: the acknowledged head left %d items", lost, promoted, len(sequence.sendItems))
+				}
+			}
+			now := time.Now()
+			if lost {
+				sequence.rewriteForLostReceiver(3, now)
+			} else {
+				// a hole proved by later acknowledgements, recovered at once
+				sequence.setResendTime(first, now)
+				first.recoveryKind = sendRecoverySelectiveGap
+			}
+			selection, outcome, err := sequence.selectDueRecovery(first, now, transferFlightPolicySnapshot{}, sequence.ackWindow)
+			if err != nil || outcome != sendRecoverySelectionReady || selection.messageId != first.messageId {
+				t.Fatalf("lost %t promoted %t: the first Pack was not selected: outcome %d, %v", lost, promoted, outcome, err)
+			}
+			pack := decodeCompactContractTestPack(t, first.transferFrameBytes)
+			if !pack.GetHead() || !first.head {
+				t.Fatalf("lost %t promoted %t: the first Pack does not go as the head", lost, promoted)
+			}
+			if lost {
+				if pack.GetContractFrame() == nil || !first.hasContractFrame {
+					t.Fatalf("promoted %t: the head for a receiver that lost the sequence carries no contract", promoted)
+				}
+				if sequence.receiverLostContract {
+					t.Fatalf("promoted %t: the head carrying the contract left the sequence owing one", promoted)
+				}
+			} else if pack.GetContractFrame() != nil || first.hasContractFrame ||
+				!bytes.Equal(pack.GetContractId(), backlog.contractId.Bytes()) {
+				t.Fatalf("promoted %t: a head recovered for a receiver that holds the contract is not compact", promoted)
+			}
+			if first.promotedHead != promoted {
+				t.Fatalf("lost %t promoted %t: the head says promoted %t", lost, promoted, first.promotedHead)
+			}
+		}
+	}
 }
 
 // A receiver that asks for a compact head's contract and says it has delivered

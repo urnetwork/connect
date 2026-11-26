@@ -7417,6 +7417,14 @@ type SendSequence struct {
 	// (rewriteForLostReceiver), so a later saying of it makes due only the
 	// items above it, each at most once.
 	receiverLostRewrittenBelow uint64
+	// Whether the receiver has lost the sequence's state, which it said, or
+	// which a peer that lost its session with this side lost with it
+	// (rewriteForLostReceiver, rewritePlaintextForLostPeer), since the
+	// sequence's first item was last written: such a receiver holds none of the
+	// sequence's contracts, so that item goes next as a head carrying the
+	// whole contract, never a compact one (selectDueRecovery). Owned by the
+	// send worker.
+	receiverLostContract bool
 	// Set by the session once the peer, which nacked a wrap of the session it
 	// could not open, seals under the established epoch (requestReseal); the
 	// send worker takes it on its next pass and writes again what it last
@@ -12936,14 +12944,16 @@ func (self *SendSequence) receiveContractMissingAck(messageId Id, ack sequenceAc
 // the receiver's first acknowledgements make. So each such Pack is due at once,
 // as receiver-state recovery that spends none of its backoff, and the resend
 // loop writes them in sequence order, the oldest promoted to the head
-// (selectDueRecovery). A Pack already due keeps its time, and an ordinary
-// timer's Pack among them becomes this recovery too, which no
-// cumulative-progress deferral holds. A Pack is written so at most once:
-// receiverLostRewrittenBelow records how far this has run, so a repeated or
-// later saying writes only what lies above it. A selectively acknowledged Pack
-// is held there already, and one the queue does not retain is being
-// acknowledged or retired.
+// (selectDueRecovery), which carries the whole contract, since the receiver
+// holds none of the sequence's (receiverLostContract). A Pack already due
+// keeps its time, and an ordinary timer's Pack among them becomes this
+// recovery too, which no cumulative-progress deferral holds. A Pack is written
+// so at most once: receiverLostRewrittenBelow records how far this has run, so
+// a repeated or later saying writes only what lies above it. A selectively
+// acknowledged Pack is held there already, and one the queue does not retain
+// is being acknowledged or retired.
 func (self *SendSequence) rewriteForLostReceiver(below uint64, at time.Time) {
+	self.receiverLostContract = true
 	if below <= self.receiverLostRewrittenBelow {
 		return
 	}
@@ -12998,8 +13008,12 @@ func (self *SendSequence) requestLostPeerRewrite() {
 // Pack already due keeps its time, and an ordinary timer's Pack among them
 // becomes this recovery. Each Pack is written so at most once:
 // lostPeerRewrittenBelow records how far this has run, so a later nack writes
-// only what came after. Runs on the send worker, which owns the items.
+// only what came after. The sequence's first item goes next as a head carrying
+// the whole contract, whichever recovery writes it, since the peer holds none
+// of the sequence's contracts (receiverLostContract). Runs on the send worker,
+// which owns the items.
 func (self *SendSequence) rewritePlaintextForLostPeer(at time.Time) {
+	self.receiverLostContract = true
 	from := self.lostPeerRewrittenBelow
 	if self.nextSequenceNumber <= from {
 		return
