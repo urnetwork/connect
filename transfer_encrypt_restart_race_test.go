@@ -963,6 +963,97 @@ func TestNackFromAPeerThatLostItsSessionAsksForWhatWentOutInPlaintext(t *testing
 	}
 }
 
+// Establishes epoch e on sess, as a verified handshake does: a hand-built
+// cipher, the peer's proof verified.
+func establishTestAttemptEpoch(sess *peerEncryptionSession, e *tlsHandshakeEpoch) {
+	sess.stateLock.Lock()
+	defer sess.stateLock.Unlock()
+	e.derivedTlsCipher = &sequenceCipher{}
+	e.peerIdentityVerified = true
+	sess.markEstablishedWithLock(e)
+}
+
+// A ClientHello that opens a new attempt over the responder's established epoch,
+// on a carrier that replaced a send sequence of the peer's this side still held
+// live, comes from a peer that lost its session with this side, as a client
+// restarted in place did, though no nack says so: such a peer abandons its live
+// send sequence and handshakes on the next. The session asks its send sequences
+// to write again at once what went out in plaintext, and owes the reseal of what
+// went out under the established epoch, which it asks for once the peer seals
+// under an epoch established after it, not before. A re-handshake on the
+// carrier the peer had, a ClientHello on a replacing carrier to a session with
+// no epoch established, and a retransmit of an attempt already answered owe
+// nothing. Before, only a nack said so, and a restarted client that nacked
+// nothing read the listener's old backlog when each Pack's own timer brought it.
+func TestRehandshakeOnACarrierThatReplacedALiveOneIsAPeerThatLostItsSession(t *testing.T) {
+	cases := []struct {
+		name         string
+		replacedLive bool
+		established  bool
+		retransmit   bool
+		lost         bool
+	}{
+		{name: "replacing carrier", replacedLive: true, established: true, lost: true},
+		{name: "the carrier it had", established: true},
+		{name: "no session yet", replacedLive: true},
+		{name: "retransmit", replacedLive: true, established: true, retransmit: true},
+	}
+	for _, c := range cases {
+		sess, cleanup := newTestEncryptionSession(t, sequenceTlsRoleServer)
+		losses, rewrites := 0, 0
+		var reseals []uint8
+		sess.settings.lostPeerReplacedCarrierForTest = func(Id, sequenceTlsRole) { losses += 1 }
+		sess.settings.lostPeerRewriteRequestedForTest = func(Id, sequenceTlsRole) { rewrites += 1 }
+		sess.settings.resealRequestedForTest = func(_ Id, _ sequenceTlsRole, sealGeneration uint8) {
+			reseals = append(reseals, sealGeneration)
+		}
+		var old *tlsHandshakeEpoch
+		if c.established {
+			old = injectTestAttemptEpoch(sess, NewId(), testAttemptClientHello(1), true, nil)
+			establishTestAttemptEpoch(sess, old)
+			// the peer's previous process sealed under it
+			sess.observePeerSealed(old.derivedTlsCipher)
+		}
+		attemptId := NewId()
+		clientHello := testAttemptClientHello(2)
+		if c.retransmit {
+			injectTestAttemptEpoch(sess, attemptId, clientHello, false, nil)
+		}
+		sess.deliverEncryptedControl(&protocol.EncryptedControl{
+			ControlType: protocol.EncryptedControlType_EncryptedControlHandshake,
+			Payload:     clientHello,
+			SessionRole: protocol.SequenceRole_SequenceRoleClient,
+			EpochId:     attemptId.Bytes(),
+		}, c.replacedLive)
+		want := 0
+		if c.lost {
+			want = 1
+		}
+		if losses != want || rewrites != want || sess.resealOwed.Load() != c.lost {
+			cleanup()
+			t.Fatalf("%s: %d losses and %d plaintext rewrites asked for, reseal owed %t; want %d, %d and %t",
+				c.name, losses, rewrites, sess.resealOwed.Load(), want, want, c.lost)
+		}
+		if c.lost {
+			// a straggler's wrap under the epoch the peer lost shows nothing
+			sess.observePeerSealed(old.derivedTlsCipher)
+			if len(reseals) != 0 {
+				cleanup()
+				t.Fatalf("a reseal was asked for under the epoch the peer lost: %v", reseals)
+			}
+			renewed := injectTestAttemptEpoch(sess, attemptId, clientHello, true, nil)
+			establishTestAttemptEpoch(sess, renewed)
+			sess.observePeerSealed(renewed.derivedTlsCipher)
+			if len(reseals) != 1 || reseals[0] != renewed.derivedTlsCipher.sealGeneration {
+				cleanup()
+				t.Fatalf("once the peer sealed under the new epoch, reseals %v, want one under generation %d",
+					reseals, renewed.derivedTlsCipher.sealGeneration)
+			}
+		}
+		cleanup()
+	}
+}
+
 // The restarted edge establishes its new session from the listener's identity
 // proof while its own proof is still off its send path (a barrier holds the
 // worker's hand-off): the session seals nothing, so the edge's first open waits

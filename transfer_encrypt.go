@@ -989,6 +989,11 @@ type EncryptionSettings struct {
 	// its established epoch (`observePeerSealed`), called outside the session
 	// lock.
 	peerSealedEstablishedForTest func(peerId Id, role sequenceTlsRole)
+	// Nil test observer of each reseal a session came to owe a peer that
+	// re-handshook on a carrier that replaced a live one
+	// (`peerEncryptionSession.oweResealForLostPeer`), called outside the session
+	// lock before it asks its send sequences for the rewrite.
+	lostPeerReplacedCarrierForTest func(peerId Id, role sequenceTlsRole)
 }
 
 func DefaultEncryptionSettings() *EncryptionSettings {
@@ -2741,6 +2746,26 @@ func (self *peerEncryptionSession) PeerClientPublicKey() ed25519.PublicKey {
 //     (sticky), permanently keeping the cipher hidden so the session stays
 //     plaintext.
 func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.EncryptedControl) {
+	self.deliverEncryptedControl(ec, false)
+}
+
+// As `DeliverEncryptedControl`, from a carrier that says whether it replaced,
+// on its lane, a send sequence of the peer's that this side still held live
+// (`ReceiveSequence.replacedLivePredecessor`). A ClientHello that opens a new
+// attempt over this responder's established epoch on such a carrier is a peer
+// that lost its session with this side: it abandoned its live send sequence
+// and handshakes anew on the next, as a client restarted in place does, while
+// a peer that only rekeys does so on the sequence it has, and one whose
+// sequence ended by its idle timeout opens the next on a lane this side has
+// already closed. So the session owes it what a nack naming no epoch would
+// (`oweResealForLostPeer`): the Packs this side wrote in plaintext go again at
+// once, and the ones it sealed under the epoch the peer lost go again sealed
+// under the new one once the peer seals under it. That brings the peer what
+// the previous process never acknowledged when no nack comes, which happens
+// when each of those Packs reached it only on its own timer, once the peer
+// sealed under the new epoch and could read it, and the first it delivered
+// took away its saying that it had lost the sequence (Ack.nothing_delivered).
+func (self *peerEncryptionSession) deliverEncryptedControl(ec *protocol.EncryptedControl, replacedLive bool) {
 	// epoch_id is the control's generation (see the proto). Unset means a
 	// pre-epoch peer, which keeps the legacy behavior for that control.
 	var epochId Id
@@ -2754,7 +2779,9 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 	}
 	switch ec.ControlType {
 	case protocol.EncryptedControlType_EncryptedControlHandshake:
-		self.deliverHandshake(ec.Payload, epochId)
+		if self.deliverHandshake(ec.Payload, epochId) && replacedLive {
+			self.oweResealForLostPeer()
+		}
 	case protocol.EncryptedControlType_EncryptedControlIdentityProof:
 		if self.client.log.V(1).Enabled() {
 			self.client.log.Infof(
@@ -2795,10 +2822,12 @@ func (self *peerEncryptionSession) DeliverEncryptedControl(ec *protocol.Encrypte
 // A responder's named control (the TLS-server role, epoch_id set) goes to
 // `deliverAttemptHandshake` instead, which answers each attempt at most once.
 // What follows is the initiator's path, and a pre-epoch peer's.
-func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) {
+//
+// Answers whether the control was a ClientHello that opened a new attempt over
+// this responder's established epoch, which only the named path reports.
+func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) bool {
 	if self.role == sequenceTlsRoleServer && epochId != (Id{}) {
-		self.deliverAttemptHandshake(payload, epochId, false)
-		return
+		return self.deliverAttemptHandshake(payload, epochId, false)
 	}
 	// A control naming a DIFFERENT generation than the epoch we hold is the
 	// peer having restarted its handshake. Reset onto the new generation
@@ -2817,7 +2846,7 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 				if !newer {
 					// straggling bytes from a superseded generation: dropping
 					// them protects the live epoch's TLS state
-					return
+					return false
 				}
 				self.reset()
 			}
@@ -2840,18 +2869,18 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 				self.logTag, len(payload),
 			)
 		}
-		return
+		return false
 	}
 	self.startEpoch()
 	e := self.currentEpoch()
 	if e == nil || e.transport == nil {
-		return
+		return false
 	}
 	// bind this epoch to the initiator's generation name (responder side);
 	// a mismatch here means a newer generation raced in — drop rather than
 	// cross-feed, the sender's resend lands on the adopted epoch
 	if !self.adoptEpochId(e, epochId) {
-		return
+		return false
 	}
 	var firstByte byte
 	if 0 < len(payload) {
@@ -2864,6 +2893,7 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 		)
 	}
 	e.transport.Deliver(payload)
+	return false
 }
 
 // Feeds a responder's named handshake control (`EncryptedControl.epoch_id`
@@ -2899,7 +2929,7 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 //
 // Safe to call from the receive loop: it starts epoch workers and appends to
 // a transport's inbox, and never blocks.
-func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epochId Id, early bool) {
+func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epochId Id, early bool) bool {
 	clientHello := isClientHelloRecord(payload)
 	var digest [sha256.Size]byte
 	if clientHello {
@@ -2911,6 +2941,8 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 	}
 	var feed *tlsHandshakeEpoch
 	opened := false
+	// whether the attempt opened while an established epoch served
+	overEstablished := false
 	paced := false
 	taken := false
 	dropReason := ""
@@ -2951,6 +2983,7 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 			e = self.epoch
 			e.epochId = epochId
 			opened = true
+			overEstablished = self.establishedEpoch != nil
 		}
 		if !clientHello {
 			if !e.clientHelloAnswered {
@@ -2996,10 +3029,10 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 				self.logTag, epochId, len(payload), clientHello, dropReason,
 			)
 		}
-		return
+		return false
 	}
 	if feed == nil || feed.transport == nil {
-		return
+		return false
 	}
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof(
@@ -3008,6 +3041,7 @@ func (self *peerEncryptionSession) deliverAttemptHandshake(payload []byte, epoch
 		)
 	}
 	feed.transport.Deliver(payload)
+	return opened && overEstablished
 }
 
 // Delivers a named ClientHello from the receive loop, ahead of the ordered
@@ -4848,6 +4882,18 @@ func (self *EncryptionSessionManager) sessionsForPeerRole(peerId Id, role sequen
 // identity companion comes from the control itself, so a created server session
 // echoes it on replies and the initiator's reply state matches.
 func (self *EncryptionSessionManager) DeliverEncryptedControl(peerId Id, role sequenceTlsRole, ec *protocol.EncryptedControl) {
+	self.deliverEncryptedControlFromCarrier(peerId, role, ec, false)
+}
+
+// As `DeliverEncryptedControl`, for a receive sequence that says whether its
+// carrier replaced, on its lane, a sequence of the peer's that this side still
+// held live (`ReceiveSequence.replacedLivePredecessor`).
+func (self *EncryptionSessionManager) deliverEncryptedControlFromCarrier(
+	peerId Id,
+	role sequenceTlsRole,
+	ec *protocol.EncryptedControl,
+	replacedLive bool,
+) {
 	if self.settings.Mode == EncryptionModeOff {
 		return
 	}
@@ -4858,7 +4904,7 @@ func (self *EncryptionSessionManager) DeliverEncryptedControl(peerId Id, role se
 	if session == nil {
 		return
 	}
-	session.DeliverEncryptedControl(ec)
+	session.deliverEncryptedControl(ec, replacedLive)
 }
 
 // Close prevents later publishers and sessions, then requests teardown without
@@ -5658,21 +5704,12 @@ func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 			if self.peerSealsEstablished.Load() {
 				return self.takeResealWithLock()
 			}
+			self.oweResealWithLock()
 		case established != nil && nackEpochId != (Id{}) &&
 			(prior != nil && prior.epochId == nackEpochId || nackEpochId.LessThan(established.epochId)):
-			return 0
 		default:
 			lostPeer = true
-			self.peerSealsEstablished.Store(false)
-			self.resealOwedPastGeneration = 0
-			if established != nil && established.derivedTlsCipher != nil {
-				self.resealOwedPastGeneration = established.derivedTlsCipher.sealGeneration
-			}
-		}
-		if !self.resealOwed.Swap(true) && established != nil && established.awaitingPeerSeal {
-			// a responder held on its prior seals under the established epoch
-			// from here (sealingEpochWithLock)
-			self.notifyRequiredCipherChangedWithLock()
+			self.oweLostPeerResealWithLock()
 		}
 		return 0
 	}()
@@ -5681,6 +5718,48 @@ func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 	}
 	if lostPeer {
 		self.requestLostPeerRewrite()
+	}
+}
+
+// What a nack naming no epoch, or one newer than the established epoch, owes
+// the peer, for a peer that shows otherwise that it lost its session with this
+// side (`deliverEncryptedControl`): the Packs this session's send sequences
+// last wrote in plaintext go again at once (`requestLostPeerRewrite`), and the
+// reseal waits for the peer to seal under an epoch established after the
+// current one (`oweLostPeerResealWithLock`).
+func (self *peerEncryptionSession) oweResealForLostPeer() {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.oweLostPeerResealWithLock()
+	}()
+	if self.settings != nil && self.settings.lostPeerReplacedCarrierForTest != nil {
+		self.settings.lostPeerReplacedCarrierForTest(self.peerId, self.role)
+	}
+	self.requestLostPeerRewrite()
+}
+
+// Owes a peer that lost its session with this side the reseal: it does not hold
+// the established epoch and never will, so the reseal waits for it to seal
+// under an epoch established after it, and its seals under the established
+// epoch meanwhile, a straggler's of the process it was before, show nothing.
+// Caller holds stateLock.
+func (self *peerEncryptionSession) oweLostPeerResealWithLock() {
+	self.peerSealsEstablished.Store(false)
+	self.resealOwedPastGeneration = 0
+	if established := self.establishedEpoch; established != nil && established.derivedTlsCipher != nil {
+		self.resealOwedPastGeneration = established.derivedTlsCipher.sealGeneration
+	}
+	self.oweResealWithLock()
+}
+
+// Owes the peer a reseal, until it seals under the established epoch, or the
+// one oweLostPeerResealWithLock waits for. Caller holds stateLock.
+func (self *peerEncryptionSession) oweResealWithLock() {
+	if !self.resealOwed.Swap(true) && self.establishedEpoch != nil && self.establishedEpoch.awaitingPeerSeal {
+		// a responder held on its prior seals under the established epoch
+		// from here (sealingEpochWithLock)
+		self.notifyRequiredCipherChangedWithLock()
 	}
 }
 

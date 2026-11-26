@@ -16052,8 +16052,10 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 
 	// Installs this Pack's sequence as its lane's head and starts its worker,
 	// which waits for predecessorExit, when it replaced a worker that has not
-	// exited, before it reads a Pack. Caller holds mutex.
-	openReceiveSequenceWithLock := func(predecessorExit <-chan struct{}) *ReceiveSequence {
+	// exited, before it reads a Pack. replacedLive says it replaced its lane's
+	// head while that was live, whether or not its worker had exited by now
+	// (ReceiveSequence.replacedLivePredecessor). Caller holds mutex.
+	openReceiveSequenceWithLock := func(predecessorExit <-chan struct{}, replacedLive bool) *ReceiveSequence {
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[r]new sequence %s\n", receivePack.SequenceId)
 		}
@@ -16081,6 +16083,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 		receiveSequence.contractHolders = self.contractHolders
 		receiveSequence.predecessorExit = predecessorExit
 		receiveSequence.started = predecessorExit == nil
+		receiveSequence.replacedLivePredecessor = replacedLive
 		self.receiveSequences[receiveSequenceId] = receiveSequence
 		self.headReceiveSequenceIds[headKey] = receiveSequenceId
 		self.activeReceiveSequences[receiveSequence] = true
@@ -16096,6 +16099,9 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 	}
 
 	initReceiveSequence := func(skip *ReceiveSequence) *ReceiveSequence {
+		// whether this Pack's sequence superseded its lane's head while that
+		// was live, which a wait for that head's exit below does not undo
+		replacedLive := false
 		for {
 			if self.beforeCreateReceiveSequenceForTest != nil {
 				self.beforeCreateReceiveSequenceForTest(receiveSequenceId)
@@ -16215,6 +16221,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					continue
 				}
 				headReceiveSequence.Cancel()
+				replacedLive = true
 				if timeout == 0 {
 					// The shared pump never waits for a retiring worker, and a
 					// drop here cost the newer sequence its first Packs until
@@ -16231,7 +16238,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 					if !headReceiveSequence.started && headReceiveSequence.predecessorExit != nil {
 						predecessorExit = headReceiveSequence.predecessorExit
 					}
-					receiveSequence = openReceiveSequenceWithLock(predecessorExit)
+					receiveSequence = openReceiveSequenceWithLock(predecessorExit, replacedLive)
 					self.mutex.Unlock()
 					return receiveSequence
 				}
@@ -16256,7 +16263,7 @@ func (self *ReceiveBuffer) Pack(receivePack *ReceivePack, timeout time.Duration)
 				continue
 			}
 
-			receiveSequence = openReceiveSequenceWithLock(nil)
+			receiveSequence = openReceiveSequenceWithLock(nil, replacedLive)
 			self.mutex.Unlock()
 			return receiveSequence
 		}
@@ -16597,6 +16604,16 @@ type ReceiveSequence struct {
 	// a later replacement waits for its exit rather than for predecessorExit.
 	// Guarded by the owning ReceiveBuffer's mutex.
 	started bool
+	// Whether this sequence replaced its lane's head while that was live: the
+	// peer abandoned a send sequence that this side still held, as a client
+	// restarted in place does, where a sequence the peer ended by its idle
+	// timeout is gone here first, the receive idle timeout being the shorter
+	// by default. The first handshake control it delivers says so to the
+	// session, and takes it (deliverEncryptedControlFrames): a new attempt of
+	// the initiator's over an established epoch, on such a carrier, is the
+	// peer's new session after it lost the old one. Set at creation, then
+	// owned by Run.
+	replacedLivePredecessor bool
 	// Whether this sequence has delivered an acknowledged Pack with a frame.
 	// Until it has, it holds no frame of the sender's below a Pack it holds,
 	// and its selective acks and its requests for a missing contract say so
@@ -18981,7 +18998,14 @@ func (self *ReceiveSequence) deliverEncryptedControlFrames(frames []*protocol.Fr
 			}
 			continue
 		}
-		self.client.encryptionSessionManager.DeliverEncryptedControl(self.source.SourceId, senderRole.complement(), ec)
+		// the first handshake control of a carrier that replaced a live one
+		// says so, once (replacedLivePredecessor)
+		replacedLive := false
+		if ec.ControlType == protocol.EncryptedControlType_EncryptedControlHandshake {
+			replacedLive = self.replacedLivePredecessor
+			self.replacedLivePredecessor = false
+		}
+		self.client.encryptionSessionManager.deliverEncryptedControlFromCarrier(self.source.SourceId, senderRole.complement(), ec, replacedLive)
 	}
 	return passthrough
 }

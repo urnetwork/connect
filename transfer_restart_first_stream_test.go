@@ -417,6 +417,50 @@ func TestReceiveBufferReplacementOfAWaitingReplacementWaitsForTheRunningWorker(t
 	})
 }
 
+// A sequence that supersedes its lane's head while that is live, as a client
+// restarted in place supersedes its previous process's, says so
+// (replacedLivePredecessor), which its first handshake control tells the
+// session. A sequence that opens its lane does not, nor does one whose lane's
+// head ended by its idle timeout before it came, as a peer's sequence that
+// ended by its own idle timeout has here, the receive idle timeout being the
+// shorter.
+func TestReceiveBufferMarksASequenceThatReplacedALiveOne(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newReplacementFixture(t)
+		firstSequenceId := NewId()
+		f.offer(firstSequenceId, 0, "first-0")
+		synctest.Wait()
+		f.takeDelivered()
+		if first := f.sequence(firstSequenceId); first == nil || first.replacedLivePredecessor {
+			t.Fatal("the lane's first sequence says it replaced a live one")
+		}
+
+		secondSequenceId := NewId()
+		f.offer(secondSequenceId, 0, "second-0")
+		synctest.Wait()
+		if got := f.takeDelivered(); len(got) != 1 || got[0] != "second-0" {
+			t.Fatalf("the replacement delivered %v", got)
+		}
+		if second := f.sequence(secondSequenceId); second == nil || !second.replacedLivePredecessor {
+			t.Fatal("the sequence that replaced the live head does not say so")
+		}
+
+		time.Sleep(DefaultClientSettings().ReceiveBufferSettings.IdleTimeout + time.Second)
+		synctest.Wait()
+		if f.sequence(secondSequenceId) != nil {
+			t.Fatal("the idle sequence did not end")
+		}
+		thirdSequenceId := NewId()
+		f.offer(thirdSequenceId, 0, "third-0")
+		synctest.Wait()
+		f.takeDelivered()
+		if third := f.sequence(thirdSequenceId); third == nil || third.replacedLivePredecessor {
+			t.Fatal("a sequence on a lane whose head had ended says it replaced a live one")
+		}
+	})
+}
+
 // Closing the buffer ends a replacement still waiting for the worker it
 // replaced. It exits at once without reading its Packs, since it never ran,
 // and the buffer's join returns only once the held worker has exited too.
@@ -525,6 +569,8 @@ type restartFirstStreamPair struct {
 	// while set, the edge's writes toward the listener that it answers true for
 	// are lost; it borrows each wire message
 	dropTowardListener func([]byte) bool
+	// the same for the listener's writes toward the edge
+	dropTowardEdge func([]byte) bool
 
 	edgeSend    chan []byte
 	edgeReceive chan []byte
@@ -595,6 +641,10 @@ func newRestartFirstStreamPair(
 				return
 			case message := <-towardEdge:
 				if pair.isEdgeDown() {
+					MessagePoolReturn(message)
+					continue
+				}
+				if drop := pair.dropTowardEdgeFunc(); drop != nil && drop(message) {
 					MessagePoolReturn(message)
 					continue
 				}
@@ -722,6 +772,20 @@ func (self *restartFirstStreamPair) setDropTowardListener(drop func([]byte) bool
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.dropTowardListener = drop
+}
+
+func (self *restartFirstStreamPair) dropTowardEdgeFunc() func([]byte) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.dropTowardEdge
+}
+
+// Loses, from here, every write of the listener's toward the edge that drop
+// answers true for, as setDropTowardListener does the other way.
+func (self *restartFirstStreamPair) setDropTowardEdge(drop func([]byte) bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.dropTowardEdge = drop
 }
 
 // Stops the edge as a killed process stops, joins it, and answers the identity
@@ -1571,4 +1635,90 @@ func TestRestartedClientGetsItsListenersAnswerWithoutTheListenersBackoff(t *test
 	}
 	t.Logf("the restarted edge's open reached the listener %s after the restart, and the answer reached the edge %s after it",
 		openTime, time.Since(startTime))
+}
+
+// The listener holds a write the old process never acknowledged when the edge
+// restarts in place, and writes nothing more toward it. Nothing the listener
+// sealed under the old session reaches the restarted edge, which the pair loses
+// until the edge has established its new session, so the edge nacks nothing,
+// and no Pack of the listener's sequence reaches it out of order, so it never
+// says it lost that sequence (Ack.nothing_delivered): neither recovery that
+// brought such a write before has a signal. The restarted edge's first open
+// comes on a send sequence that replaces the one the listener still holds,
+// with the ClientHello of its new session, which tells the listener the edge
+// lost its session: the listener reseals the held write once the edge seals
+// under the new session, and it reaches the edge within ReachTimeout, the
+// listener's timers set past it. Before, it waited for its timer. That is the
+// restart's no-nack shape: in sidecar's restart test, a restarted edge that
+// read the listener's old Packs as their own timers resent them, once it held
+// the new session, held the listener's answer behind the rest of that backlog
+// for about 0.65 s.
+func TestListenerBringsItsBacklogToARestartedClientThatNeverNacks(t *testing.T) {
+	settings := defaultRestartFirstStreamTestSettings()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*settings.StepTimeout)
+	defer cancel()
+	var losses, nacks atomic.Int32
+	// the restarted edge's session with the listener
+	var listenerId atomic.Pointer[Id]
+	var watching, dropping atomic.Bool
+	edgeEstablished := make(chan struct{}, 1)
+	coldTimers := func(s *ClientSettings) {
+		// past ReachTimeout, so only a recovery brings the held write within it
+		s.SendBufferSettings.MinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.RttMinResendInterval = settings.ColdResendInterval
+		s.SendBufferSettings.MaxResendInterval = settings.ColdResendInterval
+	}
+	pair := newRestartFirstStreamPair(t, ctx, settings, func(s *ClientSettings) {
+		coldTimers(s)
+		s.EncryptionSettings.lostPeerReplacedCarrierForTest = func(Id, sequenceTlsRole) {
+			losses.Add(1)
+		}
+		s.EncryptionSettings.unknownWrapNackHandledForTest = func(Id, sequenceTlsRole, Id) {
+			nacks.Add(1)
+		}
+	}, func(s *ClientSettings) {
+		coldTimers(s)
+		s.EncryptionSettings.afterEpochEstablishedForTest = func(peerId Id, role sequenceTlsRole) {
+			watched := listenerId.Load()
+			if watching.Load() && role == sequenceTlsRoleClient && watched != nil && *watched == peerId {
+				// from here the listener's seals are under the new session
+				dropping.Store(false)
+				restartRaceSignal(edgeEstablished)
+			}
+		}
+	})
+	defer pair.close()
+	listenerId.Store(&pair.listenerId)
+	pair.setDropTowardEdge(func(message []byte) bool {
+		return dropping.Load() && restartRaceWrapped(message)
+	})
+
+	kept, key := pair.runToRestart()
+	dropping.Store(true)
+	watching.Store(true)
+	// the old process never acknowledges it
+	pair.listenerSends("held", key)
+	startTime := time.Now()
+	pair.startEdge(kept)
+	pair.edgeSends("open after the restart")
+	if _, ok := restartFirstStreamWait(pair.listenerGot, "open after the restart", startTime.Add(settings.ReachTimeout)); !ok {
+		t.Fatalf("the restarted edge's open did not reach the listener within %s", settings.ReachTimeout)
+	}
+	// the open went sealed under the new session, which the edge established
+	// before it
+	restartRaceAwait(t, edgeEstablished, settings.StepTimeout, "the restarted edge's establishment of its new session")
+	if _, ok := restartFirstStreamWait(pair.edgeGot, "held", startTime.Add(settings.ReachTimeout)); !ok {
+		t.Fatalf("the held write did not reach the restarted edge within %s (losses %d, nacks %d, reseal writes %d)",
+			settings.ReachTimeout, losses.Load(), nacks.Load(), pair.listener.SendRecoveryStats().ResealWriteCount)
+	}
+	if n := nacks.Load(); n != 0 {
+		t.Fatalf("the restarted edge nacked %d times: the scenario did not happen", n)
+	}
+	if n := losses.Load(); n != 1 {
+		t.Fatalf("the listener took the restarted edge's new session as a lost one %d times, want once", n)
+	}
+	if pair.listener.SendRecoveryStats().ResealWriteCount == 0 {
+		t.Fatal("the held write arrived without a reseal")
+	}
+	t.Logf("the held write reached the restarted edge %s after the restart", time.Since(startTime))
 }
