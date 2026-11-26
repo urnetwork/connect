@@ -12259,15 +12259,19 @@ paths:
       summary: The caller's network's label and alias
       description: |
         The label of the network the bearer signs in to, allocated on the
-        first request that needs one, and the network's live alias: the names
+        first request that needs one, the network's live alias, and the
+        aliases it changed or released in their 90 days of retiring: the names
         a sidecar resolves its networks by in `.ur` names, git-remote-ur, its
         addresses and `network:<net>` (sidecar DESIGN.md §12.5). The network
         is the credential's own. The route reads no parameter and no body,
         so no request names another network. A label is 10 characters,
         `[a-z][a-z0-9]{9}`, drawn at random and never derived from the
         network id; it never changes and is never given to another network.
-        `alias` is absent while the network has no live alias. Both are under
-        the environment's dns root, the one `GET /network/dns` serves.
+        `alias` is absent while the network has no live alias. Each retiring
+        alias comes with the time it tombstones, after which it names no
+        network ever again, and a sidecar keeps it until then;
+        `retiring_aliases` is absent while there is none. All are under the
+        environment's dns root, the one `GET /network/dns` serves.
 
         Any credential of the network reads it, a sidecar's `strict_exp`
         token among them; a sidecar's forwarding client (`forward_only`) is
@@ -13545,9 +13549,10 @@ paths:
       summary: Read the network's zone
       description: |
         The network's label, allocated on the first request that needs one, its
-        alias, the zone's version (the serial of its last write) and every RRset
-        the zone holds, with `dns_entries`' count and the network's limit, -1 for
-        none. Read roles by the role gate. 503 while no dns root is configured or
+        alias, the aliases it changed or released in their 90 days of retiring
+        with the time each tombstones, the zone's version (the serial of its
+        last write) and every RRset the zone holds, with `dns_entries`' count and
+        the network's limit, -1 for none. Read roles by the role gate. 503 while no dns root is configured or
         the zone tables are not available. Each custom host carries its state, CAA
         mode and readiness: an active host is ready once every lb interface has
         loaded the custom-host map version it entered with and passed the dns
@@ -17077,10 +17082,12 @@ paths:
       summary: Read the caller's view of its network's zone
       description: |
         The network's label, allocated on the first request that needs one, its
-        alias and the zone's version, and the RRsets of the owners on whose host
-        the caller holds §8's `publish` or `admin` on `dns:<host>`: never the
-        whole zone, which `GET /network/dns` keeps to read roles. While the gate
-        has not loaded the network the view holds no RRset.
+        alias, its retiring aliases with the time each tombstones, which the
+        sidecar's label table keeps until then, and the zone's version, and the
+        RRsets of the owners on whose host the caller holds §8's `publish` or
+        `admin` on `dns:<host>`: never the whole zone, which `GET /network/dns`
+        keeps to read roles. While the gate has not loaded the network the view
+        holds no RRset.
       operationId: dnsZone
       security:
         - ServiceTokenAuth: []
@@ -33072,6 +33079,22 @@ components:
         alias:
           description: The network's live alias, a label with no root. Absent while the network has none.
           type: string
+        retiring_aliases:
+          description: The aliases the network changed or released, in their 90 days of retiring, by alias. Absent while there is none.
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkLabelRetiringAlias"
+    NetworkLabelRetiringAlias:
+      type: object
+      required: [alias, tombstone_time]
+      properties:
+        alias:
+          description: The retiring alias, a label with no root.
+          type: string
+        tombstone_time:
+          description: When its 90 days of retiring end and it tombstones, naming no network ever again.
+          type: string
+          format: date-time
     DnsZone:
       type: object
       required: [network_id, root, label, version, record_sets]
@@ -33087,6 +33110,11 @@ components:
         alias_certified:
           description: A certificate names the live alias, so it answers the label's records.
           type: boolean
+        retiring_aliases:
+          description: The aliases the network changed or released, in their 90 days of retiring, by alias. Absent while there is none.
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkLabelRetiringAlias"
         version:
           type: integer
           format: int64
@@ -33109,6 +33137,11 @@ components:
         alias_certified:
           description: A certificate names the live alias, so it answers the label's records.
           type: boolean
+        retiring_aliases:
+          description: The aliases the network changed or released, in their 90 days of retiring, by alias. Absent while there is none.
+          type: array
+          items:
+            $ref: "#/components/schemas/NetworkLabelRetiringAlias"
         version:
           type: integer
           format: int64
