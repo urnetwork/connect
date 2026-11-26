@@ -26,7 +26,7 @@ fi
 
 provider_label="com.urnetwork.provider"
 update_label="com.urnetwork.provider.update"
-api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
+api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urfoundation/sn}"
 default_tools_url="https://raw.githubusercontent.com/urnetwork/connect/main/scripts/Provider_Install_macOS.sh"
 tools_url="${URNETWORK_TOOLS_URL:-$default_tools_url}"
 state_dir="$HOME/.urnetwork"

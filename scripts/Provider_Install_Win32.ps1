@@ -7,7 +7,7 @@
     Installs the URnetwork provider for the current Windows user.
 
 .DESCRIPTION
-    Downloads the provider from the urnetwork/build GitHub release, checks its
+    Downloads the provider from the urfoundation/sn GitHub release, checks its
     SHA-256 digest, installs it as urnetwork.exe in
     %LOCALAPPDATA%\urnetwork\provider with urnet-tools, adds that folder to the
     user PATH, and turns on automatic updates. No administrator rights needed.
@@ -70,7 +70,7 @@
 
 .PARAMETER ReleaseApiUrl
     GitHub API URL of the repository whose releases hold the provider (for
-    mirrors and testing). Defaults to https://api.github.com/repos/urnetwork/build,
+    mirrors and testing). Defaults to https://api.github.com/repos/urfoundation/sn,
     or $env:URNETWORK_RELEASE_API_URL when set.
 
 .LINK
@@ -96,7 +96,7 @@ param(
 );
 
 $DefaultScriptsBaseUrl = "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts"
-$DefaultReleaseApiUrl = "https://api.github.com/repos/urnetwork/build"
+$DefaultReleaseApiUrl = "https://api.github.com/repos/urfoundation/sn"
 
 # Test-YesAnswer reads a [Y/n] prompt answer: yes is the default, so an empty
 # answer (plain Enter), "y" and "yes" all mean yes.

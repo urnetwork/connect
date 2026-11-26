@@ -25,7 +25,7 @@ script_url="${URNETWORK_TOOLS_URL:-${URNETWORK_TOOLS_SCRIPT_URL:-$default_script
 # raise with every change to this script: `update' never installs a urnet-tools
 # with a lower number, so a revert or an old mirror can't downgrade installs
 tools_version=3
-api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urnetwork/build}"
+api_base="${URNETWORK_API_BASE:-https://api.github.com/repos/urfoundation/sn}"
 default_interval="6h"
 # the service runs without URNETWORK_STATE_DIR, so the miner this script runs
 # (sign-in, first-start registration) must use the same ~/.urnetwork
@@ -1543,7 +1543,7 @@ do_install ()
     if [ -z "$arch" ]; then
         pr_err "This installer has no URnetwork build for '%s' processors" "$(uname -m)"
         pr_err "Supported: x86_64, i686, aarch64 (64-bit ARM), armv7l (32-bit ARM)"
-        pr_err "Other builds (e.g. MIPS routers) are in the release: https://github.com/urnetwork/build/releases/latest"
+        pr_err "Other builds (e.g. MIPS routers) are in the release: https://github.com/urfoundation/sn/releases/latest"
         exit 1
     fi
 
@@ -1581,7 +1581,7 @@ do_install ()
 
     if ! network_fetch "$api_url" > "$release_json"; then
         pr_err "Failed to fetch release information for tag: %s" "$tag"
-        pr_err "Check your internet connection, or that the tag exists: https://github.com/urnetwork/build/releases"
+        pr_err "Check your internet connection, or that the tag exists: https://github.com/urfoundation/sn/releases"
         exit 1
     fi
 

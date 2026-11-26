@@ -166,7 +166,7 @@ if ($OnWindows) {
 $DefaultScriptsBaseUrl = "https://raw.githubusercontent.com/urnetwork/connect/refs/heads/main/scripts"
 $GithubURLBase = $env:URNETWORK_RELEASE_API_URL
 if (-not $GithubURLBase) {
-    $GithubURLBase = "https://api.github.com/repos/urnetwork/build"
+    $GithubURLBase = "https://api.github.com/repos/urfoundation/sn"
 }
 $GithubURLBase = $GithubURLBase.TrimEnd('/')
 
