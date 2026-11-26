@@ -2353,16 +2353,29 @@ func (self *peerEncryptionSession) sendIdentityProofOnce(e *tlsHandshakeEpoch) {
 
 // Records that the send path has taken this side's identity proof for epoch e,
 // so the epoch can seal (`sealingEpochWithLock`), and wakes the senders waiting
-// for a cipher when it is the established epoch. Runs on the send worker.
+// for a cipher when it is the established epoch. A reseal owed to a peer seen
+// sealing under that epoch waited for this (`observePeerSealed`), and is taken
+// here, since what it writes again now seals under the epoch the peer holds.
+// Runs on the send worker.
 func (self *peerEncryptionSession) markIdentityProofHandedOff(e *tlsHandshakeEpoch) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	if !e.awaitingProofHandOff {
-		return
-	}
-	e.awaitingProofHandOff = false
-	if self.establishedEpoch == e {
+	generation := func() uint8 {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if !e.awaitingProofHandOff {
+			return 0
+		}
+		e.awaitingProofHandOff = false
+		if self.establishedEpoch != e {
+			return 0
+		}
 		self.notifyRequiredCipherChangedWithLock()
+		if !self.resealOwed.Load() || !self.peerSealsEstablished.Load() {
+			return 0
+		}
+		return self.takeResealWithLock()
+	}()
+	if generation != 0 {
+		self.requestReseal(generation)
 	}
 }
 
@@ -5687,11 +5700,14 @@ func (self *peerEncryptionSession) handleUnknownWrapNack(nackEpochId Id) {
 //     Packs it last wrote in plaintext (`requestLostPeerRewrite`).
 //
 // While a reseal is owed, a responder holding a new epoch seals under it rather
-// than under its prior (`sealingEpochWithLock`). One established epoch is
-// resealed under at most once, and only Packs last sealed before the peer was
-// seen sealing under it are written again, so repeated or forged nacks cost a
-// lock each once that is done, and each Pack goes at most once more for a lost
-// peer.
+// than under its prior (`sealingEpochWithLock`). A reseal is taken only once the
+// established epoch seals, after this side's own identity proof for it is on the
+// send path, which the peer can be seen sealing under it before: until then the
+// reseal stays owed, and the hand-off takes it (`markIdentityProofHandedOff`).
+// One established epoch is resealed under at most once, and only Packs last
+// sealed before the peer was seen sealing under it are written again, so
+// repeated or forged nacks cost a lock each once that is done, and each Pack
+// goes at most once more for a lost peer.
 func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 	lostPeer := false
 	generation := func() uint8 {
@@ -5701,9 +5717,11 @@ func (self *peerEncryptionSession) oweResealForNack(nackEpochId Id) {
 		prior := self.priorEstablishedEpoch
 		switch {
 		case established != nil && nackEpochId != (Id{}) && established.epochId == nackEpochId:
-			if self.peerSealsEstablished.Load() {
+			if self.peerSealsEstablished.Load() && !established.awaitingProofHandOff {
 				return self.takeResealWithLock()
 			}
+			// until the peer seals under the epoch, or, when it has, until
+			// this side's proof is on the send path (markIdentityProofHandedOff)
 			self.oweResealWithLock()
 		case established != nil && nackEpochId != (Id{}) &&
 			(prior != nil && prior.epochId == nackEpochId || nackEpochId.LessThan(established.epochId)):
@@ -5805,6 +5823,14 @@ func (self *peerEncryptionSession) observePeerSealed(cipher *sequenceCipher) {
 			self.notifyRequiredCipherChangedWithLock()
 		}
 		if !self.resealOwed.Load() {
+			return 0
+		}
+		if self.establishedEpoch.awaitingProofHandOff {
+			// The peer holds this side's proof, but the send path has yet to
+			// take it here, and until it has this side seals under its prior
+			// epoch, or under nothing (sealingEpochWithLock): a reseal now would
+			// write again under that, and the epoch is resealed under at most
+			// once. The hand-off takes the reseal (markIdentityProofHandedOff).
 			return 0
 		}
 		return self.takeResealWithLock()

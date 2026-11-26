@@ -799,6 +799,63 @@ func TestEpochSealsOnlyOnceItsOwnIdentityProofIsHandedOff(t *testing.T) {
 	}
 }
 
+// The peer can verify this side's identity proof, establish, and seal under the
+// new epoch before this side's worker has recorded that the send path took that
+// proof, and until it has, this side seals under its prior epoch. A reseal taken
+// then compared what went out against the prior's cipher, and so wrote nothing
+// again, and an epoch is resealed under at most once: what went out under the
+// prior waited for its timers and the lane's deferrals, 1.2 s for a restarted
+// client's open in sidecar's restart test. So a reseal owed when the peer is
+// first seen sealing under the epoch, whether a nack that named no epoch or the
+// peer's re-handshake on a carrier that replaced a live one owed it, or owed by
+// a nack naming the epoch from a peer already sealing under it, waits for the
+// hand-off, which takes it, once, with the epoch sealing.
+func TestResealWaitsForThisSidesIdentityProofHandOff(t *testing.T) {
+	for _, owedBy := range []string{"nack naming no epoch", "replaced carrier", "nack naming the epoch"} {
+		r := newResealTestSession()
+		old := r.establish()
+		// the peer's previous process sealed under the old epoch
+		r.session.observePeerSealed(old.derivedTlsCipher)
+		switch owedBy {
+		case "nack naming no epoch":
+			r.session.handleUnknownWrapNack(Id{})
+		case "replaced carrier":
+			r.session.oweResealForLostPeer()
+		}
+		e := establishTestEpoch(r.session, true)
+		// the peer's first seal under the new epoch, ahead of the hand-off here
+		r.session.observePeerSealed(e.derivedTlsCipher)
+		if owedBy == "nack naming the epoch" {
+			r.session.handleUnknownWrapNack(e.epochId)
+		}
+		if requests := r.takeRequests(); len(requests) != 0 {
+			t.Fatalf("%s: a reseal was asked for before this side's proof was handed off: %v", owedBy, requests)
+		}
+		if !r.session.resealOwed.Load() {
+			t.Fatalf("%s: the reseal is no longer owed", owedBy)
+		}
+		var sealing *sequenceCipher
+		r.session.settings.resealRequestedForTest = func(_ Id, _ sequenceTlsRole, sealGeneration uint8) {
+			sealing = r.session.Cipher()
+			r.requestedGenerations = append(r.requestedGenerations, sealGeneration)
+		}
+		r.session.markIdentityProofHandedOff(e)
+		if requests := r.takeRequests(); len(requests) != 1 || requests[0] != e.derivedTlsCipher.sealGeneration {
+			t.Fatalf("%s: reseals %v at the hand-off, want one under generation %d", owedBy, requests, e.derivedTlsCipher.sealGeneration)
+		}
+		if sealing != e.derivedTlsCipher {
+			t.Fatalf("%s: the reseal was asked for while the new epoch did not seal", owedBy)
+		}
+		// a later seal, a copy of the nack and a repeated hand-off ask for nothing more
+		r.session.observePeerSealed(e.derivedTlsCipher)
+		r.session.handleUnknownWrapNack(e.epochId)
+		r.session.markIdentityProofHandedOff(e)
+		if requests := r.takeRequests(); len(requests) != 0 {
+			t.Fatalf("%s: the new epoch was resealed under again: %v", owedBy, requests)
+		}
+	}
+}
+
 // A responder that holds a prior epoch keeps sealing under it when a new epoch
 // establishes, until the peer is seen sealing under the new one, which it does
 // only once it has verified the responder's proof: a wrap under the prior
