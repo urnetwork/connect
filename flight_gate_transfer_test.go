@@ -364,9 +364,13 @@ func newFlightGatePeerPair(
 func (self *flightGatePeerPair) receiveRoute(t testing.TB, transportType TransportType) Route {
 	t.Helper()
 	route := make(Route, 32)
-	self.receiver.RouteManager().UpdateTransport(
+	properties := TransferCarrierProperties{}
+	if transportType == TransportTypeP2p {
+		properties = properties.WithAuthenticatedSource(self.senderId)
+	}
+	self.receiver.RouteManager().UpdateTransportWithProperties(
 		NewReceiveGatewayTransportWithType(transportType),
-		[]Route{route},
+		[]Route{route}, properties,
 	)
 	t.Cleanup(func() { drainFlightGateRoute(route) })
 	return route
