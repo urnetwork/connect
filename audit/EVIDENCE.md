@@ -75,7 +75,7 @@ dispositions, repository revisions and reproduction commands.
 | P2 | The AEAD is never used before the TLS handshake has completed **and** the peer's identity proof has verified | §3.5 |
 | P3 | An active MITM that does not control identity-key distribution cannot obtain a usable session: the proof is bound to the TLS exporter of the session it signs | §3.4.3, §4.3 |
 | P4 | Under Required, no plaintext application data in either direction, including during rekeys | §3.7 |
-| P5 | Post-quantum hybrid key agreement (X25519MLKEM768) is preferred, and the negotiated group is observable | §3.2, §4.1 |
+| P5 | Required mode enforces hybrid key agreement. Opportunistic mode prefers X25519MLKEM768. The negotiated group is observable | §3.2, §4.1 |
 | P6 | The single receive loop never blocks on TLS state, so one peer cannot stall all peers | §4.7 |
 | P7 | The inner (sealed) `TransferPath` is authenticated; tampering with the outer routing path is detected | §3.3 |
 
@@ -1410,7 +1410,7 @@ is described.
 |---|---|---|---|
 | L1 | The operator distributes identity keys; first-contact substitution by a consistent operator is not detected | Design limit. Next step: multi-operator plurality read | §3.4.5, §4.3; `DESIGNNOTES2.md` §3; `DESIGNNOTES3.md` §8, §10 |
 | L2 | Opportunistic mode downgrades to plaintext under interference, including a forged unknown-wrap nack | By design. Required is the enforcing mode | §3.1, §3.9, §4.1 |
-| L3 | Signed-history gate is Required-only. On fetch error it accepts the contract key without consulting the pin. Pin extension accepts any chain whose head is past the pinned generation (a rotation). TOFU when no signer is pinned. | Open — review requested | §3.4.5 |
+| L3 | Required-mode history checks use the durable peer pin. On a history fetch error, a conflicting key is rejected. A signed rotation must preserve the pinned generation. First contact without a pin retains the documented trust and availability limits. | First-contact policy remains for review | §3.4.5 |
 | L4 | Random-nonce AES-GCM with no per-key invocation counter or volume/time rekey; one key serves both directions of a session | Open — review requested | §4.8.1 |
 | L5 | Plaintext surfaces inside the transport: the control plane, `EncryptedControl` frames, acks (accepted plaintext in every mode), the outer routing header, sizes and timing | By design | §3.8, §4.6 |
 | L6 | AES-GCM only. CPUs without AES instructions use table-based software AES. | Open — review requested | §4.4 |
