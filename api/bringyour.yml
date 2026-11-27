@@ -3210,6 +3210,8 @@ paths:
           $ref: "#/components/responses/ComputeScope"
         "429":
           $ref: "#/components/responses/ComputeHeld"
+        "451":
+          $ref: "#/components/responses/ComputeRegionRefused"
         "503":
           $ref: "#/components/responses/ComputeUnavailable"
 
@@ -3287,6 +3289,8 @@ paths:
           $ref: "#/components/responses/ComputeScope"
         "429":
           $ref: "#/components/responses/ComputeHeld"
+        "451":
+          $ref: "#/components/responses/ComputeRegionRefused"
         "503":
           $ref: "#/components/responses/ComputeUnavailable"
 
@@ -3334,6 +3338,8 @@ paths:
           $ref: "#/components/responses/ComputeScope"
         "429":
           $ref: "#/components/responses/ComputeHeld"
+        "451":
+          $ref: "#/components/responses/ComputeRegionRefused"
         "503":
           $ref: "#/components/responses/ComputeUnavailable"
 
@@ -3499,6 +3505,8 @@ paths:
           $ref: "#/components/responses/ComputeInsufficientQuota"
         "403":
           $ref: "#/components/responses/ComputeScope"
+        "451":
+          $ref: "#/components/responses/ComputeRegionRefused"
         "503":
           $ref: "#/components/responses/ComputeUnavailable"
     get:
@@ -3753,6 +3761,8 @@ paths:
           $ref: "#/components/responses/ComputeScope"
         "404":
           $ref: "#/components/responses/ComputeNotFound"
+        "451":
+          $ref: "#/components/responses/ComputeRegionRefused"
         "503":
           $ref: "#/components/responses/ComputeUnavailable"
 
@@ -19400,6 +19410,21 @@ paths:
           (`rota` or `counsel`, with counsel's contact) and the hour's end. A
           page the pager did not take answers `paged` false, the case
           standing for the clock pass to page.
+        - `compute_suspend` {network_id, reason}: reviewer. Suspends the
+          network's compute (DESIGN-COMPUTE §17.2, D-CABUSE-2): every remote
+          call, search and enclave create and start is refused `suspended`
+          at the broker, and the network's enclaves are stopped. `reason` is
+          one class: `mining`, `scanning`, `spam`, `fraud`,
+          `provider_complaint`, `harmful_content`, `terms` or `takedown`,
+          kept with the reviewer's id and never shown to the network. The
+          network keeps its balance and its records. A network held for that
+          reason already is answered as it stands. Answers the hold, whether
+          this changed it, whether every broker reads it at once
+          (`projected`; else within 30 s) and what the enclaves' stop came to.
+        - `compute_resume` {network_id}: reviewer. Ends the network's compute
+          suspension; nothing restarts on its own, its enclaves waiting for
+          their keepers or sponsors. A network not held is answered as it
+          stands.
 
         Every refusal of the credential answers one 403 "Forbidden.". 503
         with Retry-After when a store, a mailer or an effect did not answer.
@@ -19744,7 +19769,23 @@ components:
       description: |
         `scope`, `disclosure_required` or `suspended`: the token is no admitted
         sidecar's of its network, a disclosure is not acknowledged (§2.8), or
-        the network's compute is suspended (§9.9).
+        the network's compute is suspended (§9.9). At an admission (a remote
+        call, a search, an enclave's create or start), `suspended` with reason
+        `standing` is DESIGN §21's suspension of the network, and with reason
+        `hold` an operator's suspension of its compute (§17.2), which says
+        nothing of why; the network keeps its balance and its records, and a
+        resume restarts nothing.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ComputeRefusal"
+    ComputeRegionRefused:
+      description: |
+        `region_refused`: the address the request came from is in a region
+        compute is refused to (§17.2's sanctioned users), as the broker's geo
+        database places it. The address is checked in memory and kept
+        nowhere. An admission whose region cannot be checked answers `503`
+        `unavailable` instead.
       content:
         application/json:
           schema:
