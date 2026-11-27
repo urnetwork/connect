@@ -662,6 +662,10 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 // retains unscaled defaults; the one-target API preserves process defaults.
 func DefaultProviderLocalUserNatSettingsWithMemoryTargets(targetByteCount ByteCount, memoryTargetByteCount ByteCount) *LocalUserNatSettings {
 	settings := defaultLocalUserNatSettingsWithMemoryTarget(memoryTargetByteCount)
+	policy := newProviderNatDialPolicy(processProviderLocalNetworks)
+	settings.TcpBufferSettings.providerDialPolicy = policy
+	settings.UdpBufferSettings.providerDialPolicy = policy
+	settings.IcmpBufferSettings.providerDialPolicy = policy
 	if 0 < targetByteCount {
 		// the provider target has its own gate, independent of the process
 		// budget. Half the target sizes the egress nat flow tables (60% udp /
@@ -894,24 +898,28 @@ func newAdmittedLocalUserNat(ctx context.Context, clientTag string, settings *Lo
 		if copied.TcpBufferSettings == nil {
 			copied.TcpBufferSettings = DefaultTcpBufferSettings()
 		}
-		if copied.UdpBufferSettings != nil && copied.UdpBufferSettings.Log == nil {
-			udpCopied := *copied.UdpBufferSettings
+		// Each NAT owns one policy slot. Attaching a provider after creation
+		// can safely install its guard without changing another NAT's settings.
+		policy := &providerNatDialPolicy{}
+		policy.current.Store(copied.TcpBufferSettings.providerDialPolicy.guard())
+		udpCopied, tcpCopied := *copied.UdpBufferSettings, *copied.TcpBufferSettings
+		udpCopied.providerDialPolicy, tcpCopied.providerDialPolicy = policy, policy
+		if udpCopied.Log == nil {
 			udpCopied.Log = log
-			copied.UdpBufferSettings = &udpCopied
 		}
-		if copied.TcpBufferSettings != nil && copied.TcpBufferSettings.Log == nil {
-			tcpCopied := *copied.TcpBufferSettings
+		if tcpCopied.Log == nil {
 			tcpCopied.Log = log
-			copied.TcpBufferSettings = &tcpCopied
 		}
+		copied.UdpBufferSettings, copied.TcpBufferSettings = &udpCopied, &tcpCopied
 		if copied.IcmpBufferSettings == nil {
 			copied.IcmpBufferSettings = DefaultIcmpBufferSettings()
 		}
-		if copied.IcmpBufferSettings.Log == nil {
-			icmpCopied := *copied.IcmpBufferSettings
+		icmpCopied := *copied.IcmpBufferSettings
+		icmpCopied.providerDialPolicy = policy
+		if icmpCopied.Log == nil {
 			icmpCopied.Log = log
-			copied.IcmpBufferSettings = &icmpCopied
 		}
+		copied.IcmpBufferSettings = &icmpCopied
 		// an exit whose egress is a proxy dials tcp through it and udp only
 		// through the owner's packet endpoint (ConnectSettings.DialContext), and
 		// sends no icmp echo, whose socket would be this host's
@@ -2214,7 +2222,9 @@ func applyPathMtu(
 }
 
 type UdpBufferSettings struct {
-	MemoryBudget *TransferMemoryBudget
+	// Snapshot checked again when a provider flow opens its numeric destination.
+	providerDialPolicy *providerNatDialPolicy
+	MemoryBudget       *TransferMemoryBudget
 	// Shadow observes the socket default; mirror applies the first datagram's
 	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
 	EgressTtlMode EgressTtlMode
@@ -3659,7 +3669,7 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.log.V(2).Infof("[init]udp connect\n")
 	dialCtx, egressDial := self.egressTarget.dialContext(self.ctx)
 	dialStart := time.Now()
-	socket, err := self.udpBufferSettings.DialContext(
+	socket, err := dialProviderNatDestination(self.udpBufferSettings.providerDialPolicy, &self.udpBufferSettings.ConnectSettings, self.provideMode,
 		dialCtx,
 		"udp",
 		self.IpPath().DestinationHostPort(),
@@ -4180,7 +4190,9 @@ func (self *StreamState) udpPacket(payload []byte) []byte {
 }
 
 type TcpBufferSettings struct {
-	MemoryBudget *TransferMemoryBudget
+	// Snapshot checked again when a provider flow opens its numeric destination.
+	providerDialPolicy *providerNatDialPolicy
+	MemoryBudget       *TransferMemoryBudget
 	// Shadow observes the socket default; mirror applies the first SYN's
 	// TTL/hop limit. Native (including the zero value) leaves sockets untouched.
 	EgressTtlMode EgressTtlMode
@@ -5845,7 +5857,7 @@ func (self *TcpSequence) Run() {
 		var dialCtx context.Context
 		dialCtx, egressDial = self.egressTarget.dialContext(self.ctx)
 		dialStart := time.Now()
-		socket, err = self.tcpBufferSettings.DialContext(
+		socket, err = dialProviderNatDestination(self.tcpBufferSettings.providerDialPolicy, &self.tcpBufferSettings.ConnectSettings, self.provideMode,
 			dialCtx,
 			"tcp",
 			self.IpPath().DestinationHostPort(),
@@ -8325,7 +8337,12 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 	// the security policy runs a background scan goroutine; scope it to this provider (a child of
 	// the client ctx) so Close stops it, rather than leaking it for the life of the client
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
-	securityPolicy := newNatProviderSecurityPolicy(cancelCtx, settings, memory.budget != nil)
+	providerPolicy := newNatProviderSecurityPolicy(cancelCtx, settings, memory.budget != nil)
+	if reverse, ok := providerPolicy.(*reverseSecurityPolicy); ok {
+		if inner, ok := reverse.policy.(*securityPolicy); ok && inner.providerLocal != nil {
+			localUserNat.settings.TcpBufferSettings.providerDialPolicy.current.Store(inner.providerLocal)
+		}
+	}
 	userNatProvider := &RemoteUserNatProvider{
 		memory:                   memory,
 		retainedMemoryBudget:     memory.budget,
@@ -8334,10 +8351,10 @@ func newAdmittedRemoteUserNatProvider(client *Client, localUserNat *LocalUserNat
 		client:                   client,
 		cancel:                   cancel,
 		localUserNat:             localUserNat,
-		securityPolicy:           securityPolicy,
+		securityPolicy:           providerPolicy,
 		buildVersion:             BuildVersion(),
-		securityPolicyHash:       SecurityPolicyHash(securityPolicy),
-		securityPolicyGeneration: SecurityPolicyGeneration(securityPolicy),
+		securityPolicyHash:       SecurityPolicyHash(providerPolicy),
+		securityPolicyGeneration: SecurityPolicyGeneration(providerPolicy),
 		settings:                 settings,
 		packetStatsCounters:      &packetStatsCounters{},
 		packetStatsChange:        newPacketStatsChange(),

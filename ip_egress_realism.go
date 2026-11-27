@@ -149,6 +149,11 @@ func providerEgressDialer(dialer *net.Dialer) *net.Dialer {
 				return err
 			}
 		}
+		if guard, ok := ctx.Value(providerNatDialKey{}).(*providerLocalGuard); ok {
+			if err := guard.networks.inspectDial(address, guard.settings); err != nil {
+				return err
+			}
+		}
 		if dial, ok := ctx.Value(providerEgressDialKey{}).(*providerEgressDial); ok {
 			dial.controlObserved.Store(true)
 			if c := dial.target.counters; c != nil {

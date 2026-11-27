@@ -141,14 +141,22 @@ var reservedCIDRs = []string{
 // reservedCIDRs6 is non-global / special-purpose IPv6 space (RFC 4291/6890),
 // subtracted from the IPv6 blocklist for the same reasons as the IPv4 set.
 var reservedCIDRs6 = []string{
-	"::/8",          // unspecified, loopback, v4-mapped, v4-compatible (non-global)
-	"64:ff9b::/96",  // nat64
-	"100::/64",      // discard-only
-	"2001:db8::/32", // documentation
-	"2002::/16",     // 6to4
-	"fc00::/7",      // unique local
-	"fe80::/10",     // link-local
-	"ff00::/8",      // multicast
+	"::/8",           // unspecified, loopback, v4-mapped, v4-compatible (non-global)
+	"64:ff9b::/96",   // nat64
+	"100::/64",       // discard-only
+	"100:0:0:1::/64", // dummy
+	"2001::/32",      // teredo
+	"2001:2::/48",    // benchmarking
+	"2001:10::/28",   // deprecated orchid
+	"2001:db8::/32",  // documentation
+	"2002::/16",      // 6to4
+	"3ffe::/16",      // former 6bone
+	"3fff::/20",      // documentation
+	"5f00::/16",      // segment routing sids
+	"fec0::/10",      // former site local
+	"fc00::/7",       // unique local
+	"fe80::/10",      // link-local
+	"ff00::/8",       // multicast
 }
 
 type iprange struct{ lo, hi uint32 }

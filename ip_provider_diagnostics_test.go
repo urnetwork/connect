@@ -255,6 +255,8 @@ var securityPolicyRulesPins = map[uint64]string{
 	2: "2798a1cef586738de34759ff274f084e950cbd09b9c17b35a3baeba57d80141f",
 	3: "6dbeba6f777c7ec4d3567a06f344295945a11dbef6260a0ef0a048c59edf1ee0",
 	4: "c800071a98af8523400e22c9b0212d353ecb21589a97873bab2baff4bfd3dd32",
+	// Socket-time enforcement changes admission with the same address tables.
+	5: "c800071a98af8523400e22c9b0212d353ecb21589a97873bab2baff4bfd3dd32",
 }
 
 // A change to the default settings or a hand-maintained exception table must

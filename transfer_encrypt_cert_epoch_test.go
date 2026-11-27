@@ -39,6 +39,13 @@ func newCertEpochCertificate(t *testing.T) (tls.Certificate, []byte) {
 // carries that certificate as the peer leaf, as a completed epoch's does.
 func newCertEpochTlsConn(t *testing.T, peerCertificate tls.Certificate) *tls.Conn {
 	t.Helper()
+	client, _ := newCertEpochTlsPair(t, peerCertificate)
+	return client
+}
+
+// Return both ends so isolated exporter tests can verify the wire agreement.
+func newCertEpochTlsPair(t *testing.T, peerCertificate tls.Certificate) (*tls.Conn, *tls.Conn) {
+	t.Helper()
 	localCertificate, _ := newCertEpochCertificate(t)
 	clientConfig := DefaultSequenceClientTlsConfig()
 	clientConfig.Certificates = []tls.Certificate{localCertificate}
@@ -68,7 +75,7 @@ func newCertEpochTlsConn(t *testing.T, peerCertificate tls.Certificate) *tls.Con
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
 	}
-	return client
+	return client, server
 }
 
 // Builds a handshake epoch whose completed TLS connection observed
@@ -385,5 +392,25 @@ func TestNoAckFastPathSealsOnlyWithVerifiedEpoch(t *testing.T) {
 	}
 	if sealer := write(); sealer != e2 {
 		t.Fatal("fast path did not resume under the verified promoted epoch")
+	}
+}
+
+// Older API clients can still request verification, but the call itself must
+// establish that the selected cipher's actual leaf matches the commitment.
+func TestCompatibilityCertMarkerChecksPresentedLeaf(t *testing.T) {
+	session, cleanup := newTestEncryptionSession(t, sequenceTlsRoleClient)
+	defer cleanup()
+	certificate, pem := newCertEpochCertificate(t)
+	_, foreign := newCertEpochCertificate(t)
+	e := newCertEpoch(t, certificate, 11, false)
+	setCertEpochSessionForTest(session, [][]byte{foreign}, e, e)
+	session.MarkCertVerified()
+	if certEpochVerified(session, e) {
+		t.Error("unmatched certificate marked verified")
+	}
+	setCertEpochSessionForTest(session, [][]byte{pem}, e, e)
+	session.MarkCertVerified()
+	if !certEpochVerified(session, e) {
+		t.Error("matching certificate left unverified")
 	}
 }

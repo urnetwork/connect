@@ -199,18 +199,6 @@ func NewPacketTranslation(
 	packetConn net.PacketConn,
 	settings *PacketTranslationSettings,
 ) (*packetTranslation, error) {
-	if settings.DnsStateTimeout <= 0 {
-		return nil, fmt.Errorf("DNS state timeout must be positive")
-	}
-	if settings.DnsMaxCombinePerAddress <= 0 || settings.DnsMaxCombine <= 0 ||
-		settings.DnsMaxCombineFragmentCount <= 0 ||
-		settings.DnsMaxCombinedPacketByteCount <= 0 ||
-		settings.DnsMaxCombineBytesPerAddress <= 0 || settings.DnsMaxCombineBytes <= 0 {
-		return nil, fmt.Errorf("DNS combine limits must be positive")
-	}
-	if settings.DnsMaxPumpHostsPerAddress <= 0 || settings.DnsMaxPumpHosts <= 0 {
-		return nil, fmt.Errorf("DNS pump limits must be positive")
-	}
 	return NewPacketTranslationWithPrefix(
 		ctx,
 		ptMode,
@@ -228,7 +216,25 @@ func NewPacketTranslationWithPrefix(
 	settings *PacketTranslationSettings,
 	headerPrefix []byte,
 ) (*packetTranslation, error) {
+	if settings == nil || len(settings.DnsTlds) == 0 || len(headerPrefix) > 16 {
+		return nil, fmt.Errorf("DNS carrier requires a suffix and at most 16 prefix bytes")
+	}
+	if settings.DnsStateTimeout <= 0 {
+		return nil, fmt.Errorf("DNS state timeout must be positive")
+	}
+	if settings.DnsMaxCombinePerAddress <= 0 || settings.DnsMaxCombine <= 0 ||
+		settings.DnsMaxCombineFragmentCount <= 0 ||
+		settings.DnsMaxCombinedPacketByteCount <= 0 ||
+		settings.DnsMaxCombineBytesPerAddress <= 0 || settings.DnsMaxCombineBytes <= 0 {
+		return nil, fmt.Errorf("DNS combine limits must be positive")
+	}
+	if settings.DnsMaxPumpHostsPerAddress <= 0 || settings.DnsMaxPumpHosts <= 0 {
+		return nil, fmt.Errorf("DNS pump limits must be positive")
+	}
 	for _, tld := range settings.DnsTlds {
+		if len(tld) >= dnsCarrierFragmentBudget-18 {
+			return nil, fmt.Errorf("DNS suffix leaves no room for payload")
+		}
 		if len(tld) == 0 || tld[len(tld)-1] != '.' || tld[0] == '.' {
 			return nil, fmt.Errorf("TLD must be canonical (end with a ., not start with a .): %s", string(tld))
 		}

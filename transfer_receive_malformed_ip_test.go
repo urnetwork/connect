@@ -110,3 +110,48 @@ func TestReceiveEmptyLegacyIpFramesReturnMemory(t *testing.T) {
 		}
 	})
 }
+
+// Exercise the same missing legacy body after successful Required-mode
+// decryption. A different, already established peer remains able to deliver.
+func TestRequiredSealedLegacyFrameReleasesReceiveBudget(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		root := NewTransferMemoryBudget(128 * 1024)
+		rx := NewTransferMemoryBudgetWithParent(32*1024, root)
+		workerOwned := 0
+		t.Cleanup(func() {
+			if root.UsedByteCount() != 0 {
+				t.Errorf("device root retained %d bytes after shutdown", root.UsedByteCount())
+			}
+		})
+		f := newInboundHistoryFixture(t, func(settings *ClientSettings) {
+			receive := settings.ReceiveBufferSettings
+			receive.ReceiveQueueBudget = rx
+			receive.ReceiveQueueRetainedByteAccounting = true
+			receive.receiveOwnerStageForTest = func(_ *ReceiveSequence, owner *decodedPackOwner, stage string) {
+				if stage == "pack_released" && owner != nil && rx.UsedByteCount() > 0 {
+					workerOwned++
+				}
+			}
+		})
+		f.session.openKeyHistoryGate(clientKeyHistoryVerified, "")
+		peer := NewId()
+		second := &inboundHistoryFixture{t: t, ctx: f.ctx, client: f.client, peerId: peer}
+		second.session = f.client.EncryptionSessionManager().Acquire(peer, sequenceTlsRoleServer, false)
+		defer second.session.Release()
+		second.current = second.installEpoch(0x43)
+		second.session.openKeyHistoryGate(clientKeyHistoryVerified, "")
+
+		pack := &protocol.Pack{MessageId: NewId().Bytes(), SequenceId: NewId().Bytes(), Head: true, Frames: []*protocol.Frame{{MessageType: protocol.MessageType_IpIpPacketToProvider}}}
+		f.inbound <- second.wirePack(second.current, pack)
+		synctest.Wait()
+		if workerOwned != 1 || rx.UsedByteCount() != 0 || root.UsedByteCount() != ByteCount(f.client.receiveDecodeReservedByteCount.Load()) {
+			t.Fatalf("processed %d, leaf %d, root %d", workerOwned, rx.UsedByteCount(), root.UsedByteCount())
+		}
+		f.inbound <- f.wire(f.current, NewId(), 0, "healthy")
+		synctest.Wait()
+		if len(f.delivered) != 1 || f.delivered[0] != "healthy" || rx.UsedByteCount() != 0 || root.UsedByteCount() != ByteCount(f.client.receiveDecodeReservedByteCount.Load()) {
+			t.Fatalf("healthy delivery %v, leaf %d, root %d", f.delivered, rx.UsedByteCount(), root.UsedByteCount())
+		}
+	})
+}

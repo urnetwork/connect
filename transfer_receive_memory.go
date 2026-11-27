@@ -394,3 +394,16 @@ func (self *receiveItem) releaseMemory() {
 	}
 	self.transferItem.releaseMemory()
 }
+
+// Release the worker's untransferred input on both ordinary refusal and
+// unwinding. Clear the pointer before the pooled object can be recycled.
+func (self *ReceiveSequence) returnWorkerInput() {
+	if item := self.workerItem; item != nil {
+		self.workerItem = nil
+		self.discardReceiveDeliveryAdmission(item)
+		item.messagePoolReturn()
+	} else if pack := self.workerPack; pack != nil {
+		self.workerPack = nil
+		pack.messagePoolReturn()
+	}
+}

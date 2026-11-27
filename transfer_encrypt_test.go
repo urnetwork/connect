@@ -817,7 +817,7 @@ func TestRekeyCertVerificationBypass(t *testing.T) {
 
 	// Mark cert verified while checking e1
 	verifiedBefore, _ := sess.CertVerificationState()
-	sess.MarkCertVerified()
+	sess.markCertVerifiedForEpoch(e1)
 
 	// Promote unverified rekey epoch e2
 	sess.stateLock.Lock()

@@ -153,6 +153,13 @@ Two decisions depart from the column:
 
 #### 2.2.2 The provider-local guard
 
+Provider rule generation 5 applies the current destination policy again when opening a
+TCP, UDP or ICMP egress flow. Direct native TCP and UDP sockets also check the resolved
+address in the dialer's control callback. A custom dialer receives a checked numeric
+destination. An approved Network flow retains its private-network access. The synthetic
+speed TCP service terminates inside the NAT.
+
+
 In the provider role (`DefaultProviderSecurityPolicy` and the memory-bounded
 provider policy, `ip_security_local.go`), a destination that passes the public
 rule is still refused when it is this host or on one of its links:

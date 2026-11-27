@@ -190,17 +190,18 @@ const maxRejectedStreamOpens = 32
 // arrive before the first contract that proves the relationship. Physically
 // observed at 295 ms.
 type rejectedStreamOpen struct {
+	authorization *streamAuthorizationRecord
 	sourceId      *Id
 	destinationId *Id
 	forwarding    bool
 	rejectTime    time.Time
 }
 
-func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId *Id, streamId Id, forwarding bool) {
+func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId *Id, streamId Id, forwarding bool, authorization *streamAuthorizationRecord) {
 	self.rejectedStreamsLock.Lock()
 	defer self.rejectedStreamsLock.Unlock()
 
-	if _, ok := self.rejectedStreams[streamId]; ok {
+	if previous := self.rejectedStreams[streamId]; previous != nil && previous.authorization == authorization {
 		return
 	}
 	for maxRejectedStreamOpens <= len(self.rejectedStreams) {
@@ -220,6 +221,7 @@ func (self *StreamManager) retainRejectedStreamOpen(sourceId *Id, destinationId 
 		delete(self.rejectedStreams, oldestId)
 	}
 	self.rejectedStreams[streamId] = &rejectedStreamOpen{
+		authorization: authorization,
 		sourceId:      sourceId,
 		destinationId: destinationId,
 		forwarding:    forwarding,
@@ -277,11 +279,15 @@ func (self *StreamManager) reconsiderRejectedStreamOpens() {
 			)
 		}
 		self.withStreamAuthorization(p.streamId, func() {
-			if _, err := self.streamBuffer.openStream(
+			if self.authorization.records[p.streamId] != p.rejected.authorization {
+				return
+			}
+			if _, err := self.streamBuffer.openAuthorizedStream(
 				p.rejected.sourceId,
 				p.rejected.destinationId,
 				p.streamId,
 				p.rejected.forwarding,
+				p.rejected.authorization,
 			); err != nil {
 				self.client.log.Infof(
 					"[sm]%s reconsider s(%s) open err = %s\n",
@@ -366,6 +372,10 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 		if message, err := FromFrame(frame); err == nil {
 
 			streamOpenIds := func(v *protocol.StreamOpen) (sourceId *Id, destinationId *Id, streamId Id, err error) {
+				if v == nil {
+					err = errors.New("missing stream open")
+					return
+				}
 				if v.SourceId != nil {
 					var sourceId_ Id
 					sourceId_, err = IdFromBytes(v.SourceId)
@@ -404,7 +414,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 						// Retained so the first verified Network contract or peer
 						// update from this identity can reconsider it. The proof
 						// can legitimately arrive after the StreamOpen.
-						self.retainRejectedStreamOpen(sourceId, destinationId, streamId, v.GetPathHasIntermediaries())
+						self.retainRejectedStreamOpen(sourceId, destinationId, streamId, v.GetPathHasIntermediaries(), self.authorization.records[streamId])
 						logged := false
 						self.rejectedStreamLogOnce.Do(func() {
 							logged = true
@@ -432,7 +442,7 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 					if self.client.log.V(1).Enabled() {
 						self.client.log.Infof("[sm]%s open s(%s) %v->%v\n", self.client.ClientTag(), streamId, sourceId, destinationId)
 					}
-					_, err := self.streamBuffer.openStream(sourceId, destinationId, streamId, v.GetPathHasIntermediaries())
+					_, err := self.streamBuffer.openAuthorizedStream(sourceId, destinationId, streamId, v.GetPathHasIntermediaries(), self.authorization.records[streamId])
 					return err
 				})
 			}
@@ -464,24 +474,24 @@ func (self *StreamManager) handleControlFrame(frame *protocol.Frame) error {
 				// streams not in the list are canceled,
 				// and listed streams not yet open are opened below
 				keep := map[streamSequenceId]bool{}
+				authorizations := map[Id]bool{}
 				for _, m := range v.Streams {
 					sourceId, destinationId, streamId, err := streamOpenIds(m)
 					if err != nil {
 						continue
 					}
-					if self.peerConnectionsDisabled() || !self.allowStreamOpen(sourceId, destinationId) || !self.streamAuthorizationActive(streamId) {
+					matches, active := self.resetStreamAuthority(streamId, m.AuthorizationGeneration)
+					if !matches {
+						continue
+					}
+					authorizations[streamId] = true
+					if !active || self.peerConnectionsDisabled() || !self.allowStreamOpen(sourceId, destinationId) {
 						continue
 					}
 					keep[newStreamSequenceId(sourceId, destinationId, streamId)] = true
 				}
 				if self.client.log.V(1).Enabled() {
 					self.client.log.Infof("[sm]%s reset streams = %d\n", self.client.ClientTag(), len(v.Streams))
-				}
-				authorizations := map[Id]bool{}
-				for _, open := range v.Streams {
-					if id, err := IdFromBytes(open.StreamId); err == nil {
-						authorizations[id] = true
-					}
 				}
 				self.retireAbsentAuthorizations(authorizations)
 				self.streamBuffer.ResetStreams(keep)
@@ -550,6 +560,7 @@ const maxLiveStreamSequences = 1024
 // worker. Generation distinguishes a superseding open or close for the same
 // stream id while an older generation is waiting for teardown.
 type streamOpenRequest struct {
+	authorization *streamAuthorizationRecord
 	sourceId      *Id
 	destinationId *Id
 	streamId      Id
@@ -716,6 +727,11 @@ func (self *StreamBuffer) OpenStream(sourceId *Id, destinationId *Id, streamId I
 
 // Only an authorized StreamOpen can require forwarding readiness.
 func (self *StreamBuffer) openStream(sourceId *Id, destinationId *Id, streamId Id, forwarding bool) (bool, error) {
+	return self.openAuthorizedStream(sourceId, destinationId, streamId, forwarding, nil)
+}
+
+// The pending request and then the published lifecycle retain the same grant.
+func (self *StreamBuffer) openAuthorizedStream(sourceId *Id, destinationId *Id, streamId Id, forwarding bool, authorization *streamAuthorizationRecord) (bool, error) {
 	select {
 	case <-self.ctx.Done():
 		return false, errors.New("Done.")
@@ -723,6 +739,7 @@ func (self *StreamBuffer) openStream(sourceId *Id, destinationId *Id, streamId I
 	}
 
 	request := &streamOpenRequest{
+		authorization: authorization,
 		sourceId:      cloneOptionalId(sourceId),
 		destinationId: cloneOptionalId(destinationId),
 		streamId:      streamId,
@@ -989,7 +1006,7 @@ func (self *StreamBuffer) prepareOpenRequest(
 	self.mutex.Lock()
 	streamSequence = self.streamSequences[streamSequenceId]
 	if streamSequence != nil && streamSequence != skipped &&
-		(streamSequence.forwarding != nil) == request.forwarding {
+		(streamSequence.forwarding != nil) == request.forwarding && streamSequence.authorization == request.authorization {
 		self.mutex.Unlock()
 		self.managementStateLock.Unlock()
 		return streamSequence, nil, true
@@ -1018,6 +1035,7 @@ func (self *StreamBuffer) prepareOpenRequest(
 		request.streamId,
 		self.streamBufferSettings,
 	)
+	streamSequence.authorization = request.authorization
 	if request.forwarding {
 		streamSequence.forwarding = &streamForwardingBinding{readiness: newP2pStreamReadiness(streamSequence.ctx)}
 	}
@@ -1338,6 +1356,22 @@ func (self *StreamBuffer) CloseDisconnectedPeerStreams(peerIds map[Id]bool) {
 	}
 }
 
+// Covers the complete pending-to-published handoff under the publication lock order.
+func (self *StreamBuffer) hasLeasedLifecycle(id Id) bool {
+	self.managementStateLock.Lock()
+	defer self.managementStateLock.Unlock()
+	if request := self.managedOpenRequests[id]; request != nil && request.authorization != nil {
+		return true
+	}
+	if request := self.pendingOpenRequests[id]; request != nil && request.authorization != nil {
+		return true
+	}
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	stream := self.streamSequencesByStreamId[id]
+	return stream != nil && stream.authorization != nil
+}
+
 // IsStreamOpen reports whether a sequence is currently indexed for streamId.
 func (self *StreamBuffer) IsStreamOpen(streamId Id) bool {
 	self.mutex.Lock()
@@ -1349,9 +1383,11 @@ func (self *StreamBuffer) IsStreamOpen(streamId Id) bool {
 
 // StreamSequence owns one directional P2P hop generation and its alias scope.
 type StreamSequence struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
+	// Immutable identity of a platform lease, nil for legacy/direct construction.
+	authorization *streamAuthorizationRecord
+	ctx           context.Context
+	cancel        context.CancelFunc
+	done          chan struct{}
 
 	streamManager *StreamManager
 

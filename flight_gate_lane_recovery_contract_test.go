@@ -228,7 +228,7 @@ func newLaneRecoveryLink(
 		link.receiver.RouteManager().UpdateTransportWithProperties(
 			NewReceiveGatewayTransportWithType(TransportTypeP2p),
 			[]Route{directIn},
-			properties,
+			properties.WithAuthenticatedSource(senderId),
 		)
 	}
 	link.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {

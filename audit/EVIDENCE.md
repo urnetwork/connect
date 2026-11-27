@@ -19,6 +19,13 @@ This document states what we claim, where the code that implements each claim
 lives, and where the claims stop. The limitations in §1.3 and §9 are not
 oversights we are hiding; they are the areas we most want reviewed.
 
+**URN-01 update, 26 November 2026.** The source and test names in the updated
+sections below apply to the URN-01 remediation branch. The numbered line
+references, historical results and dependency scan elsewhere in this document
+refer to the original audit revision. The reviewer response records all nine
+dispositions, repository revisions and reproduction commands.
+[Partner retest response](../../factury/audit/REMEDIATE1-REPONSE.md)
+
 ## Contents
 
 1. Summary for the auditors
@@ -161,11 +168,11 @@ platform runs the same `Client` code.
 
 ### 2.3 Where a frame's source identity comes from
 
-The receive loop reads the outer `TransferPath.SourceId` from the frame bytes
-(`transfer.go:4651-4688`). connect does not authenticate it cryptographically,
-and the route layer does not compare it with the transport that carried the
-frame. The code expects the route to have done source checks
-(`transfer.go:4647-4650`).
+The receive loop reads the outer transfer path and checks which source the
+physical receive lane may attribute before it allocates state for that source.
+The platform receive gateway vouches for relayed frames. A bound direct lane
+vouches for one peer. A forwarding enrollment authenticates an origin and
+direction for its exact stream. The outer source field alone grants no authority.
 
 - For **sealed** frames, the AEAD key is bound to the peer's identity key by the
   identity proof (§3.4.3), and the sealed inner path must equal the outer path
@@ -188,16 +195,14 @@ frame. The code expects the route to have done source checks
     because what follows allocates state for the named source (a receive
     sequence and session, or for an undecryptable wrap a session, a nack, its
     send sequence and a contract request to the platform).
-  - Production streams are direct, so the adjacent peer is the stream's other
-    end. A multihop stream endpoint knows only its adjacent hop while
-    forwarded frames name the stream's origin, so multihop over P2P needs the
-    endpoint to bind its lane to an origin the platform authenticated (in the
-    stream open, or through the contract) before it admits forwarded frames
-    (§5.4, L7).
-  - A carrier that binds no source (a custom transport typed P2P) is checked
-    for the platform and this client only, and the undecryptable-wrap nack
-    treats the sources it names as unauthenticated: it nacks only through a
-    session the source already holds.
+  - A verified forwarding enrollment can attribute its authenticated origin at
+    the endpoint. The receiver verifies the envelope and its bound lane before
+    delivery. An unbound custom lane drops plaintext before allocating peer
+    state. It can carry a sealed frame for an existing session. Recovery
+    feedback requires a bound direct lane and an existing session. Unbound lanes send no recovery feedback.
+  - A custom carrier that authenticates one peer can register that peer using
+    `TransferCarrierProperties.WithAuthenticatedSource`.
+    [Route metadata](../transfer_route_manager.go) · [Attribution regressions](../transfer_p2p_source_binding_test.go)
 
 ---
 
@@ -339,12 +344,14 @@ data arrived sealed (`transfer.go:16984-17006`); see §3.8 for plaintext acks.
 - `AddTrustedPeerCertChain` admits a chain only if its signature verifies under
   the committed peer key; otherwise the chain is dropped and logged
   (`transfer_encrypt.go:3064-3135`).
-- Before the first sealed write on a non-companion send sequence,
-  `verifyPeerCertAgainstContract` requires the established epoch's peer leaf to
-  match a trusted certificate by exact DER
-  (`transfer.go:14687-14761`, `transfer_encrypt.go:4310-4347`). An empty
-  trusted set skips the check without latching. This is deliberate; the
-  identity proof below is the binding control (`DESIGNNOTES.md` §3.6).
+- An application writer captures the established epoch, its cipher and its
+  verification state together. A committed leaf must match by DER. A match
+  marks that exact epoch. Empty commitments leave verification open for a
+  later contract. Normal writes, resends and the no-ACK fast writer consume
+  the captured state. The compatibility marker independently verifies the
+  selected epoch's presented leaf. ACKs carry protocol feedback and remain
+  eligible for the existing control policy.
+  [Commitment check](../transfer_encrypt_commitment.go) · [Writer and marker tests](../transfer_encrypt_cert_epoch_test.go)
 
 #### 3.4.3 Defence 2 — the identity proof (the binding property)
 
@@ -359,8 +366,8 @@ data arrived sealed (`transfer.go:16984-17006`); see §3.8 for plaintext acks.
   checks the key and signature lengths and then calls `ed25519.Verify`
   (`transfer_key.go:347-359`, call at `transfer_encrypt.go:2095`).
 - Receive rules (`transfer_encrypt.go:2463-2564`):
-  - A proof for an **older** epoch is ignored; a proof for a **newer** epoch
-    triggers convergence (`:2482-2504`).
+  - A proof naming any other epoch is ignored before the pending slot can be
+    claimed. Only a responder receiving a ClientHello may adopt a named epoch.
   - There is a single pending-proof slot; a second proof is ignored (`:2526-2528`).
   - A proof of the wrong length is a **terminal** failure for the epoch
     (`:2529-2541`).
@@ -484,8 +491,11 @@ certificate, the epoch fails closed (`:1514-1525`). Test:
   `transfer_encrypt.go:1251-1322`).
 - Each handshake runs in a resettable **epoch** (`:906-997`). The client role
   mints an epoch id; the responder adopts it (`:1499-1503`, `:1801-1816`).
-  Controls for an older generation are dropped; a newer generation causes a
-  reset (`:2380-2403`).
+  The responder may prefer its current generation over an older ClientHello
+  during a live, time-bounded attempt. That preference ends with the attempt.
+  Foreign responses and proofs cannot move the epoch. Ordered delivery and the
+  optimistic inbox both require a live owner.
+  [Transition policy](../transfer_encrypt_transition.go) · [Epoch tests](../transfer_encrypt_epoch_test.go)
 - **Rekey triggers:**
   - every new client-role send sequence (`restartHandshake`, `:1376-1400`);
   - an inbound ClientHello after completion (server role, `:2404-2413`);
@@ -576,16 +586,11 @@ again within the full-suite run on the fixed code (§10). The command is in §10
   nack can reopen that window after sealing (§3.9). Required removes both
   (§3.7). Required is what the consumer post-quantum profile selects.
 - **Protocol version.** TLS 1.3 only, in both roles (§3.2).
-- **Key-exchange group.**
-  - X25519MLKEM768 is offered first; X25519 is accepted for peers that do not
-    offer the hybrid.
-  - TLS 1.3 authenticates the negotiated group through the transcript, and the
-    identity proof signs an exporter derived from that transcript. An active
-    attacker therefore cannot steer two hybrid-capable peers to X25519 without
-    breaking X25519 during the handshake.
-  - There is no "post-quantum only" setting (`DESIGNNOTES2.md` §8.4). The
-    negotiated group is exposed as `PeerEncryptionState.KeyExchange`
-    (`transfer_encrypt.go:573-576`).
+- **Key-exchange group.** Required mode restricts Go TLS to supported hybrid
+  groups and validates the negotiated group. Opportunistic mode permits
+  classical X25519 for compatible peers. The identity proof binds the TLS
+  transcript and the negotiated group appears in `PeerEncryptionState.KeyExchange`.
+  [TLS configuration](../transfer_encrypt.go) · [Required-policy tests](../transfer_encrypt_post_quantum_test.go)
 - **Identity-evidence downgrade.**
   - Signed → unsigned: refused per peer and per operator (§3.4.5).
   - Error-induced fallback: L3.
@@ -740,13 +745,14 @@ shuffling and censorship-evasion shaping. Uses that touch the wire or a check:
 - **Bounded verification work:** at most 64 history generations
   (`transfer_encrypt.go:809`), and a per-record size bound
   (`MaxClientKeyRegistrationBytes`, `transfer_key_history.go:361`).
-- **Not count-capped (for review):**
-  - The number of sessions in a manager. Sessions are created on demand,
-    including from inbound `EncryptedControl` frames and undecryptable wraps for
-    the claimed source id (`transfer_encrypt.go:3790-3828`, `:4406-4419`);
-    unreferenced sessions are reaped after `IdleTimeout`.
-  - The per-epoch TLS inbox. It grows on delivery (`:189-197`), is drained by the
-    TLS reader, and after completion only a ClientHello is accepted (`:2414-2421`).
+- The default client admits up to 4,096 encryption sessions, including workers
+  in teardown. Platform-relayed wrap-triggered creation also respects the configured NACK limit
+  and a quarter of the session budget. Existing sessions can still recover at
+  capacity. Each physical receive lane permits 32 recovery attempts per second.
+  A direct lane stops attempting failed record opens for the rest of its window
+  after 32 failures. A handshake inbox closes at a pending input of more than 512 KiB. Its retained
+  input and output are released on close.
+  [Session resource tests](../transfer_p2p_source_binding_test.go) · [Handshake and route tests](../transfer_encrypt_transport_lifetime_test.go)
 - **CPU:** an ML-KEM-768 hybrid handshake is CPU-heavier than X25519. A peer can
   trigger responder handshakes by sending ClientHellos to its own sessions.
 
@@ -807,8 +813,7 @@ cannot choose.
 
 **4.8.7 Post-quantum.**
 
-- X25519MLKEM768 comes from Go's `crypto/tls`. Classical X25519 remains accepted
-  (§4.1).
+- X25519MLKEM768 comes from Go's `crypto/tls`. Opportunistic mode also permits classical X25519 (§4.1).
 - `ServesPostQuantumEncryption` advertises the capability only when the hybrid
   is offered (`transfer_encrypt.go:3637-3661`).
 
@@ -1112,10 +1117,12 @@ document is authoritative, and its §2.6 file list is current.
 §2.2:
 
 1. Network-relationship bypass.
-2. **Public-unicast check.** A destination that is private, loopback,
-   link-local, multicast or unspecified, or one of the listed reserved IPv6
-   prefixes, is an incident (`ip_security.go:886-905` and `isReservedIpv6`
-   below it). A v4-mapped v6 destination is judged as its v4 address.
+2. **Public and provider-local checks.** The classifier handles special-use
+   addresses and IPv4-mapped IPv6. Provider policy also excludes interface,
+   on-link, delegated-prefix, observed public and service-anycast destinations.
+   Direct provider NAT dials recheck current policy at socket creation. The
+   simulator terminates its speed-test range in memory.
+   [Address classes](../ip_security_public.go) · [Socket guard](../ip_security_dial.go) · [Feed and policy tests](../security/provider_exclusions_test.go)
 3. CFAA endpoint reputation: a generated, sorted, disjoint blocklist plus a
    port/protocol policy (`ip_security_cfaa.go`, `ip_security_cfaa_block.go`,
    generator `security/main.go`).
@@ -1381,18 +1388,17 @@ here so it is an explicit decision.
 | Logical lanes | ≤ 8, validated on receive | `transfer_logical_lane.go:8`; `transfer.go:15569` |
 | Live stream sequences / stream authorizations / capability records | 1024 / 4096 and 128 / 1024 | `transfer_stream_manager.go:510`; `transfer_stream_authorization.go:20-21`; `transfer_peer_capability_observation.go:40` |
 
-**No count cap (we want this reviewed):**
+Ordinary receive workers have a finite per-client limit (4,096 by default)
+including workers in teardown. Existing sequences and platform repair work
+continue at capacity. The encryption session, TLS inbox and feedback budgets
+are described in §4.7. A receive worker returns its dequeued input or transfers
+custody to its hold queue or delivery batch exactly once.
+[Receive admission tests](../transfer_p2p_source_binding_test.go) · [Custody tests](../transfer_receive_pack_custody_test.go)
 
-- the number of distinct receive sequences (sources) per client
-  (`transfer.go:15367-15374`, `:15405`, `:15770`);
-- the number of encryption sessions (§4.7);
-- the per-epoch TLS inbox byte size (§4.7);
-- provider NAT flow tables when no memory target is set. "No target: unlimited
-  flow counts" (`ip.go:694-708`; `UserLimit` / `GlobalLimit` 0 = no limit,
-  `ip.go:448`, `:4287-4293`). With a target, scaled caps apply (`ip.go:604-613`).
-
-The process memory budget is advisory sizing, not admission control
-(`memory_budget.go:7-38`; `transfer_memory_budget.go:15-17`).
+Provider NAT flow counts use scaled limits when a memory target is set.
+A zero flow limit in a profile with no target still permits unrestricted flow
+counts. This is distinct from the client transfer and gossip admission limits.
+[Provider profiles](../ip.go) · [Gossip resource tests](../gossip/node_limits_test.go)
 
 ## 9. Consolidated limitations and open items
 
@@ -1407,10 +1413,10 @@ is described.
 | L4 | Random-nonce AES-GCM with no per-key invocation counter or volume/time rekey; one key serves both directions of a session | Open — review requested | §4.8.1 |
 | L5 | Plaintext surfaces inside the transport: the control plane, `EncryptedControl` frames, acks (accepted plaintext in every mode), the outer routing header, sizes and timing | By design | §3.8, §4.6 |
 | L6 | AES-GCM only. CPUs without AES instructions use table-based software AES. | Open — review requested | §4.4 |
-| L7 | Plaintext-frame source attribution is transport-level: connect does not authenticate `TransferPath.SourceId` of plaintext frames. On P2P routes, frames naming the platform or this client are dropped, and a production association's lanes are bound to its adjacent peer, so a frame naming any other source is dropped too. | By design for platform-relayed frames. P2P: platform and self spoofing fixed (§1.4); per-peer binding fixed for production associations (§1.4, partner report 2026-11-16). Multihop over P2P would need the endpoint bound to an authenticated origin — review requested | §2.3, §5.4 |
-| L8 | No post-quantum-only policy; X25519 is accepted for peers without the hybrid | Follow-up (`DESIGNNOTES2.md` §8.4) | §4.1 |
+| L7 | Plaintext attribution requires the platform relay, the exact bound peer, or a verified forwarding enrollment. Unbound carriers may deliver authenticated records for sessions already held. | URN-01-007 corrected at receive admission | §2.3, §5.4 |
+| L8 | Required mode enforces the supported post-quantum TLS groups. Opportunistic mode permits compatible peers under its configured policy. | Covered by the Required-mode group and fail-closed regressions | §3.1, §3.2 |
 | L9 | X.509 validity, KeyUsage and EKU are not enforced on seal certificates (identity comes from the Ed25519 binding) | By design | §3.2, §4.8.6 |
-| L10 | No count caps on sessions or receive sequences per client, and no byte cap on the per-epoch TLS inbox. Provider NAT tables are unbounded without a memory target. The sessions the undecryptable-wrap nack creates are capped (`UnknownWrapNackMaxSessionCount`), and P2P lanes no longer allocate for sources other than their peer (L7). | Open — review requested | §4.7, §8.4 |
+| L10 | Finite client limits cover ordinary receive workers, all encryption sessions, the TLS inbox and per-lane recovery. Gossip bounds system, transient, peer and connection work. A provider NAT profile with no memory target can still select unlimited flow counts. | URN-01-006 and URN-01-007 transfer and gossip bounds implemented | §4.7, §8.4 |
 | L11 | Secret key material is not zeroized | Accepted, recorded | §8.3 |
 | L12 | Contract stores hold contract HMACs in plaintext, integrity-protected by content digests and signatures only | Accepted, recorded | §8.1 |
 | L13 | Always-on logging of stale-DNS query domains (`net_http_doh.go:1036`) | Open | §8.2 |
@@ -1423,7 +1429,7 @@ is described.
 | L20 | Manual extenders without a key have an unauthenticated outer TLS; VLESS links may set `allowInsecure` (the inner platform TLS stays pinned in both cases) | By design | §5.4 |
 | L21 | Contract byte limits use an unchecked `uint64→int64` conversion and a float32 product | Open — review requested | §5.3 |
 | L22 | WebRTC DTLS fingerprints arrive in platform-relayed signals; no binding to client identity keys | By design (operator trust) | §5.4 |
-| L23 | Egress public-unicast check treats 100.64.0.0/10 (shared address space), 0.0.0.0/8 other than 0.0.0.0, 192.0.0.0/24, 198.18.0.0/15, 240.0.0.0/4 and 255.255.255.255 as public (`ip_security.go:886-905`). The CFAA blocklist generator subtracts the same reserved ranges (`security/main.go:124-138`), so neither layer refuses them on a provider. | Open — review requested | §5.5 |
+| L23 | The provider denies the five reported IPv4 special-use blocks, their mapped spellings and service-anycast exceptions. An offline regression compares feed subtraction with effective provider dial policy, including analogous IPv6 classes. | URN-01-001 and URN-01-002 corrected | §5.5, `docs/IP_SECURITY.md` |
 
 ## 10. Reproducing the evidence
 

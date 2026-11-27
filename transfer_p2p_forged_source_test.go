@@ -25,10 +25,7 @@ func TestP2pRouteFrameClaimingPlatformOrSelfIsDropped(t *testing.T) {
 	peerId := NewId()
 	client.ContractManager().AddNoContractPeer(peerId)
 	inbound := make(Route, 8)
-	client.RouteManager().UpdateTransport(
-		NewReceiveGatewayTransportWithType(TransportTypeP2p),
-		[]Route{inbound},
-	)
+	publishP2pAssociationReceiveRoute(ctx, client, peerId, inbound)
 	t.Cleanup(func() {
 		cancel()
 		join, stop := context.WithTimeout(context.Background(), 10*time.Second)

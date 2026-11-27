@@ -203,7 +203,7 @@ func TestReceiveSequenceAcksUnreliableCarriedPacksOnReliableLane(t *testing.T) {
 	client.RouteManager().UpdateTransportWithProperties(
 		NewReceiveGatewayTransportWithType(TransportTypeP2p),
 		[]Route{unreliableIn},
-		TransferCarrierProperties{Unreliable: true},
+		TransferCarrierProperties{Unreliable: true}.WithAuthenticatedSource(peerId),
 	)
 	t.Cleanup(func() {
 		cancel()

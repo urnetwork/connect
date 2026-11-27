@@ -3,6 +3,7 @@ package connect
 import (
 	"encoding/base32"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	// "fmt"
 	// mathrand "math/rand/v2"
@@ -39,7 +40,7 @@ const dnsEdnsUdpPayloadByteCount = 1232
 // returns the number of passes of encode needed for the packet and tld
 func encodeDnsRequestCount(packet []byte, tld []byte) int {
 
-	m := 157 - 18 - len(tld)
+	m := dnsCarrierFragmentBudget - 18 - len(tld)
 
 	c := len(packet) / m
 	if len(packet)%m != 0 {
@@ -69,7 +70,7 @@ func encodeDnsRequest(id uint16, header [18]byte, packet []byte, buf [1024]byte,
 
 	nameBuf := name.Data[:0]
 
-	m := min(len(packet), 157-len(header)-len(tld))
+	m := min(len(packet), dnsCarrierFragmentBudget-len(header)-len(tld))
 
 	copy(buf[len(buf)-30:], header[:])
 	j := min(30-len(header), m)
@@ -119,12 +120,37 @@ func dnsEdnsResourceHeader() dnsmessage.ResourceHeader {
 	return h
 }
 
+// The encoder emits one question (two on legacy clients) and at most two
+// carrier answers. Leave room for resolver-added answer records. Check the
+// section counts before the DNS parser can allocate expanded records.
+const dnsCarrierFragmentBudget = 157
+const dnsCarrierMaxQuestions = 2
+const dnsCarrierMaxAnswers = 16
+
+func dnsCarrierSectionCountsValid(packet []byte) bool {
+	return len(packet) >= 12 && binary.BigEndian.Uint16(packet[4:6]) <= dnsCarrierMaxQuestions &&
+		binary.BigEndian.Uint16(packet[6:8]) <= dnsCarrierMaxAnswers
+}
+
+// Validate each fragment against the remaining destination before asking
+// an encoding to write it. On error no partially decoded record is exposed.
+func decodeDnsCarrierFragment(dst, src []byte, decodedLen func(int) int, decode func([]byte, []byte) (int, error)) (int, error) {
+	if decodedLen(len(src)) > len(dst) {
+		return 0, errors.New("DNS fragment exceeds decode buffer")
+	}
+	return decode(dst, src)
+}
+
 // edns reports whether the request carried an opt record, which marks a
 // client that expects one in the paired response. A request from before
 // the single-question shape carries none.
 func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, header [18]byte, out []byte, tld []byte, err error, otherData bool, edns bool) {
 	enc := base32.HexEncoding.WithPadding(base32.NoPadding)
 
+	if !dnsCarrierSectionCountsValid(packet) {
+		err = errors.New("invalid DNS request section counts")
+		return
+	}
 	p := &dnsmessage.Parser{}
 	var h dnsmessage.Header
 	h, err = p.Start(packet)
@@ -133,7 +159,6 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 	}
 	id = h.ID
 
-	out = buf[:]
 	n := 0
 
 	var qs []dnsmessage.Question
@@ -171,15 +196,8 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 					}
 				}
 
-				// Compressed question names can expand beyond the datagram's
-				// size. Decode requires enough space for the entire label.
-				if enc.DecodedLen(j-i) > len(out)-n {
-					out = nil
-					err = errors.New("DNS request exceeds decode buffer")
-					return
-				}
 				var m int
-				m, err = enc.Decode(out[n:], q.Name.Data[i:j])
+				m, err = decodeDnsCarrierFragment(buf[n:], q.Name.Data[i:j], enc.DecodedLen, enc.Decode)
 				if err != nil {
 					return
 				}
@@ -205,9 +223,13 @@ func decodeDnsRequest(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16, 
 		}
 	}
 
-	if 18 <= n {
-		header = [18]byte(out[0:18])
-		out = out[18:n]
+	if !otherData {
+		if n < len(header) {
+			err = errors.New("incomplete DNS request carrier header")
+			return
+		}
+		header = [18]byte(buf[:len(header)])
+		out = buf[len(header):n]
 	}
 
 	return
@@ -355,6 +377,10 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
 	rEnc := base64.StdEncoding.WithPadding(base64.NoPadding)
 
+	if !dnsCarrierSectionCountsValid(packet) {
+		err = errors.New("invalid DNS response section counts")
+		return
+	}
 	p := &dnsmessage.Parser{}
 	var h dnsmessage.Header
 	h, err = p.Start(packet)
@@ -364,7 +390,9 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 	}
 	id = h.ID
 
-	p.SkipAllQuestions()
+	if err = p.SkipAllQuestions(); err != nil {
+		return
+	}
 
 	var as []dnsmessage.Resource
 	as, err = p.AllAnswers()
@@ -373,7 +401,6 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 		return
 	}
 
-	out = buf[:]
 	n := 0
 
 	for _, a := range as {
@@ -388,7 +415,7 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 			}
 			return nil
 		}()
-		if tld == nil {
+		if tld == nil || a.Header.Type != dnsmessage.TypeTXT {
 			continue
 		}
 
@@ -399,33 +426,32 @@ func decodeDnsResponse(packet []byte, buf [1024]byte, tlds [][]byte) (id uint16,
 			}
 		}
 
-		_, err = enc.Decode(pumpHeader[0:], a.Header.Name.Data[0:j])
+		if j != enc.EncodedLen(len(pumpHeader)) {
+			err = errors.New("invalid DNS response pump header length")
+			return
+		}
+		_, err = enc.Decode(pumpHeader[:], a.Header.Name.Data[:j])
 		if err != nil {
 			return
 		}
 
-		switch a.Header.Type {
-		case dnsmessage.TypeTXT:
-			r := a.Body.(*dnsmessage.TXTResource)
-
-			for _, txt := range r.TXT {
-				var m int
-				m, err = rEnc.Decode(out[n:], []byte(txt))
-				if err != nil {
-					// fmt.Printf("ERROR 3\n")
-					return
-				}
-				n += m
+		for _, txt := range a.Body.(*dnsmessage.TXTResource).TXT {
+			m, decodeErr := decodeDnsCarrierFragment(buf[n:], []byte(txt), rEnc.DecodedLen, rEnc.Decode)
+			if decodeErr != nil {
+				err = decodeErr
+				return
 			}
-			// else ignore
+			n += m
 		}
 
 	}
 
-	if 18 <= n {
-		header = [18]byte(out[0:18])
-		out = out[18:n]
+	if n < len(header) {
+		err = errors.New("incomplete DNS response carrier header")
+		return
 	}
+	header = [18]byte(buf[:len(header)])
+	out = buf[len(header):n]
 
 	return
 }

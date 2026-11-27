@@ -358,3 +358,91 @@ type testRemoteAddrConn struct {
 func (self *testRemoteAddrConn) RemoteAddr() net.Addr {
 	return self.remoteAddr
 }
+
+// A partial override preserves the finite role defaults at every other scope.
+func TestGossipPartialResourceLimitsKeepRoleBounds(t *testing.T) {
+	custom := &NodeResourceLimits{PeerConnCount: 2, PeerMemoryByteCount: -1}
+	node := newTestLocalNode(t, func(settings *NodeSettings) {
+		settings.ResourceLimits = custom
+	})
+	want := DefaultNodeResourceLimits(node.settings.ConnManagerHighWater)
+	want.PeerConnCount = 2
+	if got := *node.settings.ResourceLimits; got != *want {
+		t.Errorf("partial limits = %+v, want %+v", got, *want)
+	}
+	if custom.ConnCount != 0 || custom.PeerMemoryByteCount != -1 {
+		t.Error("caller-owned settings mutated")
+	}
+}
+
+// Membership is attached to the authenticated peer, so sharing an address
+// never grants another identity permission. Outbound round selection is separate.
+func TestGossipRestrictedInboundPeerSelection(t *testing.T) {
+	allowed, other := peer.ID("member"), peer.ID("other")
+	peers := []peer.ID{allowed}
+	node := newTestLocalNode(t, func(settings *NodeSettings) { settings.AllowedInboundPeers = peers })
+	peers[0] = other
+	gate := &nodeDialGater{node: node}
+	if !gate.InterceptSecured(network.DirInbound, allowed, nil) || gate.InterceptSecured(network.DirInbound, other, nil) {
+		t.Error("inbound membership does not enforce its private snapshot")
+	}
+	if !gate.InterceptSecured(network.DirOutbound, other, nil) {
+		t.Error("inbound membership constrained the outbound round")
+	}
+	closed := newTestLocalNode(t, func(settings *NodeSettings) { settings.AllowedInboundPeers = []peer.ID{} })
+	if (&nodeDialGater{node: closed}).InterceptSecured(network.DirInbound, allowed, nil) {
+		t.Error("empty membership admitted a peer")
+	}
+}
+
+// Connection-local reservations, peer streams and their parents release
+// independently. Exercise the installed libp2p scopes without any sockets.
+func TestGossipConnectionAndPeerQuotaRecovery(t *testing.T) {
+	limits := DefaultNodeResourceLimits(16)
+	limits.PeerInboundStreamCount = 1
+	const peerMemoryLimit = 1024 * 1024
+	limits.PeerMemoryByteCount = peerMemoryLimit
+	manager, err := newNodeResourceManager(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	addr := ma.StringCast("/ip4/192.0.2.10/tcp/4001")
+	conn, err := manager.OpenConnection(network.DirInbound, false, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.ReserveMemory(1+peerMemoryLimit, network.ReservationPriorityAlways); err == nil {
+		t.Error("single connection borrowed past its memory limit")
+		conn.ReleaseMemory(1 + peerMemoryLimit)
+	}
+	conn.Done()
+	one, err := manager.OpenStream(peer.ID("first"), network.DirInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extra, err := manager.OpenStream(peer.ID("first"), network.DirInbound); err == nil {
+		extra.Done()
+		t.Error("peer exceeded its stream quota")
+	}
+	other, err := manager.OpenStream(peer.ID("second"), network.DirInbound)
+	if err != nil {
+		t.Fatal("healthy sibling", err)
+	}
+	one.Done()
+	again, err := manager.OpenStream(peer.ID("first"), network.DirInbound)
+	if err != nil {
+		t.Fatal("released peer quota unavailable", err)
+	}
+	again.Done()
+	other.Done()
+	if err := manager.ViewSystem(func(scope network.ResourceScope) error {
+		stat := scope.Stat()
+		if stat.NumStreamsInbound != 0 || stat.Memory != 0 {
+			t.Errorf("unreleased resources %+v", stat)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

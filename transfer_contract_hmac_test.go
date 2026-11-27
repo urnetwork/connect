@@ -169,3 +169,30 @@ func TestContractManagerRefusesForgedLegacyContract(t *testing.T) {
 		protocol.ProvideMode_Public,
 	))
 }
+
+// A caller with no legacy policy must produce the standard MAC accepted
+// by the same verifier when it has no cutover settings.
+func TestStoredContractDefaultSignerMatchesVerifier(t *testing.T) {
+	key, body := []byte("synthetic secret"), []byte("ordinary stored contract")
+	tag := SignStoredContract(nil, key, body)
+	if len(tag) != sha256.Size || !VerifyStoredContract(nil, key, body, tag) {
+		t.Fatal("default signer and verifier disagree")
+	}
+}
+
+// The exact cutover instant is the first standard-only instant.
+func TestStoredContractMacExactCutover(t *testing.T) {
+	at := time.Unix(42, 0)
+	settings := &ContractManagerSettings{NetworkEventTimeChangeHmac: at}
+	key, body := []byte("test key"), []byte("test contract")
+	legacy := signStoredContractAt(settings, key, body, at.Add(-time.Nanosecond))
+	standard := signStoredContractAt(settings, key, body, at)
+	for _, now := range []time.Time{at.Add(-time.Nanosecond), at, at.Add(time.Nanosecond)} {
+		if want := now.Before(at); verifyStoredContractAt(settings, key, body, legacy, now) != want {
+			t.Errorf("legacy decision at %v", now)
+		}
+		if !verifyStoredContractAt(settings, key, body, standard, now) {
+			t.Errorf("standard tag refused at %v", now)
+		}
+	}
+}

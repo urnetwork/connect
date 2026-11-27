@@ -3,8 +3,6 @@ package connect
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -20,7 +18,6 @@ import (
 	"net"
 	"runtime/debug"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,18 +82,6 @@ This keeps a companion-contract and a regular-contract flow to the same peer+rol
 The identity `companion` is distinct from `carrierCompanion` — which contract the EC rides: the identity
 bit for a client session, but EncryptionControlUseCompanion for a server reply.
 */
-
-const (
-	sequenceTlsKeyLabel      = "urnetwork-connect-aead"
-	sequenceTlsKeyLength     = 32
-	sequenceTlsAeadNonceSize = 12
-	// sequenceTlsIdentityProofLabel is the exporter label both peers use to
-	// derive the 32-byte payload signed with the long-lived client identity
-	// key. Distinct from `sequenceTlsKeyLabel` so the two derivations are
-	// cryptographically separated (per RFC 5705 exporter rules).
-	sequenceTlsIdentityProofLabel  = "urnetwork-connect-identity-proof"
-	sequenceTlsIdentityProofLength = 32
-)
 
 type sequenceTlsRole int
 
@@ -175,6 +160,10 @@ type sequenceTlsTransport struct {
 	closed    chan struct{}
 }
 
+// Larger than a TLS certificate flight, including record headers. The owner
+// of an unread attempt cannot accumulate application-sized input indefinitely.
+const sequenceHandshakeInboxLimit = 512 * 1024
+
 func newSequenceTlsTransport(ctx context.Context) *sequenceTlsTransport {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	return &sequenceTlsTransport{
@@ -191,6 +180,15 @@ func (t *sequenceTlsTransport) Deliver(b []byte) {
 		return
 	}
 	t.inboxLock.Lock()
+	if t.ctx.Err() != nil {
+		t.inboxLock.Unlock()
+		return
+	}
+	if len(b) > sequenceHandshakeInboxLimit-len(t.inboxBuf) {
+		t.inboxLock.Unlock()
+		t.Close()
+		return
+	}
 	t.inboxBuf = append(t.inboxBuf, b...)
 	t.inboxLock.Unlock()
 	t.inboxNotify.NotifyAll()
@@ -222,6 +220,10 @@ func (t *sequenceTlsTransport) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	t.outboxLock.Lock()
+	if t.ctx.Err() != nil {
+		t.outboxLock.Unlock()
+		return 0, net.ErrClosed
+	}
 	t.outboxBuf = append(t.outboxBuf, p...)
 	t.outboxLock.Unlock()
 	t.outboxNotify.NotifyAll()
@@ -256,6 +258,12 @@ func (t *sequenceTlsTransport) TakeOutbox(ctx context.Context) ([]byte, error) {
 func (t *sequenceTlsTransport) Close() error {
 	t.closeOnce.Do(func() {
 		t.cancel()
+		t.inboxLock.Lock()
+		t.inboxBuf = nil
+		t.inboxLock.Unlock()
+		t.outboxLock.Lock()
+		t.outboxBuf = nil
+		t.outboxLock.Unlock()
 		close(t.closed)
 		t.inboxNotify.NotifyAll()
 		t.outboxNotify.NotifyAll()
@@ -273,93 +281,6 @@ func (t *sequenceTlsTransport) RemoteAddr() net.Addr             { return sequen
 func (t *sequenceTlsTransport) SetDeadline(time.Time) error      { return nil }
 func (t *sequenceTlsTransport) SetReadDeadline(time.Time) error  { return nil }
 func (t *sequenceTlsTransport) SetWriteDeadline(time.Time) error { return nil }
-
-// sequenceCipher is the AEAD used to outer-wrap a whole TransferFrame after
-// the per-peer TLS handshake completes. Nonce is random per-message and
-// prepended to the ciphertext.
-type sequenceCipher struct {
-	aead cipher.AEAD
-}
-
-func newSequenceCipher(tlsConn *tls.Conn) (*sequenceCipher, error) {
-	state := tlsConn.ConnectionState()
-	if !state.HandshakeComplete {
-		return nil, errors.New("sequence cipher requires a completed TLS handshake")
-	}
-	key, err := state.ExportKeyingMaterial(sequenceTlsKeyLabel, nil, sequenceTlsKeyLength)
-	if err != nil {
-		return nil, err
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	return &sequenceCipher{aead: aead}, nil
-}
-
-func (c *sequenceCipher) Seal(plaintext []byte) ([]byte, error) {
-	nonce := make([]byte, sequenceTlsAeadNonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	out := make([]byte, sequenceTlsAeadNonceSize, sequenceTlsAeadNonceSize+len(plaintext)+c.aead.Overhead())
-	copy(out, nonce)
-	return c.aead.Seal(out, nonce, plaintext, nil), nil
-}
-
-func (c *sequenceCipher) Open(ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < sequenceTlsAeadNonceSize+c.aead.Overhead() {
-		return nil, errors.New("sequence cipher: ciphertext too short")
-	}
-	nonce := ciphertext[:sequenceTlsAeadNonceSize]
-	sealed := ciphertext[sequenceTlsAeadNonceSize:]
-	plaintextLen := len(sealed) - c.aead.Overhead()
-	buf := MessagePoolGet(plaintextLen)
-	out, err := c.aead.Open(buf[:0], nonce, sealed, nil)
-	if err != nil {
-		MessagePoolReturn(buf)
-		return nil, err
-	}
-	if cap(out) != cap(buf) {
-		MessagePoolReturn(buf)
-	}
-	return out, nil
-}
-
-// SealOuterFrame writes the complete encrypted outer TransferFrame directly
-// into one pooled buffer. AEAD.Seal appends to dst, so placing the random nonce
-// at the end of the protobuf header and sealing from there avoids both the
-// standalone ciphertext allocation and the subsequent ciphertext copy that
-// buildEncryptedOuterFrameBytes would otherwise require.
-func (c *sequenceCipher) SealOuterFrame(
-	path TransferPath,
-	plaintext []byte,
-	sessionRole protocol.SequenceRole,
-	sessionCompanion bool,
-) ([]byte, error) {
-	ciphertextLen := sequenceTlsAeadNonceSize + len(plaintext) + c.aead.Overhead()
-	size := sizeEncryptedOuterTransferFrame(path, ciphertextLen, sessionRole)
-	buf := MessagePoolGet(size)
-	out := appendEncryptedOuterTransferFrameHeader(buf[:0], path, ciphertextLen)
-
-	nonceStart := len(out)
-	out = out[:nonceStart+sequenceTlsAeadNonceSize]
-	nonce := out[nonceStart:]
-	if _, err := rand.Read(nonce); err != nil {
-		MessagePoolReturn(buf)
-		return nil, err
-	}
-	out = c.aead.Seal(out, nonce, plaintext, nil)
-	out = appendEncryptedOuterTransferFrameFooter(out, sessionRole, sessionCompanion)
-	if cap(out) != cap(buf) {
-		MessagePoolReturn(buf)
-	}
-	return out, nil
-}
 
 // buildEncryptedOuterFrameBytes wraps an AEAD ciphertext as the
 // `encryptedTransferFrame` field of an outer `TransferFrame` with the given
@@ -592,6 +513,9 @@ type PeerEncryptionState struct {
 // EncryptionSettings configures the per-peer TLS sessions managed by an
 // `EncryptionSessionManager`.
 type EncryptionSettings struct {
+	// Maximum live peer-session workers across all origins, roles and lanes.
+	// Nonpositive uses the default. Existing sessions can always be reused.
+	MaxSessionCount int
 	// Mode selects the per-peer session policy: Off (inert, all plaintext),
 	// Opportunistic (seal when a session establishes, else plaintext), or
 	// Required (never expose application data in plaintext to/from a peer for
@@ -844,6 +768,7 @@ func DefaultEncryptionSettings() *EncryptionSettings {
 		UnknownWrapNackRestartCooldown: 5 * time.Second,
 		// one session per client of a busy provider that restarted
 		UnknownWrapNackMaxSessionCount: 1024,
+		MaxSessionCount:                defaultPeerSessionLimit,
 		// 0 reaps a standalone session immediately at refs==0 (<0 keeps it
 		// forever, >0 idle-reaps after the timeout). DefaultClientSettings
 		// overrides this with max(send-sequence idle, receive-sequence idle) so
@@ -1848,30 +1773,13 @@ func (self *peerEncryptionSession) completeHandshake(e *tlsHandshakeEpoch, err e
 		default:
 		}
 		if err == nil {
-			c, cipherErr := newSequenceCipher(e.tlsConn)
-			if cipherErr != nil {
-				err = cipherErr
-			} else {
-				// Hold the AEAD on `derivedTlsCipher`, not the publicly
-				// observable `Cipher()`. The cipher becomes visible only after
-				// the post-handshake identity proof exchange validates the peer
-				// (see `peerIdentityVerified`). Until then the wrap path observes
-				// cipher == nil and traffic flows in plaintext, mirroring a
-				// not-yet-completed handshake.
-				e.derivedTlsCipher = c
-				state := e.tlsConn.ConnectionState()
-				exporter, exportErr := state.ExportKeyingMaterial(
-					sequenceTlsIdentityProofLabel, nil, sequenceTlsIdentityProofLength,
-				)
-				if exportErr != nil {
-					err = fmt.Errorf("identity-proof exporter: %w", exportErr)
-				} else {
-					e.tlsExporter = exporter
-					// surfaced via PeerEncryptionStates.KeyExchange so callers
-					// can tell post-quantum from classical sessions
-					e.negotiatedCurveId = state.CurveID
-					negotiatedCurveId = state.CurveID
-				}
+			state := e.tlsConn.ConnectionState()
+			record, proof, deriveErr := deriveSequenceSecrets(state)
+			err = deriveErr
+			if err == nil {
+				// The cipher becomes eligible only after the peer proves its identity.
+				e.derivedTlsCipher, e.tlsExporter = record, proof
+				e.negotiatedCurveId, negotiatedCurveId = state.CurveID, state.CurveID
 			}
 		}
 		e.handshakeErr = err
@@ -2407,27 +2315,23 @@ func (self *peerEncryptionSession) deliverHandshake(payload []byte, epochId Id) 
 			return nil
 		}
 		e := self.epoch
-		if self.role == sequenceTlsRoleServer && isClientHelloRecord(payload) {
-			inFlight := e != nil && !isClosed(e.handshakeDone) &&
-				!e.identityFailed && e.ctx.Err() == nil
-			foreign := e != nil && epochId != (Id{}) &&
-				e.epochId != (Id{}) && e.epochId != epochId
-			if foreign && inFlight && self.settings != nil &&
-				0 < self.settings.TlsTimeout && epochId.LessThan(e.epochId) {
-				return nil
-			}
-			if !inFlight || foreign {
-				self.buildAndStartEpochWithLock()
-				e = self.epoch
-			}
-			if e != nil && e.epochId == (Id{}) {
-				e.epochId = epochId
-			}
+		var current Id
+		if e != nil {
+			current = e.epochId
 		}
-		if e == nil || e.transport == nil || isClosed(e.handshakeDone) ||
-			e.identityFailed || e.ctx.Err() != nil ||
-			(epochId != (Id{}) && e.epochId != epochId) {
+		order := self.settings != nil && self.settings.TlsTimeout > 0
+		switch selectSequenceHandshake(self.role, isClientHelloRecord(payload), e.acceptsHandshakeWithLock(), order, current, epochId) {
+		case handshakeIgnore:
 			return nil
+		case handshakeStart:
+			self.buildAndStartEpochWithLock()
+			e = self.epoch
+		}
+		if !e.acceptsHandshakeWithLock() || e.transport == nil {
+			return nil
+		}
+		if self.role == sequenceTlsRoleServer && isClientHelloRecord(payload) && e.epochId == (Id{}) {
+			e.epochId = epochId
 		}
 		return e
 	}()
@@ -2620,8 +2524,8 @@ func (self *peerEncryptionSession) optimisticallyDeliverHandshakeForEpoch(payloa
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		e := self.epoch
-		if self.role != sequenceTlsRoleServer || e == nil || e.transport == nil ||
-			!e.serverFlightSent || isClosed(e.handshakeDone) || e.epochId != epochId {
+		if self.ctx.Err() != nil || self.role != sequenceTlsRoleServer || !e.acceptsHandshakeWithLock() || e.transport == nil ||
+			!e.serverFlightSent || e.epochId != epochId {
 			return nil
 		}
 		return e
@@ -3038,6 +2942,11 @@ type sealingEpochState struct {
 	noCommitment bool
 }
 
+// Both application writers use the captured epoch's commitment gate.
+func (self sealingEpochState) requiresCertificateMatch() bool {
+	return !self.certVerified && !self.noCommitment
+}
+
 // Snapshots the sealing epoch for one send. The cipher is the one `Cipher()`
 // returns at the same instant.
 func (self *peerEncryptionSession) sealingState() sealingEpochState {
@@ -3071,15 +2980,19 @@ func (self *peerEncryptionSession) CertVerificationState() (verified bool, noCom
 	return verified, len(self.trustedPeerCertPems) == 0
 }
 
-// MarkCertVerified records a cert match for the established epoch, never for
-// an in-flight rekey epoch. It marks whichever epoch is established when it
-// runs, so a caller that checked a cert before taking the lock marks that
-// exact epoch with `markCertVerifiedForEpoch` instead.
+// MarkCertVerified rechecks the current sealing epoch before recording its
+// certificate match. Kept for callers of the earlier argument-free method.
 func (self *peerEncryptionSession) MarkCertVerified() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	if self.establishedEpoch != nil {
-		self.establishedEpoch.certVerified = true
+	sealing := self.sealingState()
+	if sealing.cipher == nil || !sealing.requiresCertificateMatch() {
+		return
+	}
+	expected := self.trustedPeerCertSnapshot()
+	if len(expected) == 0 {
+		return
+	}
+	if ok, err := verifyPeerCertificateAgainstContract(self.peerCertificatesOfEpoch(sealing.epoch), expected); err == nil && ok {
+		self.markCertVerifiedForEpoch(sealing.epoch)
 	}
 }
 
@@ -3394,6 +3307,7 @@ type EncryptionSessionManager struct {
 	// live sessions an undecryptable wrap created to carry its nack, bounded by
 	// UnknownWrapNackMaxSessionCount
 	unknownWrapNackSessionCount int
+	liveSessionCount            int
 	workers                     *lifecycleAdmission
 	// Nil test barrier pauses a publisher or session supervisor after cleanup
 	// and before joined completion.
@@ -3855,6 +3769,16 @@ func (self *EncryptionSessionManager) getOrCreate(peerId Id, role sequenceTlsRol
 	return self.getOrCreateWithLock(peerId, role, companion)
 }
 
+const defaultPeerSessionLimit = 4096
+
+// A zero setting from an older configuration still gets a finite bound.
+func (self *EncryptionSettings) sessionLimit() int {
+	if self.MaxSessionCount > 0 {
+		return self.MaxSessionCount
+	}
+	return defaultPeerSessionLimit
+}
+
 // getOrCreateWithLock returns the (peerId, companion, role) session, creating
 // and supervising it if absent. Caller holds stateLock.
 func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequenceTlsRole, companion bool) *peerEncryptionSession {
@@ -3865,11 +3789,15 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 	if s, ok := self.sessions[key]; ok {
 		return s
 	}
+	if self.liveSessionCount >= self.settings.sessionLimit() {
+		return nil
+	}
 	s := newPeerEncryptionSession(self.ctx, self, self.client, peerId, role, self.settings, self.sessionTlsConfigWithLock(role), companion)
 	if !self.workers.start() {
 		s.close()
 		return nil
 	}
+	self.liveSessionCount++
 	self.sessions[key] = s
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[tls]%s opened session for peer %s as %s c=%t\n", self.client.ClientTag(), peerId, role, companion)
@@ -3880,6 +3808,7 @@ func (self *EncryptionSessionManager) getOrCreateWithLock(peerId Id, role sequen
 			func() {
 				self.stateLock.Lock()
 				defer self.stateLock.Unlock()
+				self.liveSessionCount--
 				if self.sessions[key] == s {
 					delete(self.sessions, key)
 				}
@@ -4354,73 +4283,6 @@ func logTlsHandshakePeerCert(log Logger, tag string, peerCerts []*x509.Certifica
 	}
 }
 
-// parsePemCertificates parses PEM-encoded certificate blocks into
-// `*x509.Certificate` values. Each list entry is one PEM block; only PEM
-// is accepted.
-func parsePemCertificates(pems [][]byte) ([]*x509.Certificate, error) {
-	out := make([]*x509.Certificate, 0, len(pems))
-	for _, b := range pems {
-		if len(b) == 0 {
-			continue
-		}
-		block, rest := pem.Decode(b)
-		if block == nil {
-			return nil, errors.New("certificate is not PEM-encoded")
-		}
-		if block.Type != "CERTIFICATE" {
-			return nil, fmt.Errorf("unexpected PEM block type %q (expected CERTIFICATE)", block.Type)
-		}
-		if 0 < len(bytes.TrimSpace(rest)) {
-			return nil, errors.New("certificate has trailing content after PEM block")
-		}
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("invalid PEM certificate: %w", err)
-		}
-		out = append(out, cert)
-	}
-	return out, nil
-}
-
-// verifyPeerCertificateAgainstContract checks that the peer's leaf
-// certificate matches one of the certificates committed to in the contract.
-// `expectedPems` is the PEM-encoded chain from
-// `Contract.ProvideTlsCertificate` / `StoredContract.ProvideTlsCertificate`.
-// When empty (no contract commitment), verification is skipped.
-//
-// On mismatch, the returned error carries the peer leaf's subject and the
-// list of expected subjects so the SendSequence's `[s]` log line is
-// self-contained — useful when triaging encrypted-send rejections from
-// production logs.
-func verifyPeerCertificateAgainstContract(peer []*x509.Certificate, expectedPems [][]byte) (bool, error) {
-	if len(expectedPems) == 0 {
-		return true, nil
-	}
-	if len(peer) == 0 {
-		return false, errors.New("peer presented no certificate but contract committed to a TLS identity")
-	}
-	expected, err := parsePemCertificates(expectedPems)
-	if err != nil {
-		return false, fmt.Errorf("contract certificate parse error: %w", err)
-	}
-	peerLeaf := peer[0]
-	for _, e := range expected {
-		if bytes.Equal(peerLeaf.Raw, e.Raw) {
-			return true, nil
-		}
-	}
-	expectedSubjects := make([]string, 0, len(expected))
-	for _, e := range expected {
-		expectedSubjects = append(expectedSubjects, e.Subject.String())
-	}
-	return false, fmt.Errorf(
-		"peer cert subject=%q does not match any of %d contract-committed cert(s): [%s]",
-		peerLeaf.Subject.String(),
-		len(expected),
-		strings.Join(expectedSubjects, ", "),
-	)
-}
-
 // Testing_DropSessions tears down every session for `peerId` regardless of
 // reference count or idle state, modeling a peer-facing total state loss (the
 // mirror image of the peer's own process restart: here the LOCAL side forgets
@@ -4482,8 +4344,7 @@ func (self *peerEncryptionSession) unknownWrapNackRestartCooldown() time.Duratio
 // not free: its session, the send sequence that carries it, and the contract
 // that sequence asks the platform for are all state for `peerId`. So the
 // session is created when absent -- exactly the session the peer's coming
-// re-handshake will drive -- only when the caller vouches that `peerId` is
-// `authenticated`, and only while the sessions this path created number fewer
+// re-handshake will drive -- only for an authenticated platform relay, and only while the sessions this path created number fewer
 // than UnknownWrapNackMaxSessionCount. Otherwise the wrap is nacked through a
 // session that already exists, or not at all, and the sealer recovers through
 // its sequence lifecycle. A client with encryption off never nacks: it can
@@ -4492,7 +4353,7 @@ func (self *EncryptionSessionManager) NotifyUndecryptableWrap(
 	peerId Id,
 	senderRole sequenceTlsRole,
 	companion bool,
-	authenticated bool,
+	allowPlatformRecovery bool,
 ) {
 	if self == nil || peerId == (Id{}) {
 		return
@@ -4510,10 +4371,10 @@ func (self *EncryptionSessionManager) NotifyUndecryptableWrap(
 		if session, ok := self.sessions[sessionKey{peerId: peerId, companion: companion, role: role}]; ok {
 			return session
 		}
-		if !authenticated {
+		if !allowPlatformRecovery {
 			return nil
 		}
-		if self.settings.UnknownWrapNackMaxSessionCount <= self.unknownWrapNackSessionCount {
+		if min(self.settings.UnknownWrapNackMaxSessionCount, self.settings.sessionLimit()/4) <= self.unknownWrapNackSessionCount {
 			return nil
 		}
 		session := self.getOrCreateWithLock(peerId, role, companion)

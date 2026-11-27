@@ -39,7 +39,8 @@ import (
 // Generation 4 (2026-11-09): the service anycast addresses, port control,
 // TURN and DNS-SD service registration, are provider-local
 // (ip_security_local.go, providerLocalAnycastAddrs).
-const SecurityPolicyRulesGeneration uint64 = 4
+// Generation 5 rechecks the numeric destination when a provider opens its egress socket.
+const SecurityPolicyRulesGeneration uint64 = 5
 
 // The rules generation a policy enforces:
 // SecurityPolicyRulesGeneration for the built-in policy in either direction,

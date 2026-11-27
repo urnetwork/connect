@@ -156,6 +156,10 @@ type NodeSettings struct {
 	// which every member dials -- gets a hub's limits without restating them.
 	ResourceLimits *NodeResourceLimits
 
+	// A nil list admits the public mesh under its finite quotas. An explicit
+	// list restricts inbound connections by authenticated libp2p identity.
+	AllowedInboundPeers []peer.ID
+
 	// The operator's mesh addresses, each carrying `/p2p/<id>` (D3). Empty
 	// means no operator link, which is what a space whose operator has not
 	// published its identity yet has.
@@ -289,6 +293,47 @@ func DefaultNodeResourceLimits(connManagerHighWater int) *NodeResourceLimits {
 	}
 }
 
+// Fill each omitted or nonpositive bound independently before libp2p reads it.
+// Its zero and negative sentinel values would otherwise inherit infinity.
+func (self *NodeResourceLimits) withDefaults(highWater int) *NodeResourceLimits {
+	defaults := DefaultNodeResourceLimits(highWater)
+	if self == nil {
+		return defaults
+	}
+	result := *self
+	if result.ConnCount <= 0 {
+		result.ConnCount = defaults.ConnCount
+	}
+	if result.InboundStreamCount <= 0 {
+		result.InboundStreamCount = defaults.InboundStreamCount
+	}
+	if result.OutboundStreamCount <= 0 {
+		result.OutboundStreamCount = defaults.OutboundStreamCount
+	}
+	if result.MemoryByteCount <= 0 {
+		result.MemoryByteCount = defaults.MemoryByteCount
+	}
+	if result.TransientConnCount <= 0 {
+		result.TransientConnCount = defaults.TransientConnCount
+	}
+	if result.TransientStreamCount <= 0 {
+		result.TransientStreamCount = defaults.TransientStreamCount
+	}
+	if result.PeerConnCount <= 0 {
+		result.PeerConnCount = defaults.PeerConnCount
+	}
+	if result.PeerInboundStreamCount <= 0 {
+		result.PeerInboundStreamCount = defaults.PeerInboundStreamCount
+	}
+	if result.PeerOutboundStreamCount <= 0 {
+		result.PeerOutboundStreamCount = defaults.PeerOutboundStreamCount
+	}
+	if result.PeerMemoryByteCount <= 0 {
+		result.PeerMemoryByteCount = defaults.PeerMemoryByteCount
+	}
+	return &result
+}
+
 // The resource manager of these limits. What the limits leave unnamed --
 // services, protocols, single connections and streams -- is bounded by the
 // peer and all-peer limits above it.
@@ -303,6 +348,9 @@ func DefaultNodeResourceLimits(connManagerHighWater int) *NodeResourceLimits {
 // per source subnet before a stream reaches the node.
 func newNodeResourceManager(limits *NodeResourceLimits) (network.ResourceManager, error) {
 	limitConfig := rcmgr.PartialLimitConfig{
+		// Negotiation buffers owned by one connection have their own bound.
+		// Yamux charges its window spans to the authenticated peer as well.
+		Conn: rcmgr.ResourceLimits{Memory: rcmgr.LimitVal64(limits.PeerMemoryByteCount)},
 		System: rcmgr.ResourceLimits{
 			Conns:           rcmgr.LimitVal(limits.ConnCount),
 			Streams:         rcmgr.LimitVal(limits.InboundStreamCount + limits.OutboundStreamCount),
@@ -422,6 +470,7 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 		return nil, fmt.Errorf("the gossip node needs a network host")
 	}
 	copied := *settings
+	copied.AllowedInboundPeers = slices.Clone(settings.AllowedInboundPeers)
 	if copied.Now == nil {
 		copied.Now = time.Now
 	}
@@ -449,12 +498,7 @@ func NewNode(ctx context.Context, settings *NodeSettings) (*Node, error) {
 	if copied.NegotiationTimeout <= 0 {
 		copied.NegotiationTimeout = roleDefaults.NegotiationTimeout
 	}
-	if copied.ResourceLimits == nil {
-		copied.ResourceLimits = DefaultNodeResourceLimits(copied.ConnManagerHighWater)
-	} else {
-		resourceLimits := *copied.ResourceLimits
-		copied.ResourceLimits = &resourceLimits
-	}
+	copied.ResourceLimits = copied.ResourceLimits.withDefaults(copied.ConnManagerHighWater)
 	if copied.TlsSessionCache == nil {
 		copied.TlsSessionCache = processTlsSessionCache()
 	}

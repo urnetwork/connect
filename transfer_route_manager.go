@@ -69,6 +69,8 @@ func h1AckPriorityRoute(route Route) (Route, bool) {
 // ReceiveReliability tells Pack admission whether the physical lane can safely
 // propagate fixed-queue backpressure.
 type TransferCarrierProperties struct {
+	platformAttributesSource bool
+	recoveryBudget           *routeRecoveryBudget
 	// MaxMessageByteCount is an advertised maximum complete Transfer message,
 	// including encryption but excluding this carrier's own framing header.
 	// Zero is unknown; it must not invent a default ceiling for custom routes.
@@ -124,7 +126,7 @@ type TransferCarrierProperties struct {
 	// authenticated; any other source on such a lane is the sender's word and
 	// is dropped before it can allocate peer state. Zero binds nothing, which
 	// is every platform carrier (the platform attributes sources itself) and
-	// every custom carrier.
+	// custom carriers without an authenticated peer binding.
 	boundSourceId Id
 	// Issued by the verified platform connection to the exact receive route.
 	platformReceive      *platformReceiveProvenance
@@ -132,6 +134,13 @@ type TransferCarrierProperties struct {
 	forwardingReceive    *streamForwardingReceiveLane
 	forwardingSend       *streamForwardingBinding
 	forwardingInnerLimit int
+}
+
+// Bind a custom receive lane to the single peer
+// authenticated by its transport. A zero id leaves the lane unbound.
+func (self TransferCarrierProperties) WithAuthenticatedSource(id Id) TransferCarrierProperties {
+	self.boundSourceId = id
+	return self
 }
 
 func (self TransferCarrierProperties) messageUnreliable(
@@ -354,10 +363,12 @@ type TransportMultiRouteReader interface {
 // interfaces stay source-compatible while the production selector carries the
 // exact route lane into Client admission.
 type transferReceiveDisposition struct {
-	maxMessageByteCount int
-	transportType       TransportType
-	reliability         CarrierReliability
-	h1Credit            platformH1ReceiveCredit
+	platformAttributesSource bool
+	recoveryBudget           *routeRecoveryBudget
+	maxMessageByteCount      int
+	transportType            TransportType
+	reliability              CarrierReliability
+	h1Credit                 platformH1ReceiveCredit
 	// the source the delivering route is bound to, zero when it binds none
 	// (TransferCarrierProperties.boundSourceId)
 	boundSourceId      Id
@@ -2032,9 +2043,11 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 func (self *routeSnapshot) receiveDisposition(route Route, message []byte) transferReceiveDisposition {
 	properties := self.routeCarrierProperties[route]
 	return transferReceiveDisposition{
-		maxMessageByteCount: properties.MaxMessageByteCount,
-		transportType:       self.transportType(route),
-		reliability:         properties.ReceiveReliability,
+		platformAttributesSource: properties.platformAttributesSource,
+		recoveryBudget:           properties.recoveryBudget,
+		maxMessageByteCount:      properties.MaxMessageByteCount,
+		transportType:            self.transportType(route),
+		reliability:              properties.ReceiveReliability,
 		h1Credit: platformH1ReceiveCredit{
 			lane:      properties.h1ReceiveRetained,
 			byteCount: ByteCount(cap(message)),
@@ -2262,7 +2275,17 @@ func (self *MultiRouteSelector) updateActiveRoutesWithLock() {
 					route,
 				)
 				routePriorities[route] = transport.Priority()
-				routeCarrierProperties[route] = self.transportProperties[transport]
+				properties := self.transportProperties[transport]
+				properties.platformAttributesSource = platformGatewayAttributesSource(transport) || properties.platformReceive != nil
+				if !self.weightedRoutes {
+					if previousSnapshot != nil {
+						properties.recoveryBudget = previousSnapshot.routeCarrierProperties[route].recoveryBudget
+					}
+					if properties.recoveryBudget == nil {
+						properties.recoveryBudget = &routeRecoveryBudget{}
+					}
+				}
+				routeCarrierProperties[route] = properties
 				if !self.transportProperties[transport].Unreliable {
 					reliableRoutes = append(reliableRoutes, route)
 				}
@@ -3831,19 +3854,68 @@ func (self *sendGatewayTransport) Downgrade(source TransferPath) {
 }
 
 // conforms to `Transport`
+// Gateway constructors represent the platform relay. Custom carriers cannot
+// acquire platform privileges merely by reporting the same statistics type.
+func platformGatewayAttributesSource(transport Transport) bool {
+	switch t := transport.(type) {
+	case *receiveLaneTransport:
+		return platformGatewayAttributesSource(t.base)
+	case *receiveGatewayTransport:
+		return t.platformAttributesSource
+	case *priorityReceiveGatewayTransport:
+		return true
+	default:
+		return false
+	}
+}
+
+// Bound failed-wrap recovery on the delivering physical lane before consulting
+// the session manager. The single Client receive worker owns this budget.
+type routeRecoveryBudget struct {
+	window time.Time
+	count  int
+}
+
+const routeRecoveryPerSecond = 32
+
+// Successful records do not spend the failure allowance.
+func (self *routeRecoveryBudget) canTry(now time.Time) bool {
+	return self != nil && (self.count < routeRecoveryPerSecond || now.Sub(self.window) >= time.Second)
+}
+
+// The single receive worker charges one failed attempt.
+func (self *routeRecoveryBudget) allow(now time.Time) bool {
+	if !self.canTry(now) {
+		return false
+	}
+	if self.window.IsZero() || now.Sub(self.window) >= time.Second {
+		self.window = now
+		self.count = 0
+	}
+	self.count++
+	return true
+}
+
 type receiveGatewayTransport struct {
-	transportId   Id
-	transportType TransportType
+	platformAttributesSource bool
+	transportId              Id
+	transportType            TransportType
 }
 
 func NewReceiveGatewayTransport() *receiveGatewayTransport {
-	return NewReceiveGatewayTransportWithType(TransportTypeUnknown)
+	return &receiveGatewayTransport{transportId: NewId(), transportType: TransportTypeUnknown, platformAttributesSource: true}
 }
 
 func NewReceiveGatewayTransportWithType(transportType TransportType) *receiveGatewayTransport {
+	platform := false
+	switch transportType {
+	case TransportTypeH1, TransportTypeH3, TransportTypeH3Dns, TransportTypeH3DnsPump:
+		platform = true
+	}
 	return &receiveGatewayTransport{
-		transportId:   NewId(),
-		transportType: transportType,
+		platformAttributesSource: platform,
+		transportId:              NewId(),
+		transportType:            transportType,
 	}
 }
 

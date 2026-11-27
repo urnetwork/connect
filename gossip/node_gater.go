@@ -73,8 +73,9 @@ func (self *nodeDialGater) InterceptAccept(network.ConnMultiaddrs) bool {
 	return true
 }
 
-func (self *nodeDialGater) InterceptSecured(network.Direction, peer.ID, network.ConnMultiaddrs) bool {
-	return true
+func (self *nodeDialGater) InterceptSecured(direction network.Direction, id peer.ID, _ network.ConnMultiaddrs) bool {
+	members := self.node.settings.AllowedInboundPeers
+	return direction != network.DirInbound || members == nil || slices.Contains(members, id)
 }
 
 func (self *nodeDialGater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) {

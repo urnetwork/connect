@@ -326,7 +326,7 @@ func metricAckWriteAttribution(
 	receiver.RouteManager().UpdateTransportWithProperties(
 		NewReceiveGatewayTransportWithType(TransportTypeP2p),
 		[]Route{directIn},
-		TransferCarrierProperties{Unreliable: true},
+		TransferCarrierProperties{Unreliable: true}.WithAuthenticatedSource(senderId),
 	)
 	// the only way out is the H1 companion, so the acknowledgement must
 	// leave on it whatever lane the Pack arrived on

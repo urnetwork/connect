@@ -112,7 +112,8 @@ type icmpEgress interface {
 }
 
 type IcmpBufferSettings struct {
-	MemoryBudget *TransferMemoryBudget
+	providerDialPolicy *providerNatDialPolicy
+	MemoryBudget       *TransferMemoryBudget
 	// nil resolves to the local user nat `Log`
 	Log          Logger
 	ReadTimeout  time.Duration
@@ -798,6 +799,11 @@ func (self *IcmpSequence) Run() {
 	newEgress := newIcmpEgress
 	if self.icmpBufferSettings.newEgressForTest != nil {
 		newEgress = self.icmpBufferSettings.newEgressForTest
+	}
+	if guard := self.icmpBufferSettings.providerDialPolicy.guard(); guard != nil && self.provideMode != protocol.ProvideMode_Network {
+		if err := guard.networks.inspectDial(net.JoinHostPort(self.destinationIp.String(), "0"), guard.settings); err != nil {
+			return
+		}
 	}
 	egress, err := newEgress(self.ctx, self.ipVersion, self.destinationIp, self.icmpBufferSettings)
 	if err != nil {

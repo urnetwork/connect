@@ -15,8 +15,10 @@ package connect
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -220,6 +222,10 @@ func newForgedSourceFixture(t *testing.T, configure func(settings *ClientSetting
 // lane: a platform carrier, or with TransportTypeP2p a custom carrier.
 func (self *forgedSourceFixture) publishUnboundRoute(transportType TransportType) Route {
 	route := make(Route, forgedSourceFrameCount+8)
+	if transportType == TransportTypeUnknown || transportType == TransportTypeP2p {
+		route = make(Route)
+	}
+
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -403,18 +409,24 @@ func (self *forgedSourceFixture) unknownWrapNackSessionCount() int {
 	return manager.unknownWrapNackSessionCount
 }
 
-// Desync recovery still works for the association's own peer: its
-// undecryptable wrap opens the session its re-handshake will drive and nacks
-// the sealer, and its plaintext still arrives (the barrier).
+// A direct peer's unreadable record cannot create a recovery session. Once a
+// legitimate sequence opens that peer's session, the same lane can request repair.
 func TestP2pRouteBoundPeerUndecryptableWrapIsNacked(t *testing.T) {
 	fixture := newForgedSourceFixture(t, nil)
 	fixture.inbound <- forgedSourceWrappedFrame(t, fixture.peerId, fixture.client.ClientId())
-	fixture.awaitUnknownWrapNack(t)
 	fixture.barrier(t)
-
-	state := forgedSourcePeerStateOf(fixture.client, map[Id]bool{fixture.peerId: true})
-	AssertEqual(t, 1, state.sessionCount)
-	AssertEqual(t, 1, fixture.unknownWrapNackSessionCount())
+	session := fixture.client.encryptionSessionManager.Lookup(fixture.peerId, sequenceTlsRoleServer, false)
+	if session == nil {
+		t.Fatal("legitimate sequence did not acquire its session")
+	}
+	session.stateLock.Lock()
+	alreadyNacked := !session.lastUnknownWrapNackTime.IsZero()
+	session.stateLock.Unlock()
+	if alreadyNacked || fixture.unknownWrapNackSessionCount() != 0 {
+		t.Fatal("direct record created its own recovery session")
+	}
+	fixture.inbound <- forgedSourceWrappedFrame(t, fixture.peerId, fixture.client.ClientId())
+	fixture.awaitUnknownWrapNack(t)
 	AssertEqual(t, uint64(0), fixture.client.ReceiveStats().ForgedSourceDropCount)
 }
 
@@ -433,8 +445,7 @@ func TestPlatformRouteUndecryptableWrapIsNacked(t *testing.T) {
 }
 
 // A P2P-typed carrier that binds no source vouches for none: an undecryptable
-// wrap on it opens no session, and it is nacked only through a session the
-// named source already holds.
+// wrap on it cannot send feedback, including through a session held by a real peer.
 func TestUnboundP2pRouteUndecryptableWrapCreatesNoSession(t *testing.T) {
 	fixture := newForgedSourceFixture(t, func(settings *ClientSettings) {
 		// every undecryptable wrap that reaches a session nacks
@@ -445,7 +456,8 @@ func TestUnboundP2pRouteUndecryptableWrapCreatesNoSession(t *testing.T) {
 
 	claimedId := NewId()
 	unboundRoute <- forgedSourceWrappedFrame(t, claimedId, fixture.client.ClientId())
-	fixture.barrierOn(t, unboundRoute)
+	unboundRoute <- nil // an unbuffered handoff fences the preceding read
+	fixture.barrier(t)
 	AssertEqual(t, 0, forgedSourcePeerStateOf(fixture.client, map[Id]bool{claimedId: true}).sessionCount)
 	select {
 	case <-fixture.unknownWrapNacks:
@@ -453,12 +465,23 @@ func TestUnboundP2pRouteUndecryptableWrapCreatesNoSession(t *testing.T) {
 	default:
 	}
 
-	// once the platform has delivered the source's wrap, the source holds a
-	// session, and a wrap the unbound route names it on is nacked through it
+	// The platform source now has a session. The unbound lane still cannot
+	// act on its behalf. The handoff fences the receive worker's decision.
 	platformRoute <- forgedSourceWrappedFrame(t, claimedId, fixture.client.ClientId())
 	fixture.awaitUnknownWrapNack(t)
+	session := fixture.client.encryptionSessionManager.Lookup(claimedId, sequenceTlsRoleServer, false)
+	session.stateLock.Lock()
+	prior := session.lastUnknownWrapNackTime
+	session.stateLock.Unlock()
 	unboundRoute <- forgedSourceWrappedFrame(t, claimedId, fixture.client.ClientId())
-	fixture.awaitUnknownWrapNack(t)
+	unboundRoute <- nil
+	fixture.barrier(t)
+	session.stateLock.Lock()
+	emitted := session.lastUnknownWrapNackTime != prior
+	session.stateLock.Unlock()
+	if emitted {
+		t.Fatal("unattributed lane emitted feedback through an unrelated existing session")
+	}
 	AssertEqual(t, 1, forgedSourcePeerStateOf(fixture.client, map[Id]bool{claimedId: true}).sessionCount)
 	AssertEqual(t, 1, fixture.unknownWrapNackSessionCount())
 }
@@ -498,4 +521,147 @@ func TestUnknownWrapNackSessionCountIsBounded(t *testing.T) {
 	fixture.barrierOn(t, platformRoute)
 	AssertEqual(t, 1, forgedSourcePeerStateOf(fixture.client, map[Id]bool{sealerIds[2]: true}).sessionCount)
 	AssertEqual(t, 2, fixture.unknownWrapNackSessionCount())
+}
+
+// A custom route has no platform attribution just because its type is unknown.
+func TestUnknownCarrierCannotAllocateRecoverySession(t *testing.T) {
+	f := newForgedSourceFixture(t, nil)
+	route := f.publishUnboundRoute(TransportTypeUnknown)
+	peer := NewId()
+	route <- forgedSourceWrappedFrame(t, peer, f.client.ClientId())
+	route <- nil
+	f.barrier(t)
+	if f.client.encryptionSessionManager.Lookup(peer, sequenceTlsRoleServer, false) != nil || f.unknownWrapNackSessionCount() != 0 {
+		t.Fatal("unattributed carrier allocated recovery state")
+	}
+}
+
+// Reusing the existing peer costs no slot, and refusal on another peer
+// must keep a Required sequence from ever treating nil as a cleartext session.
+func TestOrdinaryEncryptionSessionsShareHardLimit(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		settings := closeWaitClientSettings()
+		settings.EncryptionSettings.Mode = EncryptionModeRequired
+		settings.EncryptionSettings.MaxSessionCount = 1
+		ctx, cancel := context.WithCancel(t.Context())
+		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+		client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+		defer func() { cancel(); client.CloseAndWait(context.Background()) }()
+		peer, other := NewId(), NewId()
+		manager := client.EncryptionSessionManager()
+		held := manager.Acquire(peer, sequenceTlsRoleServer, false)
+		if held == nil {
+			t.Fatal("first session refused")
+		}
+		duplicate := manager.Acquire(peer, sequenceTlsRoleServer, false)
+		if duplicate != held {
+			t.Fatal("same session charged twice")
+		}
+		duplicate.Release()
+		blocked := NewReceiveSequence(ctx, client, SourceId(other), NewId(), sequenceTlsRoleServer, false, DefaultReceiveBufferSettings())
+		if blocked.session != nil || blocked.ctx.Err() == nil {
+			t.Error("full manager admitted a new receiving peer")
+		}
+		if blocked.session != nil {
+			blocked.session.Release()
+		}
+		blocked.cancel()
+		held.Release()
+		manager.Testing_DropSessions(peer)
+		synctest.Wait()
+		recovered := manager.Acquire(NewId(), sequenceTlsRoleServer, false)
+		if recovered == nil {
+			t.Fatal("worker exit did not restore capacity")
+		}
+		recovered.Release()
+	})
+}
+
+// Even with encryption off, a busy peer cannot spend a second sequence slot.
+// An admitted sequence keeps delivering and retirement returns the slot.
+func TestPeerReceiveSequenceLimitKeepsCurrentService(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		settings := closeWaitClientSettings()
+		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
+		settings.EncryptionSettings.Mode = EncryptionModeOff
+		settings.ReceiveBufferSettings.MaxPeerSequenceCount = 1
+		c := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
+		defer func() { cancel(); c.CloseAndWait(context.Background()) }()
+		route := make(Route, 1)
+		c.RouteManager().UpdateTransport(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{route})
+		a, b := NewId(), NewId()
+		for _, p := range []Id{a, b} {
+			c.ContractManager().AddNoContractPeer(p)
+		}
+		delivered := map[Id]int{}
+		c.AddReceiveCallback(func(path TransferPath, frames []*protocol.Frame, _ Peer) { delivered[path.SourceId] += len(frames) })
+		send := func(p, id Id, n uint64) {
+			pack := newReceiveLoopTestPack(t, id, false, "ordinary")
+			pack.SequenceNumber = n
+			pack.Head = n == 0
+			wire, err := ProtoMarshal(&protocol.TransferFrame{TransferPath: TransferPath{SourceId: p, DestinationId: c.ClientId()}.ToProtobuf(), Pack: pack})
+			if err != nil {
+				t.Fatal(err)
+			}
+			route <- wire
+			synctest.Wait()
+		}
+		ai, bi := NewId(), NewId()
+		send(a, ai, 0)
+		send(b, bi, 0)
+		send(a, ai, 1)
+		if delivered[a] != 2 || delivered[b] != 0 {
+			t.Errorf("full receive table delivered %v", delivered)
+		}
+		buffer := c.receiveBuffer
+		buffer.mutex.Lock()
+		for seq := range buffer.activeReceiveSequences {
+			if seq.source.SourceId == a {
+				seq.Cancel()
+			}
+		}
+		buffer.mutex.Unlock()
+		synctest.Wait()
+		send(b, bi, 0)
+		if delivered[b] != 1 {
+			t.Error("retired receive generation did not return its slot")
+		}
+	})
+}
+
+// An exact physical peer lane bounds failed opens before trying more ciphers.
+// Clear repair traffic still runs, and the next second gets a fresh allowance.
+func TestDirectLaneBoundsFailedRecordOpens(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &captureLogger{enabled: true}
+		f := newForgedSourceFixture(t, func(settings *ClientSettings) { settings.Log = log })
+		f.barrier(t)
+		attempts := func() int {
+			log.mu.Lock()
+			defer log.mu.Unlock()
+			n := 0
+			for _, line := range log.info {
+				if strings.Contains(line, "[cr]unwrap err =") {
+					n++
+				}
+			}
+			return n
+		}
+		for range 33 {
+			f.inbound <- forgedSourceWrappedFrame(t, f.peerId, f.client.ClientId())
+		}
+		f.barrier(t)
+		if n := attempts(); n != 32 {
+			t.Fatalf("attempted %d failed opens in one second", n)
+		}
+		time.Sleep(time.Second)
+		f.inbound <- forgedSourceWrappedFrame(t, f.peerId, f.client.ClientId())
+		f.barrier(t)
+		if n := attempts(); n != 33 {
+			t.Fatalf("new window has %d total failed opens", n)
+		}
+	})
 }

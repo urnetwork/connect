@@ -18,10 +18,14 @@ package connect
 // addresses first, and with no successful read it fails closed.
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // ProviderDialRefusedError is the error of a socket the provider dial control
@@ -77,3 +81,41 @@ func (self *providerLocalNetworks) inspectDial(address string, settings *Provide
 		return nil
 	}
 }
+
+// One instance-owned slot lets a generic NAT acquire its provider's precise
+// network snapshot and IPv6 prefix policy before forwarding that provider's work.
+type providerNatDialPolicy struct {
+	current atomic.Pointer[providerLocalGuard]
+}
+
+func newProviderNatDialPolicy(networks *providerLocalNetworks) *providerNatDialPolicy {
+	p := &providerNatDialPolicy{}
+	p.current.Store(&providerLocalGuard{networks: networks, settings: DefaultProviderLocalSecurityPolicySettings()})
+	return p
+}
+
+// Read the immutable policy currently installed by this NAT owner.
+func (self *providerNatDialPolicy) guard() *providerLocalGuard {
+	if self == nil {
+		return nil
+	}
+	return self.current.Load()
+}
+
+// A numeric NAT destination has already passed packet policy. A network change
+// can make it local before its socket opens. Custom and proxied dials receive
+// the same destination check. A direct native socket checks again in ControlContext.
+func dialProviderNatDestination(policy *providerNatDialPolicy, settings *ConnectSettings, mode protocol.ProvideMode, ctx context.Context, network, address string) (net.Conn, error) {
+	if guard := policy.guard(); guard != nil && mode != protocol.ProvideMode_Network {
+		if err := guard.networks.inspectDial(address, guard.settings); err != nil {
+			return nil, err
+		}
+		if settings.ProxySettings == nil {
+			ctx = context.WithValue(ctx, providerNatDialKey{}, guard)
+		}
+	}
+	return settings.DialContext(ctx, network, address)
+}
+
+// Carries the destination policy to the final numeric socket on a direct dial.
+type providerNatDialKey struct{}

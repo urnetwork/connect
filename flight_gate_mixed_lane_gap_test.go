@@ -445,7 +445,7 @@ func newMixedLaneHarnessWithOptions(
 		harness.receiver.RouteManager().UpdateTransportWithProperties(
 			NewReceiveGatewayTransportWithType(TransportTypeP2p),
 			[]Route{receiverInFast},
-			TransferCarrierProperties{Unreliable: true},
+			TransferCarrierProperties{Unreliable: true}.WithAuthenticatedSource(harness.senderId),
 		)
 	}
 	harness.receiver.RouteManager().UpdateTransportWithProperties(

@@ -289,8 +289,13 @@ func (self *ContractManagerStats) ContractOpenByteCount() ByteCount {
 // consistent across client and server. The legacy tag is built in a new
 // array, never in spare capacity behind the caller's bytes.
 func SignStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte) []byte {
+	return signStoredContractAt(settings, provideSecretKey, storedContractBytes, time.Now())
+}
+
+// Choose the wire format using the signer's explicit policy time.
+func signStoredContractAt(settings *ContractManagerSettings, provideSecretKey, storedContractBytes []byte, now time.Time) []byte {
 	mac := hmac.New(sha256.New, provideSecretKey)
-	if time.Now().Before(settings.NetworkEventTimeChangeHmac) {
+	if settings != nil && now.Before(settings.NetworkEventTimeChangeHmac) {
 		// legacy, preserved for peers that predate the cutover. the full
 		// slice expression makes Sum append into a new array.
 		return mac.Sum(storedContractBytes[:len(storedContractBytes):len(storedContractBytes)])
@@ -308,6 +313,11 @@ func SignStoredContract(settings *ContractManagerSettings, provideSecretKey []by
 // contract bytes never verify, because their standard tag is that same
 // key-only value.
 func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []byte, storedContractBytes []byte, storedContractHmac []byte) bool {
+	return verifyStoredContractAt(settings, provideSecretKey, storedContractBytes, storedContractHmac, time.Now())
+}
+
+// Verify the negotiated representation at a specific policy time.
+func verifyStoredContractAt(settings *ContractManagerSettings, provideSecretKey, storedContractBytes, storedContractHmac []byte, now time.Time) bool {
 	if len(storedContractBytes) == 0 {
 		return false
 	}
@@ -316,7 +326,7 @@ func VerifyStoredContract(settings *ContractManagerSettings, provideSecretKey []
 	if hmac.Equal(storedContractHmac, standardMac.Sum(nil)) {
 		return true
 	}
-	if settings == nil || !time.Now().Before(settings.NetworkEventTimeChangeHmac) {
+	if settings == nil || !now.Before(settings.NetworkEventTimeChangeHmac) {
 		return false
 	}
 	legacyMac := hmac.New(sha256.New, provideSecretKey)

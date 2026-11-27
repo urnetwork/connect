@@ -17,6 +17,9 @@ const MaxStreamAuthorizationLease = 90 * time.Second
 // anchor at the request's send time makes arbitrary response/network delay
 // conservative. Client wall clock is never used in lease conversion.
 const StreamAuthorizationClockMargin = 30 * time.Second
+
+// Retain the generation through the platform binding and its final in-flight grant.
+const streamAuthorizationRetention = 8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin
 const maxStreamAuthorizationRecords = 4096
 const maxPendingStreamAuthorizations = 128
 
@@ -89,16 +92,21 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 	}
 	now := state.now()
 	for key, record := range state.records {
-		if !now.Before(record.retainUntil) {
-			if record.timer != nil {
-				record.timer.Stop()
-			}
-			delete(state.records, key)
+		if now.Before(record.retainUntil) {
+			continue
 		}
+		if !record.retired {
+			if now.Before(record.deadline) {
+				continue
+			}
+			// The expiry callback may still be waiting for this lock.
+			self.retireKnownStreamWithLock(key, record)
+		}
+		delete(state.records, key)
 	}
 	previous := state.records[id]
 	if len(open.AuthorizationGeneration) == 0 {
-		if previous != nil || state.pending[id] != nil {
+		if previous != nil || !self.streamAuthorizationActiveWithLock(id) {
 			return nil
 		}
 		return run()
@@ -155,7 +163,7 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 		// Expiry consumes the reserved slot as retirement, not free capacity.
 		// A later close must not lose this known binding when the table fills.
 		if pending != nil && previous == nil {
-			state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: now.Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+			state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: now.Add(streamAuthorizationRetention)}
 		}
 		return nil
 	}
@@ -163,21 +171,22 @@ func (self *StreamManager) authorizeStreamOpen(open *protocol.StreamOpen, run fu
 		if len(state.records)+len(state.pending) >= maxStreamAuthorizationRecords {
 			return nil
 		}
-		previous = &streamAuthorizationRecord{generation: generation, retainUntil: now.Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+		previous = &streamAuthorizationRecord{generation: generation, retainUntil: now.Add(streamAuthorizationRetention)}
 		state.records[id] = previous
 	} else if !now.Before(previous.deadline) {
-		previous.retired = true
-		self.streamBuffer.CloseStream(id)
+		self.retireKnownStreamWithLock(id, previous)
 		return nil
 	}
 	if deadline.After(previous.deadline) {
 		previous.deadline = deadline
-	}
-	if previous.timer != nil {
-		previous.timer.Stop()
+		previous.retainUntil = now.Add(streamAuthorizationRetention)
 	}
 	record := previous
-	previous.timer = time.AfterFunc(max(0, record.deadline.Sub(now)), func() { self.expireStreamAuthorization(id, record) })
+	if record.timer == nil {
+		record.timer = time.AfterFunc(record.deadline.Sub(now), func() { self.expireStreamAuthorization(id, record) })
+	} else {
+		record.timer.Reset(record.deadline.Sub(now))
+	}
 	return run()
 }
 func (self *StreamManager) expireStreamAuthorization(id Id, record *streamAuthorizationRecord) {
@@ -188,11 +197,19 @@ func (self *StreamManager) expireStreamAuthorization(id Id, record *streamAuthor
 		return
 	}
 	if remaining := record.deadline.Sub(state.now()); remaining > 0 {
-		record.timer = time.AfterFunc(remaining, func() { self.expireStreamAuthorization(id, record) })
+		record.timer.Reset(remaining)
 		return
 	}
+	self.retireKnownStreamWithLock(id, record)
+}
+
+// End the exact live owner before its retention index can be collected.
+func (self *StreamManager) retireKnownStreamWithLock(id Id, record *streamAuthorizationRecord) {
 	record.retired = true
-	delete(state.pending, id)
+	if record.timer != nil {
+		record.timer.Stop()
+	}
+	delete(self.authorization.pending, id)
 	self.forgetRejectedStreamOpen(id)
 	self.streamBuffer.CloseStream(id)
 }
@@ -212,12 +229,10 @@ func (self *StreamManager) retireStreamAuthorization(id Id, generation []byte) {
 		if len(generation) > 0 && !bytes.Equal(record.generation.Bytes(), generation) {
 			return
 		}
-		record.retired = true
-		if record.timer != nil {
-			record.timer.Stop()
-		}
+		self.retireKnownStreamWithLock(id, record)
+		return
 	} else if gen, err := IdFromBytes(generation); err == nil && (pending != nil || len(state.records)+len(state.pending) < maxStreamAuthorizationRecords) {
-		state.records[id] = &streamAuthorizationRecord{generation: gen, retired: true, retainUntil: state.now().Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+		state.records[id] = &streamAuthorizationRecord{generation: gen, retired: true, retainUntil: state.now().Add(streamAuthorizationRetention)}
 	}
 	delete(state.pending, id)
 	self.forgetRejectedStreamOpen(id)
@@ -227,8 +242,26 @@ func (self *StreamManager) streamAuthorizationActive(id Id) bool {
 	state := self.authorization
 	state.Lock()
 	defer state.Unlock()
-	record := state.records[id]
-	return !state.closed && (record == nil || !record.retired && state.now().Before(record.deadline))
+	return self.streamAuthorizationActiveWithLock(id)
+}
+
+// A pending grant and a leased lifecycle both carry positive evidence that
+// this id requires authority, even if the index has no active record.
+func (self *StreamManager) streamAuthorizationActiveWithLock(id Id) bool {
+	state := self.authorization
+	if state.closed || state.pending[id] != nil {
+		return false
+	}
+	if record := state.records[id]; record != nil {
+		return !record.retired && state.now().Before(record.deadline)
+	}
+	self.rejectedStreamsLock.Lock()
+	rejected := self.rejectedStreams[id]
+	self.rejectedStreamsLock.Unlock()
+	if rejected != nil && rejected.authorization != nil {
+		return false
+	}
+	return self.streamBuffer == nil || !self.streamBuffer.hasLeasedLifecycle(id)
 }
 func (self *StreamManager) requestAuthorizationClock() {
 	state := self.authorization
@@ -315,11 +348,28 @@ func (self *StreamManager) withStreamAuthorization(id Id, run func()) {
 	state := self.authorization
 	state.Lock()
 	defer state.Unlock()
-	record := state.records[id]
-	if !state.closed && (record == nil || !record.retired && state.now().Before(record.deadline)) {
+	if self.streamAuthorizationActiveWithLock(id) {
 		run()
 	}
 }
+
+// An authoritative reset can relist an active or pending lease only by
+// its immutable generation. Pending grants stay reserved until the clock arrives.
+func (self *StreamManager) resetStreamAuthority(id Id, generation []byte) (matches, active bool) {
+	state := self.authorization
+	state.Lock()
+	defer state.Unlock()
+	if pending := state.pending[id]; pending != nil {
+		return bytes.Equal(generation, pending.AuthorizationGeneration), false
+	}
+	if record := state.records[id]; record != nil {
+		if !bytes.Equal(generation, record.generation[:]) {
+			return false, false
+		}
+	}
+	return true, self.streamAuthorizationActiveWithLock(id)
+}
+
 func (self *StreamManager) retireAbsentAuthorizations(keep map[Id]bool) {
 	state := self.authorization
 	state.Lock()
@@ -331,7 +381,7 @@ func (self *StreamManager) retireAbsentAuthorizations(keep map[Id]bool) {
 			if state.records[id] == nil {
 				generation, err := IdFromBytes(open.AuthorizationGeneration)
 				if err == nil {
-					state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: state.now().Add(8*time.Hour + MaxStreamAuthorizationLease + StreamAuthorizationClockMargin)}
+					state.records[id] = &streamAuthorizationRecord{generation: generation, retired: true, retainUntil: state.now().Add(streamAuthorizationRetention)}
 				}
 			}
 			delete(state.pending, id)
