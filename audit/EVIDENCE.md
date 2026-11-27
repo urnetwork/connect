@@ -79,6 +79,47 @@ dispositions, repository revisions and reproduction commands.
 | P6 | The single receive loop never blocks on TLS state, so one peer cannot stall all peers | §4.7 |
 | P7 | The inner (sealed) `TransferPath` is authenticated; tampering with the outer routing path is detected | §3.3 |
 
+#### Regression tests for changing conditions
+
+| Claim | Transition and observable result |
+| --- | --- |
+| P1 · Record integrity | The fixed record vector checks the nonce, ciphertext and tag. A different key, changed tag or truncated record is refused. The two-client rollover test also identifies which real TLS epoch can open each application write. [Record vector](../transfer_encrypt_record_test.go) · [Rollover](../transfer_encrypt_rekey_wire_test.go) |
+| P2 · Key and proof gating | Paired TLS endpoints derive the same two exporter values only after completion. A restarting client stays application-ineligible until the proof for its current handshake arrives. [Exporters](../transfer_encrypt_record_test.go) · [Restart](../transfer_encrypt_restart_wire_test.go) |
+| P3 · Peer identity | The restarting peer sees a genuine earlier proof before or after the new ClientHello. Its new epoch authenticates with the fresh proof, and accepted reliable data is delivered once, including when its wire record is repeated. [Restart](../transfer_encrypt_restart_wire_test.go) |
+| P4 · Required-mode writes | A writer paused after certificate comparison uses the epoch it checked even when a real rekey finishes. The committed replacement carries a reliable retry and a no-ACK write. An uncommitted replacement refuses the retry, the no-ACK fast path and a fresh reliable write. A plaintext-only peer is also refused. [Rollover](../transfer_encrypt_rekey_wire_test.go) · [Required and legacy cases](../transfer_encrypt_contract_test.go) |
+| P5 · Hybrid agreement | Two Required clients complete an actual hybrid handshake. Removing the common post-quantum group leaves application traffic blocked. [Group negotiation](../transfer_encrypt_post_quantum_test.go) |
+| P6 · Worker isolation | The TLS inbox refuses input at its ceiling and releases retained bytes on close. Cancelling a receive sequence at either side of buffer handoff preserves application delivery for another peer and balances both memory budgets. [TLS lifetime](../transfer_encrypt_transport_lifetime_test.go) · [Receive custody](../transfer_receive_pack_custody_test.go) |
+| P7 · Authenticated path | A sealed record with an absent or different inner destination is refused. The same client still receives a sealed record with matching paths. [Receive path](../transfer_receive_loop_crash_test.go) |
+
+The certificate rollover tests consume complete frames from the server's real `CreateContract` path. The checked-in fixture uses synthetic identities and leaves. The connect tests run with a fixed virtual clock before the signed contract deadlines. To check current server issuance alongside current connect code, run this from the workspace root containing both checkouts.
+
+```bash
+verification_dir=$(mktemp -d /tmp/urnetwork-tls-contracts.XXXXXX)
+(
+  cd server &&
+  go test -mod=readonly -race -c -o "$verification_dir/controller.test" ./controller &&
+  source ./test-env.sh &&
+  cd controller &&
+  URNETWORK_TLS_CONTRACT_FIXTURE_OUT="$verification_dir/issued.json" WARP_TEST_ENV_FAIL_FAST=1 \
+    "$verification_dir/controller.test" -test.count=1 -test.run '^TestIssueContractsForRequiredSessionRekey$'
+) && (
+  cd connect &&
+  URNETWORK_TLS_CONTRACT_FIXTURE_IN="$verification_dir/issued.json" go test -mod=readonly -race -count=1 \
+    -run '^TestRequiredSession(Committed|Uncommitted)CertificateRekey$' .
+)
+```
+
+The server preflight runs after compilation so its readiness attestation is fresh when the test starts. The controller allocates fresh ids and deadlines on each run. Refresh the checked-in fixture from a successful issuance and consumer run when the contract format changes. [Fixture producer](../../server/controller/connect_contract_tls_session_test.go) · [Checked-in frames](../testdata/tls_session_contracts.json)
+
+The other audit boundaries have their own composed checks.
+
+| Boundary | Change under test |
+| --- | --- |
+| Provider sockets | A public destination becomes provider-local between admission and TCP or UDP connect. Verify both the NAT and native pre-connect refusals. [Numeric dial](../ip_security_nat_dial_test.go) |
+| Stream authorization | Keep renewing through the first retention horizon. Expire the exact published lifecycle and verify the independently listed stream stays available. [Lease retention](../transfer_stream_authorization_retention_test.go) |
+| DNS carrier | Refuse an out-of-bounds request or invalid response, then deliver valid traffic on the same worker. [Request worker](../transport_pt_decode_bounds_test.go) · [Response worker](../transport_pt_codec_header_test.go) |
+| Gossip | Exhaust one authenticated peer's stream quota. Exchange bytes on a second authenticated connection after the refusal. [Live peer test](../gossip/node_limits_test.go) |
+
 ### 1.3 Known limitations we ask you to review explicitly
 
 | # | Limitation | Where |

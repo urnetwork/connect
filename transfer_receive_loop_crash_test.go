@@ -172,6 +172,12 @@ func TestSealedFrameWithoutInnerPathDoesNotStopTheClient(t *testing.T) {
 	inbound <- seal(&protocol.TransferFrame{
 		Pack: newReceiveLoopTestPack(t, NewId(), false, "without inner path"),
 	})
+	wrongPath := path
+	wrongPath.DestinationId = NewId()
+	inbound <- seal(&protocol.TransferFrame{
+		TransferPath: wrongPath.ToProtobuf(),
+		Pack:         newReceiveLoopTestPack(t, NewId(), false, "different inner destination"),
+	})
 	inbound <- seal(&protocol.TransferFrame{
 		TransferPath: path.ToProtobuf(),
 		Pack:         newReceiveLoopTestPack(t, NewId(), false, "after"),

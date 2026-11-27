@@ -11,6 +11,15 @@ import (
 // An injected worker exit on either side of a real handoff must release
 // the same leaf and parent exactly once. All input packs are ordinary data.
 func TestReceivePackWorkerExitBalancesCustody(t *testing.T) {
+	testReceivePackWorkerExit(t, func(*ReceiveSequence) { panic("synthetic receive worker exit") })
+}
+
+func TestReceivePackCancellationBalancesCustody(t *testing.T) {
+	testReceivePackWorkerExit(t, (*ReceiveSequence).Cancel)
+}
+
+func testReceivePackWorkerExit(t *testing.T, interrupt func(*ReceiveSequence)) {
+	t.Helper()
 	assertMessagePoolOwnership(t)
 	for _, stage := range []string{"pack_released", "head_buffered"} {
 		for _, noAck := range []bool{false, true} {
@@ -35,7 +44,7 @@ func TestReceivePackWorkerExitBalancesCustody(t *testing.T) {
 						if owner == nil || rx.UsedByteCount() == 0 {
 							t.Error("worker had no charged owner")
 						}
-						panic("synthetic receive worker exit")
+						interrupt(sequence)
 					}
 				}
 				client := NewClient(ctx, NewId(), NewNoContractClientOob(), settings)
@@ -47,9 +56,12 @@ func TestReceivePackWorkerExitBalancesCustody(t *testing.T) {
 				})
 				in := make(Route, 1)
 				client.RouteManager().UpdateTransport(NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{in})
-				siblingCount := 0
+				sourceCount, siblingCount := 0, 0
 				client.AddReceiveCallback(func(path TransferPath, frames []*protocol.Frame, _ Peer) {
-					if path.SourceId == sibling {
+					switch path.SourceId {
+					case source:
+						sourceCount += len(frames)
+					case sibling:
 						siblingCount += len(frames)
 					}
 				})
@@ -66,9 +78,15 @@ func TestReceivePackWorkerExitBalancesCustody(t *testing.T) {
 					in <- wire
 					synctest.Wait()
 				}
-				if !interrupted || siblingCount != 1 || rx.UsedByteCount() != 0 || root.UsedByteCount() != 0 {
-					t.Errorf("stage %s noAck=%t interrupted=%t sibling=%d leaf=%d parent=%d",
-						stage, noAck, interrupted, siblingCount, rx.UsedByteCount(), root.UsedByteCount())
+				wantSourceCount := 0
+				// Only the delivery batch owns an accepted frame when the
+				// worker exits. It dispatches that frame before returning it.
+				if stage == "head_buffered" {
+					wantSourceCount = 1
+				}
+				if !interrupted || sourceCount != wantSourceCount || siblingCount != 1 || rx.UsedByteCount() != 0 || root.UsedByteCount() != 0 {
+					t.Errorf("stage %s noAck=%t interrupted=%t source=%d (want %d) sibling=%d leaf=%d parent=%d",
+						stage, noAck, interrupted, sourceCount, wantSourceCount, siblingCount, rx.UsedByteCount(), root.UsedByteCount())
 				}
 			})
 		}

@@ -17,9 +17,11 @@
 package gossip
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -445,4 +447,59 @@ func TestGossipConnectionAndPeerQuotaRecovery(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Keep a negotiated stream active on a second authenticated connection while
+// the first identity fills its inbound quota and receives a refusal.
+func TestGossipPeerQuotaPreservesSiblingTraffic(t *testing.T) {
+	target := newTestGossipTarget(t, func(settings *NodeSettings) {
+		limits := DefaultNodeResourceLimits(settings.ConnManagerHighWater)
+		limits.PeerInboundStreamCount = 1
+		settings.ResourceLimits = limits
+		settings.NegotiationTimeout = testHeldNegotiationTimeout
+	})
+	const echo = "/urnetwork/test/echo/1.0.0"
+	target.node.host.SetStreamHandler(echo, func(stream network.Stream) {
+		defer stream.Close()
+		var buffer [16]byte
+		for {
+			if _, err := io.ReadFull(stream, buffer[:]); err != nil {
+				return
+			}
+			if _, err := stream.Write(buffer[:]); err != nil {
+				return
+			}
+		}
+	})
+	sibling, err := target.dial(newTestKey(t)).OpenStream(target.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sibling.Close()
+	if err := sibling.SetDeadline(time.Now().Add(testMeshTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	if err := multistream.SelectProtoOrFail(echo, sibling); err != nil {
+		t.Fatal(err)
+	}
+	exchange := func(value byte) {
+		t.Helper()
+		sent := bytes.Repeat([]byte{value}, 16)
+		if _, err := sibling.Write(sent); err != nil {
+			t.Fatal(err)
+		}
+		received := make([]byte, len(sent))
+		if _, err := io.ReadFull(sibling, received); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(sent, received) {
+			t.Fatalf("sibling returned %x, want %x", received, sent)
+		}
+	}
+	exchange(1)
+	other := target.dial(newTestKey(t))
+	if !openHeldStream(t, target.ctx, other) || openHeldStream(t, target.ctx, other) {
+		t.Fatal("the first stream should fit and the second should be refused")
+	}
+	exchange(2)
 }
