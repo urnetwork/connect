@@ -523,7 +523,7 @@ func (self *BringYourApi) connectControlWithCtx(ctx context.Context, connectCont
 		HttpPostWithRawFunction(
 			ctx,
 			func(ctx context.Context, requestUrl string, body []byte, byJwt string) ([]byte, error) {
-				return httpPostWithStrategyRaw(ctx, self.clientStrategy, requestUrl, body, byJwt, probeClaimed)
+				return httpPostWithStrategyRaw(ctx, self.clientStrategy, requestUrl, body, byJwt, probeClaimed, 0)
 			},
 			fmt.Sprintf("%s/connect/control", self.apiUrl),
 			connectControl,

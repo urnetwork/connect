@@ -291,12 +291,22 @@ func (self *ExtenderActivateResult) KeyHeldByAnotherNetwork() bool {
 // PostExtenderActivate posts one activation to one family api url (C2). The
 // strategy must be direct-only: an activation that crossed an extender would
 // publish that extender's address as this host's.
+//
+// `requestTimeout` is the post's own budget, which replaces the strategy's
+// bounds for this post alone where it is longer (ClientStrategy.httpSerial).
+// The operator answers only once its probe of this host has run: for a host
+// whose tcp carrier it does not reach, the tcp challenge and then the webrtc
+// test, which ends up to 15 s after the judging began, and the store after it
+// (S8). That can outlast the strategy's 15 s, which gave up on such an
+// activation before its answer came (support inbox 8791). ctx still ends the
+// post.
 func PostExtenderActivate(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
 	apiUrl string,
 	byJwt string,
 	args *ExtenderActivateArgs,
+	requestTimeout time.Duration,
 ) (*ExtenderActivateResult, error) {
 	if clientStrategy == nil {
 		return nil, fmt.Errorf("the extender activation needs a client strategy")
@@ -308,9 +318,11 @@ func PostExtenderActivate(
 	if apiUrl == "" {
 		return nil, fmt.Errorf("the extender activation needs an api url")
 	}
-	return HttpPostWithStrategy(
+	return HttpPostWithRawFunction(
 		ctx,
-		clientStrategy,
+		func(ctx context.Context, requestUrl string, requestBodyBytes []byte, byJwt string) ([]byte, error) {
+			return httpPostWithStrategyRaw(ctx, clientStrategy, requestUrl, requestBodyBytes, byJwt, false, requestTimeout)
+		},
 		apiUrl+ExtenderActivatePath,
 		args,
 		byJwt,
@@ -482,7 +494,11 @@ type ExtenderActivatorSettings struct {
 	// minute keeps an operator's short answer from turning the loop into a
 	// poll. Non-positive takes the default.
 	MinRetryAfter time.Duration
-	// Budget of one activation post and of one hello.
+	// Budget of one activation post, which replaces the strategy's own bounds
+	// for that post alone (PostExtenderActivate): the operator answers once its
+	// probe of this host has run, which can outlast them. It also bounds one
+	// hello, which the strategy's bounds hold to theirs as any api call.
+	// Non-positive takes the default.
 	RequestTimeout time.Duration
 	// A resume from a sleep of at least ResumeMinSleep pulls the address
 	// check and the re-activation forward by the time slept, so each comes
@@ -864,7 +880,7 @@ func NewExtenderActivator(
 		copied.ReplacedPostJitter = DefaultExtenderActivatorSettings().ReplacedPostJitter
 	}
 	if copied.RequestTimeout <= 0 {
-		copied.RequestTimeout = 60 * time.Second
+		copied.RequestTimeout = DefaultExtenderActivatorSettings().RequestTimeout
 	}
 	if copied.Run == nil {
 		copied.Run = ExtenderProcessRun()
@@ -1898,6 +1914,7 @@ func (self *ExtenderActivator) activateUrl(
 		apiUrl,
 		self.byJwt(),
 		args,
+		self.settings.RequestTimeout,
 	)
 	if err != nil {
 		if self.ctx.Err() != nil {

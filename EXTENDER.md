@@ -1428,7 +1428,12 @@ moved. A pass posts the families that are due, in ip version order, each to
 its family api url with the client jwt through a direct-only client
 strategy, since an activation that crossed an extender would publish the
 extender's address; it applies the bootstrap records to the directory and
-records the status. A success moves the family to its tick. A failure holds
+records the status. A post waits for its answer as long as the loop's request
+budget, 60 s, and not the strategy's 15 s, which bound every request until
+2026-11-27 (support inbox 8791): the operator answers only once its probe has
+run, and for a host whose tcp carrier it does not reach the webrtc test ends
+up to 15 s after the judging began, before the store (S8). Every other request
+of the strategy keeps its 15 s. A success moves the family to its tick. A failure holds
 that family alone, 10 minutes doubling to 6 hours, and a success resets its
 hold, so a family the operator keeps refusing never re-posts one that works.
 A refusal that carries `retry_after_seconds` (C2: a spent activation budget,

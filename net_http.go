@@ -2164,18 +2164,22 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 }
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
-	return self.serialEvalWithAttemptContext(ctx, eval, helloEval, preferredEvalAttemptContext)
+	return self.serialEvalWithAttemptContext(ctx, eval, helloEval, preferredEvalAttemptContext, self.settings.RequestTimeout)
 }
 
 // HTTP can distinguish a stalled route from a request already written;
 // other evaluators retain their complete-attempt timeout semantics.
+// `requestTimeout` bounds the whole evaluation: the strategy's RequestTimeout,
+// or the longer budget of a request's own (httpSerial). The hellos it races
+// keep the strategy's.
 func (self *ClientStrategy) serialEvalWithAttemptContext(
 	ctx context.Context,
 	eval func(context.Context, *clientDialer) *evalResult,
 	helloEval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+	requestTimeout time.Duration,
 ) *evalResult {
-	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
+	handleCtx, handleCancel := context.WithTimeout(ctx, requestTimeout)
 	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
 	// goroutine parked for the call: the callback starts only if the strategy
 	// is canceled first. The bridge is function-owned; join a started callback
@@ -2431,11 +2435,43 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 }
 
 func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http.Request) (*httpResult, error) {
+	return self.httpSerial(request, helloRequest, 0)
+}
+
+// HttpSerial with a budget of the request's own, `requestTimeout`, for a
+// request the server answers only after work that can outlast the strategy's
+// bounds: an extender activation, which the operator answers once its probe of
+// the host has run (PostExtenderActivate). The budget lengthens, for this
+// request alone, each bound of the strategy that would end it first: the
+// whole request and each attempt's client timeout (RequestTimeout), and each
+// attempt's wait for the response headers once the request is written
+// (ConnectTimeout, when it bounds that wait at all). Each attempt then takes a
+// client of its own (acquireOneRequestHttpClient), since the strategy's cached
+// clients carry those bounds for every other request. The hellos it races keep
+// the strategy's bounds, and the request's context still ends it. A budget
+// that no bound would cut short, or a non-positive one, keeps the strategy's
+// cached client.
+func (self *ClientStrategy) httpSerial(
+	request *http.Request,
+	helloRequest *http.Request,
+	requestTimeout time.Duration,
+) (*httpResult, error) {
 	// in this order:
 	// 1. try all dialers that previously worked sequentially
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
+	serialTimeout := self.settings.RequestTimeout
+	responseHeaderTimeout := self.settings.ConnectTimeout
+	if 0 < requestTimeout {
+		serialTimeout = max(serialTimeout, requestTimeout)
+		if 0 < responseHeaderTimeout {
+			responseHeaderTimeout = max(responseHeaderTimeout, requestTimeout)
+		}
+	}
+	oneRequestClient := serialTimeout != self.settings.RequestTimeout ||
+		responseHeaderTimeout != self.settings.ConnectTimeout
+
 	if err := validateHttpRequestForAttempts(request); err != nil {
 		return nil, err
 	}
@@ -2468,7 +2504,13 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		if err != nil {
 			return causes.track(&evalResult{err: err})
 		}
-		httpClient, httpPool := dialer.acquireHttpClient()
+		var httpClient *http.Client
+		var httpPool *clientHttpPool
+		if oneRequestClient {
+			httpClient, httpPool = dialer.acquireOneRequestHttpClient(serialTimeout, responseHeaderTimeout)
+		} else {
+			httpClient, httpPool = dialer.acquireHttpClient()
+		}
 		if httpClient == nil {
 			if attemptRequest.Body != nil {
 				attemptRequest.Body.Close()
@@ -2528,7 +2570,7 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return causes.track(result)
 	}
 
-	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
+	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext, serialTimeout)
 	if result == nil {
 		observeAuthStrategyEnd(request.Context(), self.ctx)
 		return nil, causes.exhausted(request.Context(), self.ctx)
@@ -3330,82 +3372,129 @@ func (self *clientDialer) httpClientWithLock() *http.Client {
 	if self.httpClient == nil {
 		if self.httpClientFactory != nil {
 			self.httpClient = self.httpClientFactory()
-			self.httpPool.httpClient = self.httpClient
-			return self.httpClient
-		}
-		dialTlsContext := self.httpDialTlsContext
-		if dialTlsContext == nil {
-			dialTlsContext = self.dialTlsContext
-		}
-		// control-dial evidence: while an egress interface is forced (the
-		// windows service/app providing a tunnel), each api dial logs its
-		// local bind address so tester logs prove the escape path. See
-		// egress_dial.go; a no-op everywhere else.
-		dialTlsContext = wrapControlDial("api", self.settings.ConnectSettings.Log, true, dialTlsContext)
-		transport := &http.Transport{
-			DialTLSContext:        self.httpPool.dialContext(dialTlsContext, true),
-			IdleConnTimeout:       self.settings.ConnectSettings.IdleConnTimeout,
-			TLSHandshakeTimeout:   self.settings.ConnectSettings.TlsTimeout,
-			ResponseHeaderTimeout: self.settings.ConnectTimeout,
-			ExpectContinueTimeout: self.settings.ConnectTimeout,
-			DisableKeepAlives:     false,
-			ReadBufferSize:        self.settings.HttpReadBufferSize,
-			WriteBufferSize:       self.settings.HttpWriteBufferSize,
-			// A custom DialTLSContext disables net/http's automatic HTTP/2
-			// attempt unless this is set. ConnectControl and peer-key requests
-			// arrive in parallel while a provider window forms; keeping the
-			// implicit HTTP/1.1 fallback opened one TLS connection per request,
-			// repeatedly paying the pinned P-384 certificate-chain verification
-			// and creating visible CPU/pause bursts on mobile. HTTP/2
-			// multiplexes those requests over the established connection.
-			ForceAttemptHTTP2: true,
-		}
-		// A control-plane connection that went dark AFTER connecting is
-		// invisible to any dial-time policy: http/2 multiplexes every later
-		// request onto it and each one hangs to the request timeout, for as
-		// long as the idle pool holds it. Go performs NO health check when
-		// SendPingTimeout is zero (net/http.HTTP2Config: "If zero, no health
-		// check is performed"), which is what leaves that connection in the
-		// pool. The ping is what turns a silent pool poisoning into an
-		// eviction.
-		//
-		// Built unconditionally. The memory-budget fields below are set only
-		// when an embedder asked for them -- that guard is about the mobile
-		// heap -- but it used to gate the whole config, so a desktop build had
-		// no HTTP2Config at all and therefore no health check either.
-		transport.HTTP2 = nativeHttp2Config(&self.settings.ConnectSettings)
-		transport.HTTP2.SendPingTimeout = self.settings.Http2SendPingTimeout
-		transport.HTTP2.PingTimeout = self.settings.Http2PingTimeout
-		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
-			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
-			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
-			0 < self.settings.Http2MaxReceiveBufferPerStream {
-			transport.HTTP2.MaxDecoderHeaderTableSize = self.settings.Http2MaxDecoderHeaderTableSize
-			transport.HTTP2.MaxEncoderHeaderTableSize = self.settings.Http2MaxEncoderHeaderTableSize
-			transport.HTTP2.MaxReceiveBufferPerConnection = self.settings.Http2MaxReceiveBufferPerConnection
-			transport.HTTP2.MaxReceiveBufferPerStream = self.settings.Http2MaxReceiveBufferPerStream
-		}
-		// Plain http:// has no tls dialer through which to reach ConnectSettings.
-		// Always install its DialContext seam so an explicit caller dial remains
-		// authoritative and, without one, the configured resolver, family policy,
-		// proxy, and address race still apply. https:// uses the dialTlsContext
-		// chain above, which reaches the same ConnectSettings.DialContext boundary.
-		//
-		// A dialer with its own plain dial -- an extender -- uses that instead.
-		// The shared settings dial goes straight to the destination, which for
-		// an extender dialer is the one thing it must not do.
-		if self.dialContext != nil {
-			transport.DialContext = self.httpPool.dialContext(self.dialContext, false)
 		} else {
-			transport.DialContext = self.httpPool.dialContext(self.settings.ConnectSettings.DialContext, false)
-		}
-		self.httpClient = &http.Client{
-			Transport: transport,
-			Timeout:   self.settings.RequestTimeout,
+			self.httpClient = self.newHttpClientWithLock(
+				self.httpPool,
+				self.settings.RequestTimeout,
+				self.settings.ConnectTimeout,
+			)
 		}
 		self.httpPool.httpClient = self.httpClient
 	}
 	return self.httpClient
+}
+
+// Lends a client of its own for one request whose bounds are longer than the
+// strategy's (ClientStrategy.httpSerial): `requestTimeout` bounds the request
+// and `responseHeaderTimeout` its wait for the response headers once it is
+// written, over the same dials as the cached client. The cached client's
+// transport holds those bounds for every request it carries, so it cannot
+// lengthen them for one. The client is a one-request owner: the release of the
+// result that acquired it drains it, which closes every socket it dialed. A
+// dialer with a client factory (the alt dialers) builds the client there, with
+// the longer timeout; its round tripper has no response-header wait to
+// lengthen. Nil after terminal retirement, as acquireHttpClient.
+func (self *clientDialer) acquireOneRequestHttpClient(
+	requestTimeout time.Duration,
+	responseHeaderTimeout time.Duration,
+) (*http.Client, *clientHttpPool) {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	if self.retired {
+		return nil, nil
+	}
+	httpPool := newClientHttpPool()
+	if self.httpClientFactory != nil {
+		httpPool.httpClient = self.httpClientFactory()
+		httpPool.httpClient.Timeout = requestTimeout
+	} else {
+		httpPool.httpClient = self.newHttpClientWithLock(httpPool, requestTimeout, responseHeaderTimeout)
+	}
+	httpPool.acquire()
+	// terminal at once, so the one release drains it
+	httpPool.retire()
+	return httpPool.httpClient, httpPool
+}
+
+// A new api client over this dialer's dials, owned by `httpPool`, where every
+// socket it dials is registered. `requestTimeout` bounds each request, and
+// `responseHeaderTimeout` each request's wait for its response headers once it
+// is written.
+func (self *clientDialer) newHttpClientWithLock(
+	httpPool *clientHttpPool,
+	requestTimeout time.Duration,
+	responseHeaderTimeout time.Duration,
+) *http.Client {
+	dialTlsContext := self.httpDialTlsContext
+	if dialTlsContext == nil {
+		dialTlsContext = self.dialTlsContext
+	}
+	// control-dial evidence: while an egress interface is forced (the
+	// windows service/app providing a tunnel), each api dial logs its
+	// local bind address so tester logs prove the escape path. See
+	// egress_dial.go; a no-op everywhere else.
+	dialTlsContext = wrapControlDial("api", self.settings.ConnectSettings.Log, true, dialTlsContext)
+	transport := &http.Transport{
+		DialTLSContext:        httpPool.dialContext(dialTlsContext, true),
+		IdleConnTimeout:       self.settings.ConnectSettings.IdleConnTimeout,
+		TLSHandshakeTimeout:   self.settings.ConnectSettings.TlsTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: self.settings.ConnectTimeout,
+		DisableKeepAlives:     false,
+		ReadBufferSize:        self.settings.HttpReadBufferSize,
+		WriteBufferSize:       self.settings.HttpWriteBufferSize,
+		// A custom DialTLSContext disables net/http's automatic HTTP/2
+		// attempt unless this is set. ConnectControl and peer-key requests
+		// arrive in parallel while a provider window forms; keeping the
+		// implicit HTTP/1.1 fallback opened one TLS connection per request,
+		// repeatedly paying the pinned P-384 certificate-chain verification
+		// and creating visible CPU/pause bursts on mobile. HTTP/2
+		// multiplexes those requests over the established connection.
+		ForceAttemptHTTP2: true,
+	}
+	// A control-plane connection that went dark AFTER connecting is
+	// invisible to any dial-time policy: http/2 multiplexes every later
+	// request onto it and each one hangs to the request timeout, for as
+	// long as the idle pool holds it. Go performs NO health check when
+	// SendPingTimeout is zero (net/http.HTTP2Config: "If zero, no health
+	// check is performed"), which is what leaves that connection in the
+	// pool. The ping is what turns a silent pool poisoning into an
+	// eviction.
+	//
+	// Built unconditionally. The memory-budget fields below are set only
+	// when an embedder asked for them -- that guard is about the mobile
+	// heap -- but it used to gate the whole config, so a desktop build had
+	// no HTTP2Config at all and therefore no health check either.
+	transport.HTTP2 = nativeHttp2Config(&self.settings.ConnectSettings)
+	transport.HTTP2.SendPingTimeout = self.settings.Http2SendPingTimeout
+	transport.HTTP2.PingTimeout = self.settings.Http2PingTimeout
+	if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
+		0 < self.settings.Http2MaxEncoderHeaderTableSize ||
+		0 < self.settings.Http2MaxReceiveBufferPerConnection ||
+		0 < self.settings.Http2MaxReceiveBufferPerStream {
+		transport.HTTP2.MaxDecoderHeaderTableSize = self.settings.Http2MaxDecoderHeaderTableSize
+		transport.HTTP2.MaxEncoderHeaderTableSize = self.settings.Http2MaxEncoderHeaderTableSize
+		transport.HTTP2.MaxReceiveBufferPerConnection = self.settings.Http2MaxReceiveBufferPerConnection
+		transport.HTTP2.MaxReceiveBufferPerStream = self.settings.Http2MaxReceiveBufferPerStream
+	}
+	// Plain http:// has no tls dialer through which to reach ConnectSettings.
+	// Always install its DialContext seam so an explicit caller dial remains
+	// authoritative and, without one, the configured resolver, family policy,
+	// proxy, and address race still apply. https:// uses the dialTlsContext
+	// chain above, which reaches the same ConnectSettings.DialContext boundary.
+	//
+	// A dialer with its own plain dial -- an extender -- uses that instead.
+	// The shared settings dial goes straight to the destination, which for
+	// an extender dialer is the one thing it must not do.
+	if self.dialContext != nil {
+		transport.DialContext = httpPool.dialContext(self.dialContext, false)
+	} else {
+		transport.DialContext = httpPool.dialContext(self.settings.ConnectSettings.DialContext, false)
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   requestTimeout,
+	}
 }
 
 func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.Dialer {
@@ -3746,11 +3835,13 @@ func HttpPostWithStrategyRaw(
 	requestBodyBytes []byte,
 	byJwt string,
 ) ([]byte, error) {
-	return httpPostWithStrategyRaw(ctx, clientStrategy, requestUrl, requestBodyBytes, byJwt, false)
+	return httpPostWithStrategyRaw(ctx, clientStrategy, requestUrl, requestBodyBytes, byJwt, false, 0)
 }
 
 // Only the private control-call boundary enables this self-reported marker.
 // Hello discovery and shared strategy headers remain untouched.
+// `requestTimeout` is the post's own budget where it outlasts the strategy's
+// bounds (ClientStrategy.httpSerial), and 0 keeps the strategy's.
 func httpPostWithStrategyRaw(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
@@ -3758,6 +3849,7 @@ func httpPostWithStrategyRaw(
 	requestBodyBytes []byte,
 	byJwt string,
 	probeControl bool,
+	requestTimeout time.Duration,
 ) ([]byte, error) {
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -3785,7 +3877,7 @@ func httpPostWithStrategyRaw(
 		return nil, err
 	}
 
-	r, err := clientStrategy.HttpSerial(request, helloRequest)
+	r, err := clientStrategy.httpSerial(request, helloRequest, requestTimeout)
 	if err != nil {
 		return nil, err
 	}
