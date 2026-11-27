@@ -83,8 +83,10 @@ func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multi
 	}
 	if hasSyn && len(parents) != 0 {
 		if update.IsDone() {
+			// The generation ended between its lookup and this admission.
 			admission.releaseTcpRecoveryWithLock()
 			update.stateLock.Unlock()
+			parents[0].recordFlowGenerationDrop(self, batchAdmission)
 			return false
 		}
 		// The existing send defer releases this scalar; no descriptor is

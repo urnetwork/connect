@@ -1847,6 +1847,9 @@ type RemoteUserNatMultiClient struct {
 	// Redundant TCP packets are deliberately refused before admission. Count
 	// packets, not send calls, so singular and grouped sends reconcile alike.
 	tcpCollapseDropCount atomic.Uint64
+	// Packets refused because their exact tuple could take no flow generation,
+	// counted in packets at the caller's final offer (recordFlowGenerationDrop).
+	flowGenerationDropCount atomic.Uint64
 	// Best-effort removal-generated packets are delivered by one isolated
 	// worker. A permanently blocked downstream therefore cannot wedge the
 	// maintenance paths; the fixed queue caps retained packets and memory.
@@ -7729,6 +7732,29 @@ func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
 	return self.tcpCollapseDropCount.Load()
 }
 
+// Reports lifetime packet refusals caused only by a tuple that could take no
+// flow generation when the packet was offered: an ended generation of the same
+// tuple (completed, removed or renewed) was still inside its application
+// delivery callback, which the device's own TCP can answer before the callback
+// returns, as its reset or re-acknowledgement of a completed flow's late packet
+// does; a renewal held the tuple; the generation ended while the packet was
+// admitted; or the client had closed. These are not security blocks, TCP
+// collapse or exit admission failures. Counted in packets once, at the caller's
+// final offer. Safe to read concurrently with sends.
+func (self *RemoteUserNatMultiClient) FlowGenerationDropCount() uint64 {
+	return self.flowGenerationDropCount.Load()
+}
+
+// Counts a final refusal of a group whose tuple could take no flow generation.
+// A ready pass the batch offers again and an internal SYN retry, whose original
+// the application already handed over, are not final refusals.
+func (self *RemoteUserNatMultiClient) recordFlowGenerationDrop(group *parsedPacketGroup, admission *ipPacketGroupAdmission) {
+	if group.isSynRetry() || admission != nil && admission.probing {
+		return
+	}
+	self.flowGenerationDropCount.Add(uint64(len(group.packets)))
+}
+
 // AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
 // every window client's transports, passed through unchanged (DELAY.md §9).
 // Callbacks run on transport goroutines and must not block.
@@ -8775,6 +8801,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			}
 		}
 	})
+	if !success && sentUpdate == nil {
+		// The affinity path handed this offer no generation: the tuple was
+		// held by an ended generation's executing callback or by a renewal,
+		// or the client had closed. Counted, so no such refusal is silent.
+		self.recordFlowGenerationDrop(sendPacketGroup, batchAdmission)
+	}
 	// Commit close state only after the group was accepted by an exit and
 	// sendClientPath finished its client bookkeeping. A failed/backpressured
 	// FIN or RST must not retire a flow that is still live upstream.
