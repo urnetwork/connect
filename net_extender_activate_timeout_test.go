@@ -2,13 +2,17 @@ package connect
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -380,6 +384,76 @@ func TestExtenderActivateBudgetIsTheActivationsAlone(t *testing.T) {
 		}
 		if requestTimeout := DefaultClientStrategySettings().RequestTimeout; elapsed != requestTimeout {
 			t.Fatalf("the post ended after %s (%s); expected at the strategy's %s", elapsed, err, requestTimeout)
+		}
+	})
+}
+
+// A request whose budget no bound of the strategy would cut short keeps the
+// strategy's cached client: one with no budget of its own, whatever its
+// bounds -- an unbounded response-header wait (a ConnectTimeout of zero or
+// less) included -- and one whose budget is within them. Only a positive
+// budget that a positive bound would end first takes a client of its own.
+func TestHttpSerialWithinTheStrategysBoundsKeepsTheCachedClient(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, connectTimeout := range []time.Duration{15 * time.Second, 0, -1} {
+			for _, requestTimeout := range []time.Duration{0, 10 * time.Second} {
+				ctx, cancel := context.WithCancel(context.Background())
+				settings := DefaultClientStrategySettings()
+				settings.ConnectTimeout = connectTimeout
+				// only a client of its own dials. Its dial ends the request at
+				// once, which would otherwise retry the route, failing as fast,
+				// for as long as its deadline allows
+				var ownClientDials atomic.Int32
+				settings.ConnectSettings.DialContextSettings = &DialContextSettings{
+					DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+						ownClientDials.Add(1)
+						cancel()
+						return nil, errors.New("test: a client of its own dialed")
+					},
+				}
+				posts := 0
+				dialer := &clientDialer{
+					description:     "cached",
+					minimumWeight:   1,
+					settings:        settings,
+					successCount:    1,
+					lastSuccessTime: time.Now(),
+					httpClient: &http.Client{Transport: serialTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+						if request.Method == http.MethodPost {
+							posts += 1
+						}
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Header:     http.Header{},
+							Body:       io.NopCloser(bytes.NewBufferString(`{}`)),
+							Request:    request,
+						}, nil
+					})},
+				}
+				strategy := &ClientStrategy{
+					ctx:               ctx,
+					log:               NewNoopLogger(),
+					settings:          settings,
+					dialers:           map[*clientDialer]bool{dialer: true},
+					extenderIpSecrets: map[netip.Addr]string{},
+				}
+				request, err := http.NewRequestWithContext(ctx, http.MethodPost, testActivateTimeoutApiUrl+"/auth-client", bytes.NewBufferString(`{}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				hello, err := http.NewRequestWithContext(ctx, http.MethodGet, testActivateTimeoutApiUrl+"/hello", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := strategy.httpSerial(request, hello, requestTimeout)
+				if err != nil || result == nil || posts != 1 || ownClientDials.Load() != 0 {
+					t.Errorf(
+						"ConnectTimeout %s, budget %s: err=%v posts=%d dials of a client of its own=%d; expected the cached client to answer the one post",
+						connectTimeout, requestTimeout, err, posts, ownClientDials.Load(),
+					)
+				}
+				cancel()
+			}
 		}
 	})
 }

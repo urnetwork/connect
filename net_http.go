@@ -2441,14 +2441,16 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 // HttpSerial with a budget of the request's own, `requestTimeout`, for a
 // request the server answers only after work that can outlast the strategy's
 // bounds: an extender activation, which the operator answers once its probe of
-// the host has run (PostExtenderActivate). Where the budget is longer, it
-// replaces the strategy's bounds for this request alone -- the whole request,
-// each attempt's client timeout (RequestTimeout) and each attempt's wait for
-// the response headers once the request is written (ConnectTimeout) -- and each
-// attempt takes a client of its own (acquireOneRequestHttpClient), since the
-// strategy's cached clients carry those bounds for every other request. The
-// hellos it races keep the strategy's bounds, and the request's context still
-// ends it. A budget within the strategy's bounds, or non-positive, keeps them.
+// the host has run (PostExtenderActivate). The budget lengthens, for this
+// request alone, each bound of the strategy that would end it first: the
+// whole request and each attempt's client timeout (RequestTimeout), and each
+// attempt's wait for the response headers once the request is written
+// (ConnectTimeout, when it bounds that wait at all). Each attempt then takes a
+// client of its own (acquireOneRequestHttpClient), since the strategy's cached
+// clients carry those bounds for every other request. The hellos it races keep
+// the strategy's bounds, and the request's context still ends it. A budget
+// that no bound would cut short, or a non-positive one, keeps the strategy's
+// cached client.
 func (self *ClientStrategy) httpSerial(
 	request *http.Request,
 	helloRequest *http.Request,
@@ -2459,8 +2461,14 @@ func (self *ClientStrategy) httpSerial(
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
-	serialTimeout := max(self.settings.RequestTimeout, requestTimeout)
-	responseHeaderTimeout := max(self.settings.ConnectTimeout, requestTimeout)
+	serialTimeout := self.settings.RequestTimeout
+	responseHeaderTimeout := self.settings.ConnectTimeout
+	if 0 < requestTimeout {
+		serialTimeout = max(serialTimeout, requestTimeout)
+		if 0 < responseHeaderTimeout {
+			responseHeaderTimeout = max(responseHeaderTimeout, requestTimeout)
+		}
+	}
 	oneRequestClient := serialTimeout != self.settings.RequestTimeout ||
 		responseHeaderTimeout != self.settings.ConnectTimeout
 
