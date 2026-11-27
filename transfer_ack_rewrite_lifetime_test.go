@@ -84,9 +84,14 @@ func newAckRetirementFixture(t *testing.T, carrier TransportType, version int, l
 	fixture.receiver.ContractManager().AddNoContractPeer(fixture.sender.ClientId())
 	fixture.sender.RouteManager().UpdateTransport(dataTransport, []Route{fixture.senderOut})
 	fixture.receiver.RouteManager().UpdateTransport(replyTransport, []Route{fixture.receiverOut})
-	properties := TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable}
-	fixture.sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(carrier), []Route{fixture.senderIn}, properties)
-	fixture.receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(carrier), []Route{fixture.receiverIn}, properties)
+	senderLane := TransferCarrierProperties{ReceiveReliability: CarrierReliabilityReliable}
+	receiverLane := senderLane
+	if carrier == TransportTypeP2p {
+		senderLane = senderLane.WithAuthenticatedSource(fixture.receiver.ClientId())
+		receiverLane = receiverLane.WithAuthenticatedSource(fixture.sender.ClientId())
+	}
+	fixture.sender.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(carrier), []Route{fixture.senderIn}, senderLane)
+	fixture.receiver.RouteManager().UpdateTransportWithProperties(NewReceiveGatewayTransportWithType(carrier), []Route{fixture.receiverIn}, receiverLane)
 	fixture.receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 		fixture.deliveredCount += len(frames)
 	})

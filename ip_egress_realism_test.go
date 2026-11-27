@@ -7,7 +7,6 @@ package connect
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"net"
 	"runtime"
@@ -29,24 +28,6 @@ type providerEgressTestFlow struct {
 	source          TransferPath
 	sharedLifecycle bool
 	tcpResponses    chan struct{}
-}
-
-// Builds a valid packet with the client's chosen TTL, including its checksum.
-func providerEgressTestPacket(path *IpPath, ttl uint8) []byte {
-	var packet []byte
-	if path.Protocol == IpProtocolTcp {
-		packet = ipOosTcpPacketSequence(path, tcpFlagSyn, 100, nil)
-	} else {
-		packet = ipOosUdpPacket(path, []byte("provider ttl test"))
-	}
-	if path.Version == 4 {
-		packet[8] = ttl
-		packet[10], packet[11] = 0, 0
-		binary.BigEndian.PutUint16(packet[10:12], checksumFinish(checksumAdd(0, packet[:20])))
-	} else {
-		packet[7] = ttl
-	}
-	return MessagePoolCopy(packet)
 }
 
 // Starts a real NAT flow, optionally through the reliable provider receipt
@@ -347,22 +328,6 @@ func TestProviderEgressRefusedTtlStillForwards(t *testing.T) {
 		}
 	}
 }
-
-// A raw-descriptor failure is separate from a refused option and never masks
-// an error from the caller's preexisting control chain.
-type providerEgressFailedRawConn struct{ controls int }
-
-// Refuses descriptor access before the socket-option callback can run.
-func (self *providerEgressFailedRawConn) Control(func(uintptr)) error {
-	self.controls++
-	return syscall.EBADF
-}
-
-// This fixture never provides socket I/O.
-func (self *providerEgressFailedRawConn) Read(func(uintptr) bool) error { return syscall.EBADF }
-
-// This fixture never provides socket I/O.
-func (self *providerEgressFailedRawConn) Write(func(uintptr) bool) error { return syscall.EBADF }
 
 // Best-effort realism must preserve existing control errors and public dialer
 // customization, including a preexisting context-aware control callback.

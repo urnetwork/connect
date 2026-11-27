@@ -1,7 +1,9 @@
+// Provider NAT admission and socket control with synthetic networks and no live egress.
 package connect
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -11,6 +13,40 @@ import (
 
 	"github.com/urnetwork/connect/protocol"
 )
+
+// Builds a valid packet with the client's chosen TTL, including its checksum.
+func providerEgressTestPacket(path *IpPath, ttl uint8) []byte {
+	var packet []byte
+	if path.Protocol == IpProtocolTcp {
+		packet = ipOosTcpPacketSequence(path, tcpFlagSyn, 100, nil)
+	} else {
+		packet = ipOosUdpPacket(path, []byte("provider ttl test"))
+	}
+	if path.Version == 4 {
+		packet[8] = ttl
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(packet[10:12], checksumFinish(checksumAdd(0, packet[:20])))
+	} else {
+		packet[7] = ttl
+	}
+	return MessagePoolCopy(packet)
+}
+
+// A raw-descriptor failure is separate from a refused option and never masks
+// an error from the caller's preexisting control chain.
+type providerEgressFailedRawConn struct{ controls int }
+
+// Refuses descriptor access before the socket-option callback can run.
+func (self *providerEgressFailedRawConn) Control(func(uintptr)) error {
+	self.controls++
+	return syscall.EBADF
+}
+
+// This fixture never provides socket I/O.
+func (self *providerEgressFailedRawConn) Read(func(uintptr) bool) error { return syscall.EBADF }
+
+// This fixture never provides socket I/O.
+func (self *providerEgressFailedRawConn) Write(func(uintptr) bool) error { return syscall.EBADF }
 
 // Move a public destination onto the provider after admission. Both flow
 // constructors must consult the new snapshot before invoking even a custom dial.
