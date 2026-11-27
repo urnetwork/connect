@@ -2,8 +2,10 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"testing/synctest"
 
@@ -24,16 +26,28 @@ func TestProviderNatRechecksNumericDestinationAtDial(t *testing.T) {
 		settings.Log = NewNoopLogger()
 		settings.TcpBufferSettings.providerDialPolicy = newProviderNatDialPolicy(nets)
 		settings.UdpBufferSettings.providerDialPolicy = settings.TcpBufferSettings.providerDialPolicy
+		target := netip.MustParseAddr("203.0.113.89")
+		atSocket := false
+		refusedAtSocket := map[string]bool{}
+		native := providerEgressDialer(&net.Dialer{ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+			nets.setObservedAddresses([]netip.Addr{target})
+			return nil
+		}})
 		dialed := map[string]int{}
-		dial := &DialContextSettings{DialContext: func(_ context.Context, network, address string) (net.Conn, error) {
+		dial := &DialContextSettings{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			dialed[network]++
+			if atSocket {
+				// Invoke the real pre-connect callback after dial preparation
+				// changes the snapshot. No socket or packet leaves this fixture.
+				var refused *ProviderDialRefusedError
+				refusedAtSocket[network] = errors.As(native.ControlContext(ctx, network, address, &providerEgressFailedRawConn{}), &refused)
+			}
 			return nil, context.Canceled
 		}}
 		settings.TcpBufferSettings.DialContextSettings = dial
 		settings.UdpBufferSettings.DialContextSettings = dial
 		nat := NewLocalUserNat(ctx, "numeric destination", settings)
 		defer func() { cancel(); nat.CloseAndWait(context.Background()) }()
-		target := netip.MustParseAddr("203.0.113.89")
 		if err := nets.inspectDial(netip.AddrPortFrom(target, 443).String(), DefaultProviderLocalSecurityPolicySettings()); err != nil {
 			t.Fatal(err)
 		}
@@ -54,6 +68,20 @@ func TestProviderNatRechecksNumericDestinationAtDial(t *testing.T) {
 			if dialed["tcp"] != i || dialed["udp"] != i {
 				t.Errorf("step %d called tcp %d / udp %d times", i, dialed["tcp"], dialed["udp"])
 			}
+		}
+		atSocket = true
+		for _, p := range []IpProtocol{IpProtocolTcp, IpProtocolUdp} {
+			nets.setObservedAddresses(nil)
+			path := &IpPath{Version: 4, Protocol: p, SourceIp: net.IPv4(198, 51, 100, 9).To4(), SourcePort: 42005, DestinationIp: net.IP(target.AsSlice()), DestinationPort: 443}
+			wire := providerEgressTestPacket(path, 64)
+			if !nat.SendPacket(SourceId(NewId()), protocol.ProvideMode_Public, wire, 0) {
+				MessagePoolReturn(wire)
+				t.Fatal("NAT refused pre-connect fixture")
+			}
+			synctest.Wait()
+		}
+		if !refusedAtSocket["tcp"] || !refusedAtSocket["udp"] {
+			t.Errorf("native pre-connect refusal after snapshot change = %v", refusedAtSocket)
 		}
 	})
 }

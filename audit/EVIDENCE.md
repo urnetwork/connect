@@ -234,7 +234,7 @@ direction for its exact stream. The outer source field alone grants no authority
 | Setting | Value | Evidence |
 |---|---|---|
 | Versions | TLS 1.3 only (`MinVersion = VersionTLS13`) in both roles | `transfer_encrypt.go:408`, `:428` |
-| Groups | `[X25519MLKEM768, X25519]`, hybrid first | `transfer_encrypt.go:382-385`, `:410`, `:431` |
+| Groups | Required accepts supported hybrids only. Opportunistic offers `X25519MLKEM768` first and permits `X25519` | `transfer_encrypt.go:382-385`, `:410`, `:431` |
 | ALPN | `urnetwork/sequence` | `transfer_encrypt.go:409`, `:430` |
 | Client verification of the server cert | `InsecureSkipVerify: true` (by design, see below) | `transfer_encrypt.go:427` |
 | Server verification of the client cert | `ClientAuth = RequireAnyClientCert`, so both sides present certificates | `transfer_encrypt.go:407`; the client presents the same self cert, `:3395-3407` |
@@ -539,10 +539,11 @@ explained in `DESIGNNOTES2.md` §8.1–§8.2.
 
 ### 3.9 Desync recovery: the unknown-wrap nack
 
-- A receiver that cannot open a wrapped frame carrying a role hint sends
-  `EncryptedControlUnknownWrapNack`, naming the epoch it can read. Emission is
-  rate-limited to once per `UnknownWrapNackMinInterval` per session (default
-  1 s) (`transfer_encrypt.go:4401-4477`, default `:817`).
+- A direct receiver can send recovery feedback for the adjacent peer's existing
+  session. Unbound lanes send none. Only a platform-attributed source can
+  bootstrap a capped recovery session. Each feedback names the epoch the
+  receiver can read. The per-session interval defaults to one second and the
+  physical receive lane also limits failed-wrap recovery (§4.7).
 - The sealing side acts only in the client role, only when it has an established
   epoch, only when the nack names *no* epoch, and at most once per
   `UnknownWrapNackRestartCooldown` (default 5 s). It demotes its epochs and
@@ -1481,7 +1482,7 @@ an unmodified `03e98fe5`:
 | AEAD key exporter label | `urnetwork-connect-aead` (32 bytes) | `transfer_encrypt.go:90-91` |
 | Identity-proof exporter label | `urnetwork-connect-identity-proof` (32 bytes) | `transfer_encrypt.go:97-98` |
 | AEAD nonce | 12 bytes, random per frame | `transfer_encrypt.go:92`, `:304-311` |
-| TLS | 1.3 only; groups `[X25519MLKEM768, X25519]`; ALPN `urnetwork/sequence` | `transfer_encrypt.go:382-433` |
+| TLS | 1.3 with ALPN `urnetwork/sequence`. Required enforces hybrid groups. Opportunistic also accepts X25519 | `transfer_encrypt.go:382-433` |
 | `EncryptionSettings.Mode` | `EncryptionModeOff` | `transfer_encrypt.go:788` |
 | `TlsTimeout` | 60 s (TLS + identity proof) | `transfer_encrypt.go:796` |
 | `IdentityProofResendInterval` | 2 s, doubling, within `TlsTimeout` | `transfer_encrypt.go:797`, `:1994-2047` |
@@ -1498,7 +1499,10 @@ an unmodified `03e98fe5`:
 
 | File | Contents |
 |---|---|
-| `transfer_encrypt.go` | Sessions, epochs, TLS configs, AEAD, identity proof, gates, nacks, manager |
+| `transfer_encrypt.go` | Session and epoch lifetimes, TLS configuration, identity proof, admission and recovery |
+| `transfer_encrypt_record.go` | Completed TLS exporters, AES-256-GCM records and the pooled outer frame |
+| `transfer_encrypt_transition.go` | Handshake role, generation and inbox lifetime |
+| `transfer_encrypt_commitment.go` | Parsing committed certificates and verifying the selected epoch’s presented leaf |
 | `transfer_key.go` | Ed25519 identity key, signing and verification helpers, publication |
 | `transfer_key_history.go` | Signed client-key history verifier (secp256k1, Keccak, chain rules, pins) |
 | `transfer_key_history_session.go` | Signed-history policy and cipher gate (Required) |
