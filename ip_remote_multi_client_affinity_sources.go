@@ -169,7 +169,7 @@ func (self *multiClientChannelUpdate) affinitySourceFenced(client *multiClientCh
 // Borrows one generated control. Its read-only share uses the same tracked
 // group contract as native application sends; a stale producer is refused by
 // closed enrollment before Transfer custody, without revoking accepted owners.
-func (self *multiClientChannelUpdate) sendAffinityControl(client *multiClientChannel, packet []byte, timeout time.Duration) bool {
+func (self *multiClientChannelUpdate) sendAffinityControl(client *multiClientChannel, packet []byte, timeout time.Duration, openings ...*nativeRaceOpening) bool {
 	if self == nil || client == nil || client.client == nil {
 		return false
 	}
@@ -184,6 +184,9 @@ func (self *multiClientChannelUpdate) sendAffinityControl(client *multiClientCha
 	group := &parsedPacketGroup{
 		ipPath: path, byteCount: ByteCount(len(shared)), collapseAdmission: admission,
 		packets: []parsedPacket{{packet: shared, ipPath: path, payload: payload, collapseAdmission: admission}},
+	}
+	if len(openings) == 1 {
+		group.nativeRaceReset = openings[0]
 	}
 	accepted, _ := client.SendGroupDetailedWithAck(group, timeout, true)
 	if !accepted {

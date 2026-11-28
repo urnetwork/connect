@@ -472,15 +472,25 @@ func (self *BringYourApi) FindProviders2Sync(findProviders2 *FindProviders2Args)
 // FindProviders2SyncWithCtx is the caller-bounded form used by multi-client
 // maintenance, so a discovery request cannot own the only enumerator forever.
 func (self *BringYourApi) FindProviders2SyncWithCtx(ctx context.Context, findProviders2 *FindProviders2Args) (*FindProviders2Result, error) {
-	return HttpPostWithStrategy(
+	byJwt := self.ByJwt()
+	var operation *findProvidersHttpOperation
+	if byJwt != "" {
+		operation = &findProvidersHttpOperation{strategy: self.clientStrategy}
+		ctx = context.WithValue(ctx, findProvidersHttpOperationKey{}, operation)
+	}
+	result, err := HttpPostWithStrategy(
 		ctx,
 		self.clientStrategy,
 		fmt.Sprintf("%s/network/find-providers2", self.apiUrl),
 		findProviders2,
-		self.ByJwt(),
+		byJwt,
 		&FindProviders2Result{},
 		NewNoopApiCallback[*FindProviders2Result](),
 	)
+	if operation != nil {
+		operation.finish(result, err)
+	}
+	return result, err
 }
 
 type ConnectControlCallback ApiCallback[*ConnectControlResult]

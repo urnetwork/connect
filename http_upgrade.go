@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"strings"
@@ -25,6 +26,10 @@ const (
 	h1UpgradeMaxHeaderBytes = 32 * 1024
 	h1UpgradeTimeout        = 5 * time.Second
 )
+
+// A framed platform upgrade can ask the literal TUN dial for a faster
+// second TCP attempt. TLS and HTTP still run only on the selected socket.
+type h1FramedTcpDialKey struct{}
 
 var h1PlusDisabled atomic.Bool
 
@@ -278,15 +283,21 @@ func DialFramedUpgrade(ctx context.Context, address string, header http.Header, 
 		}
 		hostPort = net.JoinHostPort(u.Hostname(), port)
 	}
+	dialCtx := attemptCtx
+	if secure && protocol == H1FramerProtocol && moveDialOverrideFromContext(attemptCtx) == nil {
+		if _, err := netip.ParseAddrPort(hostPort); err == nil {
+			dialCtx = context.WithValue(attemptCtx, h1FramedTcpDialKey{}, hostPort)
+		}
+	}
 	plainDial := dialer.NetDialContext
 	if plainDial == nil {
 		plainDial = (&net.Dialer{}).DialContext
 	}
 	var conn net.Conn
 	if secure && dialer.NetDialTLSContext != nil {
-		conn, err = dialer.NetDialTLSContext(attemptCtx, "tcp", hostPort)
+		conn, err = dialer.NetDialTLSContext(dialCtx, "tcp", hostPort)
 	} else {
-		conn, err = plainDial(attemptCtx, "tcp", hostPort)
+		conn, err = plainDial(dialCtx, "tcp", hostPort)
 		if err == nil && secure {
 			config := &tls.Config{MinVersion: tls.VersionTLS12}
 			if dialer.TLSClientConfig != nil {

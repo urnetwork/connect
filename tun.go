@@ -1410,13 +1410,23 @@ func (self *Tun) dialUdp(laddr *tcpip.FullAddress, raddr *tcpip.FullAddress, pro
 
 // safe to call from multiple goroutines
 func (self *Tun) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
+	stagger := self.settings.DialRaceTimeout
+	if self.settings.DialRace == 2 && isRaceableDialNetwork(network) {
+		framedAddress, _ := ctx.Value(h1FramedTcpDialKey{}).(string)
+		contractDial, _ := ctx.Value(contractControlDialKey{}).(*contractControlDial)
+		if (framedAddress != "" && framedAddress == address) || contractDial.claim(address) {
+			// The ordinary two-second stagger lets a lost SYN wait for
+			// the stack's initial retransmit before considering a hedge.
+			stagger = min(stagger, DefaultDialFallbackDelay)
+		}
+	}
 	return raceTunDialContext(
 		ctx,
 		self.ctx,
 		network,
 		address,
 		self.settings.DialRace,
-		self.settings.DialRaceTimeout,
+		stagger,
 		self.settings.DialTimeout,
 		self.dialContext,
 	)

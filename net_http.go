@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "golang.org/x/net/proxy"
@@ -391,6 +392,9 @@ type ClientStrategy struct {
 	scores            *networkStrategyScores
 	currentNetworkId  string
 	networkGeneration uint64
+	// Discovery readiness is fenced by explicit network IDs as well as
+	// physical path transitions, even when an old network ID is revisited.
+	findProvidersNetworkGeneration uint64
 }
 
 func NewClientStrategyWithDefaults(ctx context.Context) *ClientStrategy {
@@ -733,6 +737,7 @@ func (self *ClientStrategy) networkChanged() {
 		// Hosts without a stable network identifier still isolate every path
 		// transition. This generation is private and never sent to a server.
 		self.networkGeneration++
+		self.findProvidersNetworkGeneration++
 		self.currentNetworkId = deriveNetworkId("network-change", fmt.Sprint(self.networkGeneration))
 	}()
 	self.CloseIdleConnections()
@@ -1858,7 +1863,7 @@ func (self *ClientStrategy) parallelEvalWithRouteHedge(
 }
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
-	return self.serialEvalWithAttemptContext(ctx, eval, helloEval, preferredEvalAttemptContext)
+	return self.serialEvalWithAttemptContext(ctx, eval, helloEval, preferredEvalAttemptContext, nil)
 }
 
 // HTTP can distinguish a stalled route from a request already written;
@@ -1868,6 +1873,7 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 	eval func(context.Context, *clientDialer) *evalResult,
 	helloEval func(context.Context, *clientDialer) *evalResult,
 	attemptContext func(context.Context, int) (context.Context, context.CancelFunc),
+	tryVerifiedOrigin func(context.Context) *evalResult,
 ) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
 	// merge handleCtx with self.ctx. A registration on self.ctx rather than a
@@ -1889,6 +1895,12 @@ func (self *ClientStrategy) serialEvalWithAttemptContext(
 		handleCancel()
 		contextWaitGroup.Wait()
 	}()
+
+	if tryVerifiedOrigin != nil {
+		if result := tryVerifiedOrigin(handleCtx); result != nil {
+			return result
+		}
+	}
 
 	// A short hello can establish this operation without becoming lasting
 	// delivery evidence for future races.
@@ -2124,6 +2136,71 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	return materializeHttpResult(result)
 }
 
+// A contract POST and its readiness probe can give their first raw TCP dial
+// the existing shorter stagger. The permit is local to one HTTP attempt.
+// Checkout disarms it before any request bytes or redirect.
+type contractControlPostKey struct{}
+
+type contractControlDialKey struct{}
+
+type contractControlDial struct {
+	address string
+	owner   context.Context
+	used    atomic.Bool
+}
+
+func (self *contractControlDial) claim(address string) bool {
+	return self != nil && self.address == address && self.used.CompareAndSwap(false, true) && self.owner.Err() == nil
+}
+
+func (self *contractControlDial) disarm() {
+	if self != nil {
+		self.used.Store(true)
+	}
+}
+
+func armContractControlDial(request *http.Request, dialer *clientDialer, client *http.Client) (*http.Request, *contractControlDial) {
+	ctx := request.Context()
+	if typed, _ := ctx.Value(contractControlPostKey{}).(bool); !typed {
+		return request, nil
+	}
+	transport, _ := client.Transport.(*http.Transport)
+	if dialer.description != "normal" || dialer.dialContext != nil || dialer.httpClientFactory != nil ||
+		transport == nil || transport.Proxy != nil || moveDialOverrideFromContext(ctx) != nil {
+		return request, nil
+	}
+	settings := &dialer.settings.ConnectSettings
+	if settings.ProxySettings != nil || settings.DialContextSettings == nil || settings.DialContextSettings.DialContext == nil {
+		return request, nil
+	}
+
+	target := request.URL
+	bearer, hasBearer := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
+	contractPost := request.Method == http.MethodPost && target.Path == "/connect/control"
+	contractHello := request.Method == http.MethodGet && target.Path == "/hello"
+	if (!contractPost && !contractHello) || target.Scheme != "http" ||
+		target.RawPath != "" || target.Opaque != "" ||
+		target.RawQuery != "" || target.ForceQuery || target.Fragment != "" || target.User != nil ||
+		request.Host != target.Host || !hasBearer || bearer == "" {
+		return request, nil
+	}
+	port := target.Port()
+	if port == "" {
+		port = "80"
+	}
+	address := net.JoinHostPort(target.Hostname(), port)
+	if ipPort, err := netip.ParseAddrPort(address); err != nil || ipPort.Addr().Zone() != "" {
+		return request, nil
+	}
+
+	dial := &contractControlDial{address: address, owner: ctx}
+	ctx = context.WithValue(ctx, contractControlDialKey{}, dial)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { dial.disarm() },
+	})
+	return request.WithContext(ctx), dial
+}
+
 func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http.Request) (*httpResult, error) {
 	// in this order:
 	// 1. try all dialers that previously worked sequentially
@@ -2155,22 +2232,40 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return result, nil
 	}
 
-	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+	operation, _ := request.Context().Value(findProvidersHttpOperationKey{}).(*findProvidersHttpOperation)
+	if operation != nil && (operation.strategy != self || !operation.prepare(request)) {
+		operation = nil
+	}
+	evaluate := func(handleCtx context.Context, dialer *clientDialer, verifiedPool *clientHttpPool) *evalResult {
 		handleCtx, authProgress := traceAuthPostAttempt(handleCtx)
 		info := self.dialerInfo(dialer)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
+			if verifiedPool != nil {
+				verifiedPool.release()
+			}
 			return causes.track(&evalResult{err: err})
 		}
-		httpClient, httpPool := dialer.acquireHttpClient()
+		var httpClient *http.Client
+		httpPool := verifiedPool
+		if httpPool == nil {
+			httpClient, httpPool = dialer.acquireHttpClient()
+		} else {
+			httpClient = httpPool.httpClient
+		}
 		if httpClient == nil {
 			if attemptRequest.Body != nil {
 				attemptRequest.Body.Close()
 			}
 			return causes.track(&evalResult{err: errClientDialerRetired})
 		}
+		if operation != nil {
+			attemptRequest = operation.begin(attemptRequest, dialer, httpPool)
+		}
+		attemptRequest, contractDial := armContractControlDial(attemptRequest, dialer, httpClient)
 		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		contractDial.disarm()
 		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		authProgress.responseHeaders(response, err)
@@ -2189,6 +2284,9 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		result.httpPool = httpPool
 		return causes.track(result)
 	}
+	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		return evaluate(handleCtx, dialer, nil)
+	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		info := self.dialerInfo(dialer)
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
@@ -2202,8 +2300,10 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 			}
 			return causes.track(&evalResult{err: errClientDialerRetired})
 		}
+		attemptRequest, contractDial := armContractControlDial(attemptRequest, dialer, httpClient)
 		sendTime := extenderCamouflageLocalNow()
 		response, err := httpClientForRequest(httpClient, attemptRequest).Do(attemptRequest)
+		contractDial.disarm()
 		self.observeExtenderCamouflagePlatformTime(response, err, sendTime)
 		self.observeHttpResponse(handleCtx, info, response, err)
 		if self.log.V(2).Enabled() {
@@ -2222,10 +2322,23 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return causes.track(result)
 	}
 
-	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext)
+	var tryVerifiedOrigin func(context.Context) *evalResult
+	if operation != nil {
+		tryVerifiedOrigin = func(handleCtx context.Context) *evalResult {
+			pool := operation.acquire(handleCtx)
+			if pool == nil {
+				return nil
+			}
+			return evaluate(handleCtx, operation.dialer, pool).Selected()
+		}
+	}
+	result := self.serialEvalWithAttemptContext(request.Context(), eval, helloEval, preferredHttpAttemptContext, tryVerifiedOrigin)
 	if result == nil {
 		observeAuthStrategyEnd(request.Context(), self.ctx)
 		return nil, causes.exhausted(request.Context(), self.ctx)
+	}
+	if operation != nil {
+		operation.observe(result)
 	}
 	return materializeHttpResult(result)
 }

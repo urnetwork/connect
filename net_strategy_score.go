@@ -583,7 +583,10 @@ func (self *ClientStrategy) SetNetworkId(identifiers ...string) {
 	networkId := deriveNetworkId(identifiers...)
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	self.currentNetworkId = networkId
+	if self.currentNetworkId != networkId {
+		self.findProvidersNetworkGeneration++
+		self.currentNetworkId = networkId
+	}
 }
 
 // SetStrategyPrior installs the injected per-network prior the scoring blends

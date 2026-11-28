@@ -25,6 +25,9 @@ type clientHttpPool struct {
 	retired     bool
 	drained     bool
 	conns       map[*clientHttpPoolConn]bool
+
+	findProvidersHint    findProvidersHttpHint
+	findProvidersVersion uint64
 }
 
 // Allocates once per cached client; request leases require no new allocation.
@@ -206,6 +209,10 @@ func (self *clientHttpPoolConn) Close() error {
 			self.pool.stateLock.Lock()
 			defer self.pool.stateLock.Unlock()
 			delete(self.pool.conns, self)
+			if self.pool.findProvidersHint.connection == self {
+				self.pool.findProvidersHint = findProvidersHttpHint{}
+			}
+
 		}()
 		self.err = self.Conn.Close()
 	})

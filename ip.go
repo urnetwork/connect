@@ -4708,6 +4708,7 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 	var orphanSourceIp net.IP
 	var orphanDestinationIp net.IP
 	handledTerminalControl := false
+	var connectedRaceReset uint32
 	obsoleteGeneration := false
 	initSequence := func() *TcpSequence {
 		self.mutex.Lock()
@@ -4721,6 +4722,9 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 
 		if sequence, ok := self.sequences[bufferId]; ok {
 			if tcp.rst {
+				if sequence.connectedRace != nil && sequence.ctx.Err() == nil {
+					connectedRaceReset = sequence.connectedRace.cancelByReset(self.ctx, terminalOwner, tcp)
+				}
 				// drop the packet
 				sequence.Cancel()
 				delete(self.sequences, bufferId)
@@ -4869,6 +4873,14 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		if sequence == nil {
 			return nil
 		}
+		if tcp.syn && !tcp.rst && !tcp.ack && !tcp.fin && !tcp.psh && len(tcp.payload) == 0 {
+			if receipt := terminalOwner.connectedRaceReceipt(); receipt != nil {
+				sequence.connectedRace = &providerRaceOpening{
+					source: receipt.queue.sequence.ctx.Done(), ordinal: receipt.ack.sequenceNumber, cancel: sequence.cancel,
+				}
+				sequence.cancel = sequence.connectedRace.cancelNormally
+			}
+		}
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.admissionCapacity = self.admissionCapacity
 		sequence.egressRealism = self.egressRealism
@@ -4909,6 +4921,12 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		return sequence
 	}
 	finishNoSequence := func() (bool, error) {
+		if connectedRaceReset != 0 {
+			receipt := terminalOwner.connectedRaceReceipt()
+			receipt.queue.mutex.Lock()
+			receipt.ack.connectedRaceReset = connectedRaceReset
+			receipt.queue.mutex.Unlock()
+		}
 		if obsoleteGeneration {
 			return false, errReliableIngressObsoleteFlow
 		}
@@ -5327,6 +5345,7 @@ type TcpSequence struct {
 	// immutable generation identity used to distinguish a retransmitted SYN
 	// from four-tuple reuse while the previous flow is still being reaped
 	initialSynSeq uint32
+	connectedRace *providerRaceOpening
 	// handshakeAcked records that the source acknowledged the synthesized
 	// SYN-ACK. Until then an identical SYN is a handshake retransmission and
 	// must receive SYN-ACK again, not the pure ACK used for a stale SYN on an
@@ -5877,6 +5896,9 @@ func (self *TcpSequence) Run() {
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]connect success\n")
 
+	if self.connectedRace != nil && !synthetic && socket != nil && self.ctx.Err() == nil {
+		self.connectedRace.connected.Store(true)
+	}
 	defer socket.Close()
 	egressDial.afterConnect(socket)
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
@@ -11411,6 +11433,9 @@ type IpPath struct {
 	// Receive-local stream provenance; never serialized or part of a flow key.
 	// The parent preserves it in TCP control receipts across ordinary dispatch.
 	receiveAheadOfGap bool
+	// Private, positive reliable source supplied by the receive worker.
+	// NoAck and mixed dispatches have no such sequence receipt.
+	receiveReliableToken *byte
 
 	ServerName string
 	// Only a TCP constructor's immutable canonical callback path carries this

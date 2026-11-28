@@ -309,17 +309,18 @@ func (self *multiClientWindow) waitDiscoveryDemand(generatorNotify <-chan struct
 
 // One demand credit means one API read, including for family-aware generators.
 // It asks for the waiting flow's family and yields at most one candidate. The
-// ordinary pass still owns every setup/evaluation/admission decision.
-func (self *multiClientWindow) listDiscoveryDemand(read *discoveryDemandRead, excluded []MultiHopId) ([]enumeratedDestination, error) {
+// ordinary pass still owns every setup/evaluation/admission decision. A
+// nonempty answer whose capable tails all refused retains nonempty pacing.
+func (self *multiClientWindow) listDiscoveryDemand(read *discoveryDemandRead, excluded []MultiHopId) ([]enumeratedDestination, bool, error) {
 	if !self.discoveryDemandReadLive(read) {
-		return nil, context.Canceled
+		return nil, false, context.Canceled
 	}
 	timeout := time.Until(read.deadline)
 	if self.settings.WindowGeneratorTimeout > 0 {
 		timeout = min(timeout, self.settings.WindowGeneratorTimeout)
 	}
 	if timeout <= 0 {
-		return nil, context.DeadlineExceeded
+		return nil, false, context.DeadlineExceeded
 	}
 	destinations, err := callDiscoveryDemand(self, read, timeout, func(ctx context.Context) (map[MultiHopId]DestinationStats, error) {
 		if err := read.ctx.Err(); err != nil {
@@ -345,15 +346,21 @@ func (self *multiClientWindow) listDiscoveryDemand(read *discoveryDemandRead, ex
 		return self.generator.(multiClientGeneratorDiscoveryContext).NextDestinationsContext(ctx, 1, excluded, self.requestRankMode())
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	refresh := self.serviceRefreshSnapshot()
+	allRefused := false
 	for destination, stats := range destinations {
 		if !self.admitsCapabilities(stats.Capabilities) {
 			continue
 		}
-		return []enumeratedDestination{{destination: destination, stats: stats}}, nil
+		if !refresh.allowsDestination(destination) {
+			allRefused = true
+			continue
+		}
+		return []enumeratedDestination{{destination: destination, stats: stats}}, false, nil
 	}
-	return nil, nil
+	return nil, allRefused, nil
 }
 
 func (self *multiClientWindow) mintDiscoveryDemand(read *discoveryDemandRead, destination MultiHopId) (*MultiClientGeneratorClientArgs, error) {

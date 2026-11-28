@@ -145,6 +145,13 @@ func (self *discoveryDemandTestGenerator) counts() (reads, empty, mints, retired
 // the counting wrapper differs from newReraceHarness; every worker joins.
 func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configure ...func(*MultiClientSettings)) (*reraceHarness, *discoveryDemandTestGenerator) {
 	t.Helper()
+	return newDiscoveryDemandTestHarnessWithGenerator(t, specs, nil, configure...)
+}
+
+// Allows a test to advertise selector-mode listing while keeping the same
+// actual provider construction, context-aware mint and retirement handlers.
+func newDiscoveryDemandTestHarnessWithGenerator(t *testing.T, specs []reraceExitSpec, wrap func(*discoveryDemandTestGenerator) MultiClientGenerator, configure ...func(*MultiClientSettings)) (*reraceHarness, *discoveryDemandTestGenerator) {
+	t.Helper()
 	resetBackendDegraded()
 	t.Cleanup(resetBackendDegraded)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -180,7 +187,11 @@ func newDiscoveryDemandTestHarness(t *testing.T, specs []reraceExitSpec, configu
 	for _, configureSettings := range configure {
 		configureSettings(settings)
 	}
-	h.multiClient = NewRemoteUserNatMultiClient(ctx, g, h.receive, protocol.ProvideMode_Network, settings)
+	var generator MultiClientGenerator = g
+	if wrap != nil {
+		generator = wrap(g)
+	}
+	h.multiClient = NewRemoteUserNatMultiClient(ctx, generator, h.receive, protocol.ProvideMode_Network, settings)
 	t.Cleanup(func() {
 		if t.Failed() {
 			for _, line := range h.log.lines() {

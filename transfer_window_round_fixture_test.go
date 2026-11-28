@@ -49,6 +49,18 @@ func newWindowRoundFixture(
 	sendCarrier ...TransportType,
 ) *windowRoundFixture {
 	t.Helper()
+	return newWindowRoundFixtureWithIds(t, Id{}, Id{}, configureSend, configureReceive, sendCarrier...)
+}
+
+func newWindowRoundFixtureWithIds(
+	t *testing.T,
+	senderId Id,
+	receiverId Id,
+	configureSend func(*SendBufferSettings),
+	configureReceive func(*ReceiveBufferSettings),
+	sendCarrier ...TransportType,
+) *windowRoundFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	newSettings := func() *ClientSettings {
 		settings := DefaultClientSettings()
@@ -72,12 +84,19 @@ func newWindowRoundFixture(
 	if configureReceive != nil {
 		configureReceive(receiverSettings.ReceiveBufferSettings)
 	}
+	// Preserve the ordinary allocation order when the caller uses new IDs.
+	clientId := func(id Id) Id {
+		if id == (Id{}) {
+			return NewId()
+		}
+		return id
+	}
 	fixture := &windowRoundFixture{
 		t:           t,
 		ctx:         ctx,
 		cancel:      cancel,
-		sender:      NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings),
-		receiver:    NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings),
+		sender:      NewClient(ctx, clientId(senderId), NewNoContractClientOob(), senderSettings),
+		receiver:    NewClient(ctx, clientId(receiverId), NewNoContractClientOob(), receiverSettings),
 		senderOut:   make(Route, 128),
 		senderIn:    make(Route, 128),
 		receiverOut: make(Route, 128),

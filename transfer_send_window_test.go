@@ -757,70 +757,99 @@ func TestReceiveAdvertisementStopsTheLossRetransmitStorm(t *testing.T) {
 func TestWindowRetainedCandidateUsesMeasuredRoundTrip(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	const propagation = 25 * time.Millisecond
-	const ceiling = ByteCount(16 * 1024 * 1024)
-	harness := newSendWindowHarness(t, ctx, propagation, func(settings *SendBufferSettings) {
-		settings.DeliverySizedWindowScale = 2
-		settings.DeliverySizedWindowCeilingByteCount = ceiling
-		settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
-		// the target clamp is a separate mechanism with its own rows, and it
-		// ships on; this row measures the rule, so the clamp is held out
-		settings.TargetGoodputByteRate = 0
+	synctest.Test(t, func(t *testing.T) {
+		const propagation = 25 * time.Millisecond
+		const offerDuration = 2 * time.Second
+		const packsPerFlight = 48
+		const payloadByteCount = 4 * 1024
+		const ceiling = ByteCount(16 * 1024 * 1024)
+		fixture := newWindowRoundFixture(t, func(settings *SendBufferSettings) {
+			settings.DeliverySizedWindowScale = 2
+			settings.DeliverySizedWindowCeilingByteCount = ceiling
+			settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+			settings.TargetGoodputByteRate = 0
+		}, func(settings *ReceiveBufferSettings) {
+			settings.ReceiveQueueMaxByteCount = ceiling
+			settings.AdvertiseReceiveWindow = true
+		})
+		// Release a fixed delivered flight at each measured RTT boundary.
+		for range int(offerDuration / propagation) {
+			var lastAck *windowRoundFrame
+			for range packsPerFlight {
+				lastAck = fixture.receive(fixture.write(payloadByteCount))
+			}
+			time.Sleep(propagation)
+			fixture.forward(lastAck, fixture.senderIn)
+		}
+		wantPacks := int(offerDuration/propagation) * packsPerFlight
+		if fixture.deliveredCount != wantPacks || fixture.ackedCount != wantPacks {
+			t.Fatalf("delivered and acknowledged %d/%d Packs, want %d", fixture.deliveredCount, fixture.ackedCount, wantPacks)
+		}
+		estimate := fixture.sender.DestinationSendStats(fixture.receiver.ClientId()).SendWindow
+
+		t.Logf(
+			"window %d candidate %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
+			estimate.Window, estimate.CandidateWindow, estimate.DeliveredByteCount, estimate.Interval,
+			estimate.RoundTrip, estimate.Floor, estimate.Ceiling, estimate.Reason,
+		)
+
+		if !estimate.Sized {
+			t.Fatalf("the window rule did not engage, so this cell does not test it: %+v", estimate)
+		}
+		// the rule's own arithmetic, recomputed from the evidence it published
+		want := ByteCount(int64(estimate.DeliveredByteCount) *
+			estimate.WindowRoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
+		want = min(max(ByteCount(2)*want, estimate.Floor), estimate.Ceiling)
+		if estimate.ServiceSized {
+			service := ByteCount(2 * float64(estimate.ServiceByteRate) * estimate.WindowRoundTrip.Seconds())
+			want = max(want, min(max(service, estimate.Floor), estimate.Ceiling))
+		}
+		if estimate.CandidateWindow != want {
+			t.Errorf(
+				"the current candidate is %d but its reported evidence gives %d",
+				estimate.CandidateWindow,
+				want,
+			)
+		}
+		if estimate.LearnedWindow < estimate.Initial || estimate.Window != min(max(estimate.LearnedWindow, estimate.Floor), estimate.Ceiling) {
+			t.Errorf("the effective window lost retained capacity or its hard bounds: %+v", estimate)
+		}
+		if estimate.RoundTrip != propagation {
+			t.Errorf("measured round trip = %s, want %s", estimate.RoundTrip, propagation)
+		}
+		// The floored resend timer is 300 ms. The same delivered flight must
+		// distinguish that counterfactual from the measured round trip.
+		if floor := DefaultSendBufferSettings().RttMinResendInterval; estimate.RoundTrip >= floor {
+			t.Errorf(
+				"the rule multiplied by %s on a %s path, at or above the %s resend floor, which is the defect this step corrects",
+				estimate.RoundTrip,
+				propagation,
+				floor,
+			)
+		}
+		resendFloor := DefaultSendBufferSettings().RttMinResendInterval
+		resendCandidate := ByteCount(int64(estimate.DeliveredByteCount) * resendFloor.Nanoseconds() / estimate.Interval.Nanoseconds())
+		resendCandidate = min(max(ByteCount(2)*resendCandidate, estimate.Floor), estimate.Ceiling)
+		if estimate.ServiceSized {
+			service := ByteCount(2 * float64(estimate.ServiceByteRate) * resendFloor.Seconds())
+			resendCandidate = max(resendCandidate, min(max(service, estimate.Floor), estimate.Ceiling))
+		}
+		if estimate.CandidateWindow == resendCandidate {
+			t.Errorf("the measured and resend-timer candidates both size to %d", resendCandidate)
+		}
+		if estimate.CandidateWindow >= estimate.Ceiling || estimate.Window >= estimate.Ceiling {
+			t.Errorf(
+				"the window reached its %d byte ceiling, so this cell measured the ceiling rather than the path; the rule is supposed to converge to what the path delivers",
+				estimate.Ceiling,
+			)
+		}
+		if estimate.CandidateWindow <= estimate.Floor {
+			t.Errorf(
+				"the window sits on its %d byte floor, so this cell measured a clamp and would pass with the rule reading a resend timer",
+				estimate.Floor,
+			)
+		}
 	})
-	harness.receiveHold(ceiling)
-	harness.offer(t, 4*1024, 2*time.Second)
-	estimate := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-
-	t.Logf(
-		"window %d candidate %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
-		estimate.Window, estimate.CandidateWindow, estimate.DeliveredByteCount, estimate.Interval,
-		estimate.RoundTrip, estimate.Floor, estimate.Ceiling, estimate.Reason,
-	)
-
-	if !estimate.Sized {
-		t.Fatalf("the window rule did not engage, so this cell does not test it: %+v", estimate)
-	}
-	// the rule's own arithmetic, recomputed from the evidence it published
-	want := ByteCount(int64(estimate.DeliveredByteCount) *
-		estimate.WindowRoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
-	want = min(max(ByteCount(2)*want, estimate.Floor), estimate.Ceiling)
-	if estimate.ServiceSized {
-		service := ByteCount(2 * float64(estimate.ServiceByteRate) * estimate.WindowRoundTrip.Seconds())
-		want = max(want, min(max(service, estimate.Floor), estimate.Ceiling))
-	}
-	if estimate.CandidateWindow != want {
-		t.Errorf(
-			"the current candidate is %d but its reported evidence gives %d",
-			estimate.CandidateWindow,
-			want,
-		)
-	}
-	if estimate.LearnedWindow < estimate.Initial || estimate.Window != min(max(estimate.LearnedWindow, estimate.Floor), estimate.Ceiling) {
-		t.Errorf("the effective window lost retained capacity or its hard bounds: %+v", estimate)
-	}
-	// the floored resend timer is 300 ms; a rule reading it would be here
-	if floor := DefaultSendBufferSettings().RttMinResendInterval; estimate.RoundTrip >= floor {
-		t.Errorf(
-			"the rule multiplied by %s on a %s path, at or above the %s resend floor, which is the defect this step corrects",
-			estimate.RoundTrip,
-			propagation,
-			floor,
-		)
-	}
-	if estimate.CandidateWindow >= estimate.Ceiling || estimate.Window >= estimate.Ceiling {
-		t.Errorf(
-			"the window reached its %d byte ceiling, so this cell measured the ceiling rather than the path; the rule is supposed to converge to what the path delivers",
-			estimate.Ceiling,
-		)
-	}
-	if estimate.CandidateWindow <= estimate.Floor {
-		t.Errorf(
-			"the window sits on its %d byte floor, so this cell measured a clamp and would pass with the rule reading a resend timer",
-			estimate.Floor,
-		)
-	}
 }
 
 // An eightfold reduction in physical drain must lower the fresh candidate

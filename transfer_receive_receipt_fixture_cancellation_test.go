@@ -143,3 +143,44 @@ func TestReceiveReceiptFixtureWaitsForOwnTcpCancellation(t *testing.T) {
 		}
 	})
 }
+
+// The receipt gateway belongs to the offered peer. Hold the real Client's
+// cancellation after the fixture cancels, then let the original joined cleanup
+// check the gateway for foreign platform control.
+func TestReceiveReceiptFixtureCancelKeepsClientKeyOffGateway(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		delayed := &receiptFixtureDelayedCancelContext{
+			Context: ctx,
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		defer func() {
+			cancel()
+			close(delayed.release)
+			delayed.callbacks.Wait()
+		}()
+
+		f := newReceiptAdmissionFixtureWithClientParent(t, ctx, cancel, delayed, 1, false)
+		delivered := f.observeGeneric()
+		messageId := NewId()
+		f.offerGeneric(0, messageId, 8192)
+		if delivered.Load() != 1 || !f.hasAck(f.sequenceId, messageId, false) {
+			t.Fatal("the offered peer did not complete the real generic callback and ACK")
+		}
+
+		f.cancel()
+		synctest.Wait()
+		select {
+		case <-delayed.entered:
+		default:
+			t.Fatal("the Client cancellation propagation did not enter its hold")
+		}
+		if ctx.Err() != context.Canceled || f.client.ctx.Err() != nil ||
+			f.client.clientKeyManager == nil || f.client.clientKeyManager.ctx.Err() != nil {
+			t.Fatal("the fixture cancellation did not leave the real Client and key manager live")
+		}
+		t.Log("fixture canceled with live Client and key manager after verified peer ACK")
+	})
+}

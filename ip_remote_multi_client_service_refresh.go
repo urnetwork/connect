@@ -311,6 +311,19 @@ func (self *multiClientWindow) serviceRefreshLive(owner *tcpSynRetry) bool {
 	return self.serviceRefreshOwner == owner && self.serviceRefreshLiveWithLock()
 }
 
+// A listing can outlive another refusal from this same SYN. Check its paid
+// remote-tail history before spending the pass's one identity on a provider.
+func (self serviceRefreshSnapshot) allowsDestination(destination MultiHopId) bool {
+	if self.owner == nil {
+		return true
+	}
+	self.update.stateLock.Lock()
+	defer self.update.stateLock.Unlock()
+	current := self.update.currentSynRetryLineageWithLock(self.owner)
+	return current != nil && discoveryDemandAttemptLive(self.update, self.stamp) &&
+		destination.Len() != 0 && !current.remoteDestinationRefusedWithLock(destination)
+}
+
 // Caller exclusions are not authority to admit a newly minted local alias.
 // The original paid generation still decides whether its remote tail refused.
 func (self *multiClientWindow) serviceRefreshCandidateAllowed(owner *tcpSynRetry, client *multiClientChannel) bool {
