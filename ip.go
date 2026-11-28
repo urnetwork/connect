@@ -7713,6 +7713,12 @@ type RemoteUserNatProviderSettings struct {
 	// tombstones consume the source bound. The owner must schedule replacement
 	// and return promptly; provider callbacks never join their own Client tree.
 	SourceLifecycleSaturated func()
+
+	// ShareLimiter, when set, paces every return the provider sends to the
+	// clients it serves to the limiter's rate, the owner's maximum sharing
+	// speed (provider_share_limiter.go). The owner keeps the limiter and
+	// changes its rate in place. Nil does not pace.
+	ShareLimiter *ProviderShareLimiter
 }
 
 // RemoteUserNatProviderReturnSendPhase identifies exact item admission and
@@ -9183,11 +9189,25 @@ func (self *RemoteUserNatProvider) sendReturnItem(item *providerReturnItem) {
 			item.sendAdmissionContext = nil
 		}()
 	}
+	packetCount := item.packetCount()
+	packetByteCount := item.packetByteCount
+	// The owner's sharing speed. This runs on the flow's dedicated socket
+	// reader or on a datagram shard worker, never on a shared receive
+	// callback, so the wait slows only what this sender carries. A wait that
+	// the return's own cancellation ends sends nothing, as a canceled send
+	// does.
+	if self.settings != nil && !self.settings.ShareLimiter.Wait(item.sendContext(self.ctx), packetByteCount) {
+		self.congestionDrops.addReturnSend(packetCount, packetByteCount)
+		self.observeReturnSend(item, providerReturnSendResult{
+			packetCount:     packetCount,
+			packetByteCount: packetByteCount,
+			sent:            false,
+		})
+		return
+	}
 	if self.returnSendStarted != nil {
 		self.returnSendStarted()
 	}
-	packetCount := item.packetCount()
-	packetByteCount := item.packetByteCount
 	var sent bool
 	if item.batch {
 		sent = self.sendReturnBatch(item)
