@@ -20,7 +20,7 @@
 // AS32934 (an ISP-hosted cache) and the RPKI-to-IRR conversions are left out.
 //
 // Generated input provenance v1:
-//   - name=radb server=whois.radb.net:43 query="-i origin AS32934" accepted_v4=446 accepted_v6=664 accepted_sha256=1c4d1f425d1158c634f0fbb52585857615a834018ff01b2eb54be729da2a20be prefixes_v4=22 prefixes_v6=5 disposition=accepted_allow
+//   - name=radb server=whois.radb.net:43 query="-i origin AS32934" accepted_v4=447 accepted_v6=665 accepted_sha256=4ec6da977d07de4605c2192595247a618fe3d87dba7301947f6292910823c69b prefixes_v4=22 prefixes_v6=5 disposition=accepted_allow
 
 package connect
 
