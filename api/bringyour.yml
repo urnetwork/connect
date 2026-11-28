@@ -1342,6 +1342,236 @@ paths:
         "403":
           $ref: "#/components/responses/EmbedClientJwtRefused"
 
+  /auth/email-change:
+    get:
+      x-status: planned
+      tags: [Authentication]
+      summary: The account's pending email change
+      description: |
+        The email change the caller's account has waiting for its two codes,
+        or `pending: false`. Network credential only: the network's sign-in
+        token. A client token is refused with 403, and an API key is answered
+        `owner_only`.
+      operationId: authEmailChangeStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthEmailChangeStatusResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+    post:
+      x-status: planned
+      tags: [Authentication]
+      summary: Start a verified email change
+      description: |
+        Starts changing the account's email sign-in to `new_email`. A code is
+        sent to the current email and another to the new one; the change
+        happens only when both are confirmed through
+        `POST /auth/email-change/confirm` before `expires_at_millis`. The
+        password stays the same. The account's sign-in email addresses get a
+        security notice when the change is requested and again when it
+        completes, and completing it signs out the account's other sessions.
+
+        A new request replaces a waiting one. Requests are limited per
+        account and per address. Network credential only: the network's
+        sign-in token. A client token is refused with 403, and an API key is
+        answered `owner_only`. Refusals come back in the result `error` as a
+        200 (`AuthEmailChangeError`).
+      operationId: authEmailChange
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthEmailChangeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthEmailChangeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /auth/email-change/confirm:
+    post:
+      x-status: planned
+      tags: [Authentication]
+      summary: Confirm a waiting email change
+      description: |
+        Confirms the waiting email change with the code sent to the current
+        email (`current_code`), the code sent to the new email (`new_code`),
+        or both. Each right code confirms its address; when both addresses
+        are confirmed the change completes (`complete: true`): the email
+        sign-in and the account email become the new address, and the
+        account's other sessions are signed out
+        (`other_sessions_signed_out`; false when the current sign-in has no
+        session to keep, in which case Settings > Sessions signs them out).
+        A wrong code counts against the request; too many end it
+        (`too_many_tries`). Network credential only, as for
+        `POST /auth/email-change`.
+      operationId: authEmailChangeConfirm
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthEmailChangeConfirmArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthEmailChangeConfirmResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /auth/email-change/cancel:
+    post:
+      x-status: planned
+      tags: [Authentication]
+      summary: Cancel a waiting email change
+      description: |
+        Ends the waiting email change, if any; its codes stop working.
+        Network credential only, as for `POST /auth/email-change`.
+      operationId: authEmailChangeCancel
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthEmailChangeCancelArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthEmailChangeCancelResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /auth/microsoft/start:
+    get:
+      x-status: planned
+      tags: [Authentication]
+      summary: Start Sign in with Microsoft in the browser
+      description: |
+        Every app (and ur.io) signs in with Microsoft through the browser:
+        it opens this endpoint with a fresh `state` and `nonce` per attempt,
+        and the endpoint answers `302` to Microsoft's authorize page
+        (`login.microsoftonline.com/common/oauth2/v2.0/authorize`) with the
+        server's Microsoft client, `response_type=code`,
+        `scope=openid email profile`, `prompt=select_account` and
+        `redirect_uri` = `GET /auth/microsoft/callback`. The client id lives
+        only on the server, so no app carries it.
+
+        `state` is opaque except for its optional `platform` claim, as for
+        the Apple and Google callbacks: base64url JSON with a `platform` key
+        picks where the result returns (`android` → `ur://`, `ios`, `macos`,
+        `windows` and `linux` → `urnetwork://`, `web` → ur.io's
+        `/auth/microsoft/callback` page, the result in the fragment); without
+        it the android scheme is used. Without a configured Microsoft client,
+        or for a malformed `state` or `nonce`, the answer goes straight back
+        to the app with `error` (`not_configured`, `invalid_request`).
+      operationId: authMicrosoftStart
+      security: []
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: The attempt's state, at most 1024 characters of the base64url alphabet, `.`, `-` and `_`.
+        - in: query
+          name: nonce
+          required: true
+          schema:
+            type: string
+          description: The attempt's nonce, 16 to 256 characters of the same alphabet. The identity token carries it as its `nonce` claim.
+      responses:
+        '302':
+          description: Redirect to Microsoft's authorize page, or back to the app with `error`.
+          headers:
+            Location:
+              schema:
+                type: string
+
+  /auth/microsoft/callback:
+    get:
+      x-status: planned
+      tags: [Authentication]
+      summary: Sign in with Microsoft return
+      description: |
+        Microsoft redirects the browser here with the authorization code of
+        an attempt `GET /auth/microsoft/start` began. This endpoint exchanges
+        it at Microsoft's token endpoint with the server's client secret and
+        answers `302` to where the attempt's `platform` returns:
+
+        ```
+        <scheme>://oauth/microsoft?state=…&id_token=…
+        <scheme>://oauth/microsoft?state=…&error=…
+        https://ur.io/auth/microsoft/callback#state=…&id_token=…
+        ```
+
+        Nothing is stored. The app checks that `state` is the attempt it
+        started and that the identity token's `nonce` claim is the one it
+        minted, then signs in with the token through `POST /auth/login`
+        (`auth_jwt_type: microsoft`) or adds it with `POST /auth/add-auth`.
+        The server accepts a Microsoft identity token only for its own
+        client id and only with an email Microsoft verified: a personal
+        Microsoft account's email, or a work or school account's email whose
+        domain its organization verified (the `xms_edov` claim).
+      operationId: authMicrosoftCallback
+      security: []
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: The attempt's state, echoed by Microsoft untouched.
+        - in: query
+          name: code
+          schema:
+            type: string
+          description: Microsoft's authorization code, exchanged here for the identity token.
+        - in: query
+          name: error
+          schema:
+            type: string
+          description: Microsoft's error, e.g. `access_denied`.
+        - in: query
+          name: error_description
+          schema:
+            type: string
+          description: Microsoft's description of its error.
+      responses:
+        '302':
+          description: Redirect to the attempt's return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'urnetwork://oauth/microsoft?state=eyJwbGF0Zm9ybSI6IndpbmRvd3MiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state`.
+        '405':
+          description: Not a `GET`.
+
   /auth/generate-seedphrase:
     post:
       tags: [Authentication]
@@ -10038,6 +10268,79 @@ paths:
               schema:
                 $ref: "#/components/schemas/SnValidateWalletResult"
 
+  /sn/wallet/disconnect-code:
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Send the code that confirms a payout wallet disconnect
+      description: |
+        Sends a confirmation code to the account's sign-in email addresses
+        (`sent_to`, masked). `POST /sn/wallet/disconnect` takes it before
+        `expires_at_millis`. A new code replaces the last one.
+
+        Only a wallet the network connected without a signed payout consent
+        can be disconnected: the side copy connected with
+        `POST /sn/wallet` and the providers' wallets set without a consent.
+        A signed network payout consent or hotkey delegation in force ends
+        only by a signed replacement (there is no unsigned revocation), so
+        while one is in force this answers `consent_in_force`; a provider's
+        own signed consent is never touched. Network credential only: the
+        network's sign-in token. A client token is refused with 403, and an
+        API key is answered `owner_only`. Refusals come back in the result
+        `error` as a 200 (`SnWalletDisconnectError`).
+      operationId: snWalletDisconnectCode
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnWalletDisconnectCodeArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletDisconnectCodeResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
+  /sn/wallet/disconnect:
+    post:
+      x-status: planned
+      tags: [Other]
+      summary: Disconnect the network's payout wallet
+      description: |
+        With the code from `POST /sn/wallet/disconnect-code`, removes the
+        network's connected Bittensor wallet and the providers' wallets set
+        without a signed consent. The network then has no payout wallet:
+        its earnings can't be paid out until a wallet is connected and a
+        payout consent is signed again. Earnings already paid stay claimable
+        by the wallet they were paid to. The account's sign-in email
+        addresses get the payout wallet security notice. A wrong code counts
+        against it; too many end it (`code_expired`, request a new one).
+        Network credential only, as for `POST /sn/wallet/disconnect-code`.
+      operationId: snWalletDisconnect
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnWalletDisconnectArgs"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnWalletDisconnectResult"
+        "403":
+          $ref: "#/components/responses/ClientJwtRefused"
+
   /sn/head:
     get:
       tags: [Other]
@@ -13497,6 +13800,7 @@ components:
           enum:
             - apple
             - google
+            - microsoft
         wallet_auth:
           $ref: "#/components/schemas/WalletAuthArgs"
         seedphrase:
@@ -13546,6 +13850,7 @@ components:
               - phone
               - apple
               - google
+              - microsoft
               - solana
               - bittensor
               - seedphrase
@@ -13560,6 +13865,7 @@ components:
                 - password
                 - apple
                 - google
+                - microsoft
             code:
               description: |
                 A stable code for a refusal that has one, so a client can pick
@@ -13822,6 +14128,7 @@ components:
           enum:
             - apple
             - google
+            - microsoft
         password:
           type: string
         network_name:
@@ -19322,6 +19629,7 @@ components:
           enum:
             - apple
             - google
+            - microsoft
         password:
           type: string
         wallet_auth:
@@ -19361,6 +19669,7 @@ components:
             - phone
             - apple
             - google
+            - microsoft
             - solana
             - bittensor
             - seedphrase
@@ -19375,6 +19684,122 @@ components:
           properties:
             message:
               type: string
+    AuthEmailChangeArgs:
+      type: object
+      required:
+        - new_email
+      properties:
+        new_email:
+          description: The email address to change the account's email sign-in to.
+          type: string
+    AuthEmailChangeError:
+      description: Why an email change step did not go through.
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          description: |
+            `owner_only`: only the network's own sign-in can change its email
+            (not an API key).
+            `no_email`: the account has no email sign-in; add one instead.
+            `email_unverified`: the current email sign-in is not verified yet.
+            `invalid_email`: `new_email` is not an email address.
+            `same_email`: `new_email` is the current email.
+            `email_in_use`: another account signs in with `new_email`.
+            `rate_limited`: too many requests or codes; see `retry_after_seconds`.
+            `send_failed`: a code could not be sent; ask again.
+            `no_change`: no email change is waiting (it expired, was
+            cancelled, completed, or never started).
+            `code_invalid`: a code is wrong; the request is still waiting.
+            `too_many_tries`: too many wrong codes; the request ended.
+            Clients show `message` for an unknown code.
+          type: string
+        message:
+          type: string
+        retry_after_seconds:
+          description: For `rate_limited`, seconds until it can be asked again.
+          type: integer
+    AuthEmailChangeResult:
+      type: object
+      properties:
+        current_email:
+          description: The current email, masked (`j…@example.com`), which was sent a code.
+          type: string
+        new_email:
+          description: The new email, normalized, which was sent a code.
+          type: string
+        expires_at_millis:
+          description: When the request ends unless both codes were confirmed, unix milliseconds.
+          type: integer
+          format: int64
+        error:
+          $ref: "#/components/schemas/AuthEmailChangeError"
+    AuthEmailChangeStatusResult:
+      type: object
+      required:
+        - pending
+      properties:
+        pending:
+          description: Whether an email change is waiting for its codes.
+          type: boolean
+        current_email:
+          description: The current email, masked.
+          type: string
+        new_email:
+          type: string
+        current_confirmed:
+          type: boolean
+        new_confirmed:
+          type: boolean
+        expires_at_millis:
+          type: integer
+          format: int64
+        error:
+          $ref: "#/components/schemas/AuthEmailChangeError"
+    AuthEmailChangeConfirmArgs:
+      type: object
+      properties:
+        current_code:
+          description: The code sent to the current email.
+          type: string
+        new_code:
+          description: The code sent to the new email.
+          type: string
+    AuthEmailChangeConfirmResult:
+      type: object
+      required:
+        - current_confirmed
+        - new_confirmed
+        - complete
+      properties:
+        current_confirmed:
+          type: boolean
+        new_confirmed:
+          type: boolean
+        complete:
+          description: Both addresses are confirmed and the account's email sign-in is now `email`.
+          type: boolean
+        email:
+          description: The account's email sign-in once complete.
+          type: string
+        other_sessions_signed_out:
+          description: |
+            The account's other sessions were signed out when the change
+            completed. False when the current sign-in has no session to keep;
+            Settings > Sessions signs them out then.
+          type: boolean
+        error:
+          $ref: "#/components/schemas/AuthEmailChangeError"
+    AuthEmailChangeCancelArgs:
+      type: object
+      properties: {}
+    AuthEmailChangeCancelResult:
+      type: object
+      properties:
+        error:
+          $ref: "#/components/schemas/AuthEmailChangeError"
     GenerateSeedphraseResult:
       type: object
       required:
@@ -21208,6 +21633,76 @@ components:
           properties:
             message:
               type: string
+
+    SnWalletDisconnectError:
+      description: Why a payout wallet disconnect step did not go through.
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          description: |
+            `owner_only`: only the network's own sign-in can disconnect its
+            payout wallet (not an API key).
+            `no_wallet`: the network has no wallet to disconnect.
+            `consent_in_force`: a signed payout consent or hotkey delegation
+            pays the network's earnings; only a signed replacement changes
+            it (Change wallet).
+            `email_required`: the account has no sign-in email to send the
+            confirmation code to; add an email sign-in first.
+            `rate_limited`: too many codes; see `retry_after_seconds`.
+            `send_failed`: the code could not be sent; ask again.
+            `code_invalid`: the code is wrong; it still works for its
+            remaining tries.
+            `code_expired`: no code is waiting (expired, used, or ended by
+            too many wrong tries); ask for a new one.
+            Clients show `message` for an unknown code.
+          type: string
+        message:
+          type: string
+        retry_after_seconds:
+          description: For `rate_limited`, seconds until a code can be asked again.
+          type: integer
+
+    SnWalletDisconnectCodeArgs:
+      type: object
+      properties: {}
+
+    SnWalletDisconnectCodeResult:
+      type: object
+      properties:
+        sent_to:
+          description: The masked sign-in email addresses the code was sent to.
+          type: array
+          items:
+            type: string
+        expires_at_millis:
+          description: When the code stops working, unix milliseconds.
+          type: integer
+          format: int64
+        error:
+          $ref: "#/components/schemas/SnWalletDisconnectError"
+
+    SnWalletDisconnectArgs:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          description: The code from `POST /sn/wallet/disconnect-code`.
+          type: string
+
+    SnWalletDisconnectResult:
+      type: object
+      required:
+        - disconnected
+      properties:
+        disconnected:
+          description: The network now has no connected payout wallet.
+          type: boolean
+        error:
+          $ref: "#/components/schemas/SnWalletDisconnectError"
 
     SnWalletMappingChallengeArgs:
       type: object
