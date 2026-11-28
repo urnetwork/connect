@@ -88,8 +88,12 @@ func (self *multiClientChannelUpdate) synRetryHasRemoteRefusalWithLock() bool {
 // Overflow is unknown freshness and therefore refuses automatic continuation.
 // A later ordinary native source offer retains its existing routing policy.
 func (self *tcpSynRetry) remoteTailRefusedWithLock(client *multiClientChannel) bool {
-	return self != nil && client != nil && client.args != nil &&
-		(self.remoteRefusalOverflow || slices.Contains(self.refusedRemoteIds, client.Destination().Tail()))
+	return client != nil && client.args != nil && self.remoteDestinationRefusedWithLock(client.Destination())
+}
+
+// The same paid history applies before and after a local channel is minted.
+func (self *tcpSynRetry) remoteDestinationRefusedWithLock(destination MultiHopId) bool {
+	return self != nil && (self.remoteRefusalOverflow || slices.Contains(self.refusedRemoteIds, destination.Tail()))
 }
 
 // Publication and final admission use the same paid generation's remote proof.

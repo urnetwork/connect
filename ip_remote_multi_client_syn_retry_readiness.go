@@ -281,19 +281,49 @@ func (self *RemoteUserNatMultiClient) armSynRetryReadiness(owner *tcpSynRetry) {
 	}
 }
 
-func (ready *tcpSynRetryReadiness) clearSlotsWithLock() {
-	for index := 0; index < ready.count; index++ {
-		slot := &ready.slots[index]
-		if slot.gate != nil && slot.installation != 0 {
-			slot.gate.abandonWatch(&slot.waiter, slot.installation)
-			if slot.gate == &slot.source.resendCapacityUnavailable {
-				slot.source.notifyRetainedAdmissionDemand()
-			}
+// Withdraws one source's watch without resetting the embedded installation epoch.
+func (self *tcpSynRetryReadySlot) clearWithLock() {
+	if self.gate != nil && self.installation != 0 {
+		self.gate.abandonWatch(&self.waiter, self.installation)
+		if self.gate == &self.source.resendCapacityUnavailable {
+			self.source.notifyRetainedAdmissionDemand()
 		}
-		slot.source, slot.gate, slot.installation = nil, nil, 0
-		slot.raceOrder, slot.sourceOrder = 0, 0
+	}
+	self.source, self.gate, self.installation = nil, nil, 0
+	self.raceOrder, self.sourceOrder = 0, 0
+}
+
+// Detaches remaining source affiliations before owner retirement or dispatch.
+func (ready *tcpSynRetryReadiness) clearSlotsWithLock() {
+	for index := range ready.count {
+		ready.slots[index].clearWithLock()
 	}
 	ready.count = 0
+}
+
+// Consumes a live source's turn, keeping other watches in their original queues.
+func (self *tcpSynRetryReadiness) takeGrantedSourceWithLock() (*SendSequence, bool) {
+	waiting := false
+	for index := range self.count {
+		slot := &self.slots[index]
+		if slot.gate == nil || slot.installation == 0 {
+			continue
+		}
+		if slot.source.ctx.Err() != nil || slot.gate.closed.Load() || slot.waiter.owner.Load() != slot.gate {
+			slot.clearWithLock()
+			continue
+		}
+		if slot.gate.watchGranted(&slot.waiter, slot.installation) && slot.gate.passWatch(&slot.waiter, slot.installation) {
+			source := slot.source
+			slot.clearWithLock()
+			if source.ctx.Err() == nil {
+				return source, false
+			}
+			continue
+		}
+		waiting = true
+	}
+	return nil, waiting
 }
 
 func (self *RemoteUserNatMultiClient) appendSynRetryReadinessWithLock(ready *tcpSynRetryReadiness) {
@@ -398,34 +428,16 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	var grantedSource *SendSequence
 	waiting := false
 	if valid {
-		for index := 0; index < ready.count; index++ {
-			slot := &ready.slots[index]
-			if slot.gate == nil {
-				continue
-			}
-			if slot.source.ctx.Err() != nil || slot.gate.closed.Load() {
-				slot.gate.abandonWatch(&slot.waiter, slot.installation)
-				if slot.gate == &slot.source.resendCapacityUnavailable {
-					slot.source.notifyRetainedAdmissionDemand()
-				}
-				slot.source, slot.gate, slot.installation = nil, nil, 0
-				continue
-			}
-			waiting = true
-			if slot.gate.watchGranted(&slot.waiter, slot.installation) && slot.gate.passWatch(&slot.waiter, slot.installation) {
-				grantedSource = slot.source
-				break
-			}
-		}
+		grantedSource, waiting = ready.takeGrantedSourceWithLock()
 	}
-	if grantedSource != nil || !valid || !waiting {
-		ready.clearSlotsWithLock()
-		if grantedSource == nil {
+	if grantedSource == nil {
+		if valid && waiting {
+			self.appendSynRetryReadinessWithLock(ready)
+			keep = true
+		} else {
+			ready.clearSlotsWithLock()
 			update.retireUnwatchedSynOpeningWithLock(owner, ready)
 		}
-	} else {
-		self.appendSynRetryReadinessWithLock(ready)
-		keep = true
 	}
 	update.stateLock.Unlock()
 	self.stateLock.Unlock()
@@ -442,9 +454,22 @@ func (self *RemoteUserNatMultiClient) processSynRetryReadiness(ready *tcpSynRetr
 	if current && !valid {
 		owner.preserveRaceRequestWithLock(ready.raceOrder)
 	}
-	if valid && grantedSource.ctx.Err() == nil {
+	if valid && grantedSource.ctx.Err() != nil {
+		grantedSource, waiting = ready.takeGrantedSourceWithLock()
+	}
+	switch {
+	case valid && grantedSource != nil:
+		ready.clearSlotsWithLock()
 		self.queueSynRetryWithLock(owner, ready.raceOrder)
-	} else {
+	case valid && waiting:
+		// The passed source retired while unlocked. Preserve the other FIFO
+		// places and this index reference. A single wake covers an edge
+		// concurrent with returning the popped owner to the index.
+		self.appendSynRetryReadinessWithLock(ready)
+		keep = true
+		self.notifyFlowReaper()
+	default:
+		ready.clearSlotsWithLock()
 		update.retireUnwatchedSynOpeningWithLock(owner, ready)
 	}
 	update.stateLock.Unlock()

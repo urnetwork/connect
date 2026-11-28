@@ -503,78 +503,74 @@ func TestFullServiceRefreshFenceRejectsConcurrentFreshRegistration(t *testing.T)
 	})
 }
 
-// Even a stale discovery answer can create a fresh local identity to an old
-// remote. Evaluation success does not erase that source's remote-tail refusal.
+// The remote can refuse the paid SYN after its replacement identity was
+// minted. A completed evaluation must still check that same source at admission.
 func TestFullServiceRefreshRefusesFreshLocalAliasOfFailedRemote(t *testing.T) {
 	GetMessagePoolAggregateStats()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		h, generator, window, path, paths, owners := newFullServiceRefreshFixture(t, 53010)
-		original := window.unorderedClients()
-		var aliasRemote *multiClientChannel
-		for _, candidate := range original {
-			if h.multiClient.clientFlowCount(candidate) == 0 {
-				aliasRemote = candidate
-			}
+		f := newEarlyIdleRefusalFixture(t, 53010, false)
+		original := f.window.unorderedClients()
+		aliasRemote := f.siblingOwners[0]
+		f.h.generator.mutex.Lock()
+		provider := f.h.generator.clientExits[aliasRemote.ClientId()]
+		f.h.generator.mutex.Unlock()
+		if provider == nil {
+			t.Fatal("alias control has no provider for its original contender")
 		}
-		if aliasRemote == nil {
-			t.Fatal("alias control has no actual idle victim")
-		}
-		generator.mutex.Lock()
-		generator.holdNextAvailable = true
-		generator.resultOverrideForTest = map[MultiHopId]DestinationStats{
+		f.generator.mutex.Lock()
+		f.generator.resultOverrideForTest = map[MultiHopId]DestinationStats{
 			aliasRemote.Destination(): {IpFamily: aliasRemote.IpFamily()},
 		}
-		generator.mutex.Unlock()
-		_, _, beforeMints, beforeRetired := generator.counts()
-		evaluated := discoveryDemandTestObservePublication(window)
-		start := time.Now()
-		if !privateCrossWindowNativeSyn(h, path) {
-			t.Fatal("alias control's original actual source was not admitted")
+		f.generator.mutex.Unlock()
+		_, _, beforeMints, beforeRetired := f.generator.counts()
+		entered, release := make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		finish := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(finish)
+		f.window.beforeExpandPingResultForTest = func() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
 		}
-		if !discoveryDemandTestAwaitPublication(t, generator.availableEntered, start.Add(window.settings.WindowExpandTimeout)) {
-			t.Fatal("alias listing did not reach its actual availability barrier")
+		f.start(t)
+		if !discoveryDemandTestAwaitPublication(t, entered, f.started.Add(f.window.settings.WindowExpandTimeout)) {
+			t.Fatal("eligible remote alias did not reach its actual evaluation callback")
 		}
-		update := h.update(path)
-		update.stateLock.Lock()
-		known := update.synRetryRemoteTailRefusedWithLock(aliasRemote)
-		update.stateLock.Unlock()
-		if !known {
-			t.Fatal("alias control lacks actual refused remote provenance before evaluation")
+		syns := provider.syns(f.path)
+		_, _, minted, retired := f.generator.counts()
+		f.update.stateLock.Lock()
+		alreadyRefused := f.update.synRetryRemoteTailRefusedWithLock(aliasRemote)
+		f.update.stateLock.Unlock()
+		if minted != beforeMints+1 || retired != beforeRetired || alreadyRefused || len(syns) != 1 ||
+			syns[0].source != aliasRemote.ClientId() || syns[0].path.SequenceNumber != f.path.SequenceNumber {
+			t.Fatal("post-mint control lacks one eligible alias and its original SYN at the same remote")
 		}
-		finished := make(chan struct{}, 1)
-		window.beforeDiscoveryRetryPublishForTest = func(owner *tcpSynRetry) {
-			if owner != nil {
-				select {
-				case finished <- struct{}{}:
-				default:
-				}
-			}
+		provider.sendTo(syns[0].source, reraceProviderSignal(t, syns[0].path))
+		f.h.settle()
+		f.update.stateLock.Lock()
+		refused := f.update.currentSynRetryLineageWithLock(f.owner) == f.owner && f.update.synRetryRemoteTailRefusedWithLock(aliasRemote)
+		f.update.stateLock.Unlock()
+		if !refused {
+			t.Fatal("original remote refusal did not reach the paid source before admission")
 		}
-		close(generator.availableRelease)
-		if !discoveryDemandTestAwaitPublication(t, evaluated, start.Add(window.settings.WindowExpandTimeout)) {
-			t.Fatal("actual alias candidate did not finish its normal evaluation")
-		}
-		if !discoveryDemandTestAwaitPublication(t, finished, start.Add(window.settings.WindowExpandTimeout+time.Second)) {
-			t.Fatal("alias rejection did not finish its actual bounded pass")
-		}
-		h.settle()
-		_, _, mints, retired := generator.counts()
-		if mints != beforeMints+1 || retired != beforeRetired+1 || len(window.unorderedClients()) != 5 {
+		finish()
+		f.h.settle()
+		_, _, minted, retired = f.generator.counts()
+		if minted != beforeMints+1 || retired != beforeRetired+1 || len(f.window.unorderedClients()) != 5 {
 			t.Fatal("failed-remote alias was not returned through the existing bounded candidate owner")
 		}
 		for _, client := range original {
-			window.stateLock.Lock()
-			installed := window.clients[client.ClientId()] == client
-			window.stateLock.Unlock()
+			f.window.stateLock.Lock()
+			installed := f.window.clients[client.ClientId()] == client
+			f.window.stateLock.Unlock()
 			if !installed || client.IsDone() || client.isWarning() {
 				t.Fatal("SERVICE_REFRESH_READMITTED_A_REFUSED_REMOTE_TAIL: a new local identity replaced a healthy original owner")
 			}
 		}
-		if _, answered := h.synAck(path); answered {
+		if _, answered := f.h.synAck(f.path); answered {
 			t.Fatal("refused same-remote alias fabricated destination proof")
 		}
-		discoveryDemandFullWindowAssertSiblings(t, h, paths, owners)
+		discoveryDemandFullWindowAssertSiblings(t, f.h, f.siblingPaths, f.siblingOwners)
 	})
 }
 
@@ -613,6 +609,13 @@ func newEarlyIdleRefusalFixture(t *testing.T, port int, holdEmpty bool) *earlyId
 // ordinary handover. Source generation and remote-refusal fields stay real.
 func newEarlyIdleRefusalFixtureWithBodyCount(t *testing.T, port int, holdEmpty bool, bodyCount int, configureClients ...func(*ClientSettings)) *earlyIdleRefusalFixture {
 	t.Helper()
+	return newEarlyIdleRefusalFixtureWithGenerator(t, port, holdEmpty, bodyCount, nil, configureClients...)
+}
+
+// Keeps the five real old providers and their body owners when the test
+// supplies a selector-mode listing adapter.
+func newEarlyIdleRefusalFixtureWithGenerator(t *testing.T, port int, holdEmpty bool, bodyCount int, wrap func(*discoveryDemandTestGenerator) MultiClientGenerator, configureClients ...func(*ClientSettings)) *earlyIdleRefusalFixture {
+	t.Helper()
 	f := &earlyIdleRefusalFixture{path: unboundFlowTcpPath(port)}
 	f.refuseIdle.Store(true)
 	var idle atomic.Int32
@@ -633,7 +636,7 @@ func newEarlyIdleRefusalFixtureWithBodyCount(t *testing.T, port int, holdEmpty b
 			return reraceAccept
 		}}
 	}
-	f.h, f.generator = newDiscoveryDemandTestHarness(t, specs, func(settings *MultiClientSettings) { settings.StrictWindowHandover = true })
+	f.h, f.generator = newDiscoveryDemandTestHarnessWithGenerator(t, specs, wrap, func(settings *MultiClientSettings) { settings.StrictWindowHandover = true })
 	if bodyCount == 4 {
 		f.window, f.siblingPaths, f.siblingOwners = discoveryDemandTestCarryFour(t, f.h)
 	} else if bodyCount == 3 {

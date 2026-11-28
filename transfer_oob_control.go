@@ -256,6 +256,12 @@ func (self *ApiOutOfBandControl) SendControlWithCtx(
 	frames []*protocol.Frame,
 	callback OobResultFunction,
 ) {
+	// The frame type is already determined by the caller's control codec.
+	// Only a single ordinary, remote contract creation can use the TCP hedge.
+	if self.localControl == nil && !self.probeClaimed && len(frames) == 1 &&
+		frames[0].GetMessageType() == protocol.MessageType_TransferCreateContract && !frames[0].GetRaw() {
+		ctx = context.WithValue(ctx, contractControlPostKey{}, true)
+	}
 	connectControl := func(connectControlArgs *ConnectControlArgs, apiCallback ConnectControlCallback) {
 		if self.localControl == nil {
 			self.api.connectControlWithCtx(ctx, connectControlArgs, apiCallback, self.probeClaimed)

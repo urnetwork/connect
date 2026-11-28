@@ -280,17 +280,32 @@ func testSynMetadataHeldServiceAcquisition(t *testing.T, mode string) {
 		if len(window.unorderedClients()) != 5 {
 			t.Fatal("metadata service fixture lost the original full strict window")
 		}
+		var late *reraceExit
+		listingEntered := generator.emptyEntered
+		if mode == "payload-aba" {
+			// Hold a real positive answer for the original paid owner. Its
+			// release must decide this acquisition before a later resize.
+			late = h.addExit(reraceExitSpec{name: "late"})
+			listingEntered = generator.availableEntered
+		}
 		generator.mutex.Lock()
-		generator.holdNextEmpty = true
+		if mode == "payload-aba" {
+			generator.holdNextAvailable = true
+			generator.resultOverrideForTest = map[MultiHopId]DestinationStats{
+				late.destination: {IpFamily: late.family},
+			}
+		} else {
+			generator.holdNextEmpty = true
+		}
 		generator.mutex.Unlock()
 		first := synMetadataTestPacket(path, 301, 401, nil)
 		if !synRetryControlOffer(t, h, MessagePoolCopy(first)) {
 			t.Fatal("initial service SYN was refused")
 		}
 		select {
-		case <-generator.emptyEntered:
+		case <-listingEntered:
 		default:
-			t.Fatal("service acquisition did not reach its actual empty-listing barrier")
+			t.Fatal("service acquisition did not reach its held listing")
 		}
 		update := h.update(path)
 		old := discoveryDemandServiceRefreshOwner(t, window, update)
@@ -308,7 +323,9 @@ func testSynMetadataHeldServiceAcquisition(t *testing.T, mode string) {
 		if len(history) == 0 {
 			t.Fatal("held service acquisition lacks actual remote refusals")
 		}
-		late := h.addExit(reraceExitSpec{name: "late"})
+		if late == nil {
+			late = h.addExit(reraceExitSpec{name: "late"})
+		}
 		if mode == "payload-aba" {
 			other := synMetadataTestPacket(path, 302, 402, []byte("different admitted early bytes"))
 			if !synRetryControlOffer(t, h, MessagePoolCopy(other)) {
@@ -429,13 +446,18 @@ func testSynMetadataHeldServiceAcquisition(t *testing.T, mode string) {
 			discoveryDemandFullWindowAssertSiblings(t, h, siblingPaths, siblingOwners)
 			return
 		}
-		evaluated := discoveryDemandTestObservePublication(window)
-		close(generator.emptyRelease)
-		if !discoveryDemandTestAwaitPublication(t, evaluated, deadline) {
-			t.Fatal("continuous service candidate missed the unchanged acquisition bound")
-		}
-		h.settle()
 		if mode == "payload-aba" {
+			reads, empty, mints, retired := generator.counts()
+			beforeEvaluation := late.evaluations.Load()
+			resumed := time.Now()
+			close(generator.availableRelease)
+			h.settle()
+			afterReads, afterEmpty, afterMints, afterRetired := generator.counts()
+			if !time.Now().Equal(resumed) || afterReads != reads || afterEmpty != empty ||
+				afterMints != mints || afterRetired != retired || late.evaluations.Load() != beforeEvaluation {
+				t.Fatalf("interrupted service listing spent acquisition work: reads=%d empty=%d mints=%d retired=%d evaluations=%d",
+					afterReads-reads, afterEmpty-empty, afterMints-mints, afterRetired-retired, late.evaluations.Load()-beforeEvaluation)
+			}
 			lateInstalled := false
 			for _, client := range window.unorderedClients() {
 				if client.Destination() == late.destination && !client.IsDone() {
@@ -452,6 +474,12 @@ func testSynMetadataHeldServiceAcquisition(t *testing.T, mode string) {
 			discoveryDemandFullWindowAssertSiblings(t, h, siblingPaths, siblingOwners)
 			return
 		}
+		evaluated := discoveryDemandTestObservePublication(window)
+		close(generator.emptyRelease)
+		if !discoveryDemandTestAwaitPublication(t, evaluated, deadline) {
+			t.Fatal("continuous service candidate missed the unchanged acquisition bound")
+		}
+		h.settle()
 		lateClient := h.channel("late")
 		window.stateLock.Lock()
 		installed := lateClient != nil && window.clients[lateClient.ClientId()] == lateClient && len(window.clients) == 5 && window.serviceRefreshOwner == nil

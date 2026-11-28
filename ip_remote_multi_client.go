@@ -14506,6 +14506,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// is open, then the main fill -- or, for a resize-pass probe, the
 		// v6-capable request alone; see enumerateDestinations
 		var destinations []enumeratedDestination
+		var demandCandidatesRefused bool
 		var err error
 		if demandRead == nil {
 			ipv6Probe = self.takeIpv6ProbeRequest()
@@ -14528,7 +14529,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			destinations, err = self.enumerateDestinations(slices.Collect(maps.Keys(windowDestinations())), probeOnly)
 		} else {
-			destinations, err = self.listDiscoveryDemand(demandRead, slices.Collect(maps.Keys(windowDestinations())))
+			destinations, demandCandidatesRefused, err = self.listDiscoveryDemand(demandRead, slices.Collect(maps.Keys(windowDestinations())))
 			if !self.discoveryDemandReadLive(demandRead) {
 				notify := demandRead.generatorNotify
 				demandRead = nil
@@ -14560,10 +14561,11 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			continue
 		}
+		emptyListing := len(destinations) == 0 && !demandCandidatesRefused
 		// a round whose cool-off exclusions left it empty lets the next round
 		// run without them (the starvation escape), unless it asked only for
 		// v6-capable providers, whose absence says nothing of the pool
-		self.noteCooloffRound(cooloffExcluded, len(destinations) == 0 && self.cooloffRoundAsksThePool(probeOnly, demandRead))
+		self.noteCooloffRound(cooloffExcluded, emptyListing && self.cooloffRoundAsksThePool(probeOnly, demandRead))
 		// The platform answered, which clears the error backoff so the window
 		// returns to its normal cadence once the platform recovers. A refused
 		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
@@ -14578,14 +14580,14 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// unconditional (V0): the platform answered with ZERO candidates. Only
 		// a failure while the window is empty — a full window legitimately
 		// enumerates nothing because its destinations are all excluded.
-		if len(destinations) == 0 && len(self.unorderedClients()) == 0 {
+		if emptyListing && len(self.unorderedClients()) == 0 {
 			if ok, suppressed := self.enumerateZeroThrottle.Allow(time.Now()); ok {
 				self.log.Infof("[multi]window enumerate returned zero providers%s\n",
 					suppressedSuffix(suppressed))
 			}
 			self.recordEvaluationFailure(windowFailureProvider, nil)
 		}
-		if len(destinations) == 0 {
+		if emptyListing {
 			self.mintStarve.Store(mintStarveOther)
 		}
 
@@ -14648,10 +14650,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 				if demandRead == nil && !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld() || self.idleRefillListingHeld() || self.limitedListingHeld()) {
 					return
 				}
-				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
-					return
-				}
-				serviceOwner := self.serviceRefreshSnapshot().owner
+				refresh := self.serviceRefreshSnapshot()
+				serviceOwner := refresh.owner
 				for {
 					if serviceOwner != nil && !self.serviceRefreshLive(serviceOwner) {
 						return
@@ -14662,6 +14662,12 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					}
 					timeout := expirationTime.Sub(time.Now())
 					if timeout <= 0 {
+						return
+					}
+					if !refresh.allowsDestination(destination) {
+						break
+					}
+					if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
 						return
 					}
 					networkChanged := self.networkChangeNotify()
@@ -14770,7 +14776,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}
 
 		demandRead = nil
-		demandRead = self.waitDiscoveryDemand(generatorNotify, len(destinations) == 0)
+		demandRead = self.waitDiscoveryDemand(generatorNotify, emptyListing)
 		if self.ctx.Err() != nil {
 			return
 		}
